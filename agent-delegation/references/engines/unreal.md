@@ -60,6 +60,13 @@ escalation thresholds should account for it.
 engine subsystems, can be covered by low-level automation specs that run without
 booting the full editor. Push rules there wherever the plan allows.
 
+## Windows
+
+Unreal development is mostly Windows, where deep `Intermediate/` paths routinely
+approach the 260-character limit and the editor holds locks on `Binaries/`. Keep
+worktrees at a short root path and expect cleanup to need a retry — see
+`DESIGN.md` §4.4b.
+
 ## Before you report
 
 State exactly what you built and ran, and how long it took. "Compiled; automation

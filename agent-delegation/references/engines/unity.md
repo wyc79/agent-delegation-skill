@@ -63,6 +63,13 @@ give each agent its own copy, so never point two agents at one project path.
 run in EditMode in seconds. Logic reachable only through a scene needs play mode.
 Push the rules into POCOs and let components call them.
 
+## Windows
+
+Unity development is mostly Windows. Long paths, case-insensitive scope
+matching, CRLF diffs, and the editor holding file locks all bite here — see
+`DESIGN.md` §4.4b. Practical rule: keep worktrees at a short path, and expect
+`git worktree remove` to fail while the editor is open.
+
 ## Before you report
 
 Say which test platform you ran (EditMode / PlayMode / compile only) and what you

@@ -79,6 +79,11 @@ agent-delegation/
 ├── SKILL.md              entry point (≤100 lines) — orientation and routing
 ├── roles/                one card per role; an agent reads exactly one
 ├── references/           depth loaded only when its trigger fires
+│   ├── task-dir.md       locating task state on Linux / macOS / Windows
+│   ├── escalation.md     when to stop, and how to hand off a stuck task
+│   ├── deviations.md     minor vs major departures from the plan
+│   ├── parallelism.md    file scopes and worktree etiquette
+│   ├── scratch-files.md  the narrow in-repo escape hatch
 │   └── engines/          Godot / Unity / Unreal specifics
 ├── schemas/              JSON Schema for reports, verdicts, subtask blocks
 └── templates/            copy-paste starting points for task/plan/deviations
@@ -121,9 +126,46 @@ test split that keeps iteration from grinding on a five-minute engine boot.
 
 ## Status
 
-The skill is complete and usable by hand today — you can assign roles yourself
-and get the artifact discipline immediately. The orchestrator that automates
-routing, worktrees, and gates is specified in `DESIGN.md` §15 but not yet built.
+**The skill is complete. Can one agent drive a task end to end with it today?**
+Yes — with one caveat that matters.
+
+Given a task and the skill, a capable agent can create the task directory, write
+`task.md`, plan, decompose, implement subtask by subtask, run the project's
+checks, review its own work against the plan, and integrate. The protocol is
+self-contained: every step names the artifact it produces and the next role reads
+it from disk. Nothing in the loop requires the orchestrator to exist.
+
+**The caveat: one agent playing every role loses the independence the roles are
+for.** A reviewer that shares context with the implementer already believes the
+implementation is correct, and a test author that has seen the code writes tests
+that mirror it. To get the real value, run each role in a **fresh session or
+subagent** with only its artifacts as input — that is the part a human driving by
+hand has to be disciplined about.
+
+What you also give up without the orchestrator is *enforcement and routing*,
+which is exactly what code is good at and prompts are not:
+
+| Works with just the skill | Needs the orchestrator |
+|---|---|
+| Artifact discipline, handoffs, authority ordering | Different models per role (principle #1 is unrealized on one model) |
+| Review as an evidence chain; independent test authoring | Escalating to a stronger model on failure |
+| Deviation logging, honest `blocked` reporting | Mechanically reverting out-of-scope edits |
+| Escalation *thresholds* as self-discipline | Counting iterations and enforcing budget caps |
+| Sequential subtasks in one worktree | Parallel worktrees with lock/hotspot enforcement |
+| Asking the human at obvious moments | Schema validation, cost tracking, jargon-free briefs |
+
+**The orchestrator is designed but not yet built.** That is the program which
+would automate the parts you currently do by hand:
+
+- choosing which model runs each role (`DESIGN.md` §5)
+- creating and integrating worktrees (§7)
+- **approval checkpoints** — pausing for a human before a plan is executed,
+  before a branch is merged, or when cost or repeated failure crosses a
+  threshold (§9)
+- retrying and escalating failures up a ladder (§6)
+
+`DESIGN.md` §15 lists the minimum version of that program one developer could
+realistically build.
 
 ## License
 

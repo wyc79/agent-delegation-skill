@@ -302,6 +302,8 @@ agent-delegation-skill/
     │   ├── escalation.md         # full signal catalog + how to raise one
     │   ├── deviations.md         # severity rules, worked examples
     │   ├── parallelism.md        # file scopes, worktree etiquette
+    │   ├── task-dir.md           # locating $TASK_DIR (Linux/macOS/Windows)
+    │   ├── scratch-files.md      # the in-repo escape hatch (§4.5)
     │   └── engines/              # godot.md, unity.md, unreal.md — game projects only
     ├── schemas/
     │   ├── report.schema.json    # §3.4 handoff contract
@@ -605,6 +607,79 @@ interface named in the plan, or contradicts an entry in `decisions.md` — major
 deviations fire an escalation signal (§6) instead of just a log line. The Reviewer
 cross-checks the diff against declared scopes mechanically (the orchestrator gives
 it the file-list diff), so unlogged deviations are detectable, not just discouraged.
+
+### 4.4b Cross-platform: Windows
+
+Windows is not an afterthought here — it is where most Unity and Unreal work
+happens, so the game-development goal (§10) implies first-class Windows support.
+Nine concrete divergences, each with the decision taken:
+
+**1. State root.** There is no XDG on Windows. Resolution order is
+`%XDG_STATE_HOME%` if set (Git Bash and WSL users often do), else
+`%LOCALAPPDATA%`, else `$HOME/.local/state` on Linux/macOS. `%LOCALAPPDATA%` and
+not `%APPDATA%`: this is machine-local scratch and must not roam.
+
+**2. Project-key canonicalization.** `git rev-parse --path-format=absolute
+--git-common-dir` already returns forward slashes on Windows. Before hashing:
+strip a trailing slash, and **lowercase the path on Windows only** — the
+filesystem is case-insensitive, so `C:/Repo/.git` and `c:/repo/.git` are one
+directory and must not yield two keys. The key is machine-local, so it never
+needs to match across platforms; it only needs to be stable *within* a machine.
+
+**3. `MAX_PATH` (260 chars).** Unreal and Unity paths are deep, and worktrees add
+a prefix. Mitigations, in order: place worktree roots at a short path
+(`C:\adg\<task-id>\<subtask>`, never nested inside a deep repo), set
+`core.longpaths=true` for the task's repo, and prefer the Win10+ long-path
+policy where the environment allows it. The orchestrator **checks the projected
+worktree path length at DECOMPOSE** and shortens subtask ids rather than
+discovering the failure mid-implementation.
+
+**4. Case-insensitive filesystem.** Two subtasks scoped to `src/Foo.cs` and
+`src/foo.cs` are the same file. **All file-scope, hotspot, and lock comparisons
+casefold on Windows and macOS** — a case-sensitive comparison silently grants
+parallel write access to one file. This applies to macOS too, which is
+case-insensitive by default and is easy to forget.
+
+**5. Line endings.** `core.autocrlf` can make a diff look like a whole-file
+rewrite. The mechanical scope check is unaffected because it compares
+**file lists** (`git diff --name-only`), not content — but *line-count* signals
+(`estimated_loc` overrun, `edit_churn`) can inflate badly. So line-based
+thresholds are computed with `--ignore-cr-at-eol`, and **agents must never change
+`core.autocrlf` or bulk-normalize line endings**; that is a major deviation.
+
+**6. Filename charset.** Windows forbids `: * ? " < > |` in filenames and
+reserves `CON`, `PRN`, `AUX`, `NUL`, `COM1`…, `LPT1`…. Every identifier that
+becomes a path component is therefore restricted to `[a-z0-9-]` (already enforced
+by the id patterns in `schemas/`). One live trap: **herdr pane and tab ids
+contain colons** (`w1:p1`) — they are values inside `task.json`, and must never
+be interpolated into a filename.
+
+**7. File locking.** Windows refuses to delete files held open, and Unity,
+Unreal, and antivirus scanners all hold handles. `git worktree remove` and
+`git clean` will therefore fail intermittently. Cleanup **retries with backoff,
+then defers**: a worktree that will not delete is recorded in `task.json` and
+pruned at the next task start (`git worktree prune`), never force-deleted while a
+process may still be writing.
+
+**8. Symlinks** need Developer Mode or elevation. The design uses none, and must
+keep it that way — no symlinking the task directory into the repo, which would
+also violate §4.0.
+
+**9. Shells and tooling.** An agent may be in PowerShell, cmd, Git Bash, or WSL.
+This is why every build, test, and lint command comes from **project config**
+rather than being assumed POSIX (§2.2), and why the permission broker's denylist
+needs a PowerShell-aware equivalent (`Remove-Item -Recurse -Force`,
+`Invoke-WebRequest | iex`) rather than only matching `rm -rf` and `curl | sh`.
+
+**herdr caveat:** herdr ships stable binaries for Linux and macOS; **native
+Windows support is preview-only beta** (per its install docs). So on Windows the
+no-herdr fallback path from §4.6 is not a rarely-exercised branch — it may be the
+primary path, which is a good reason to keep that fallback real rather than
+theoretical. WSL2 is the pragmatic alternative, at the cost of slow cross-OS
+filesystem access when the repo lives on the Windows side (keep it inside the
+WSL filesystem if you go that route).
+
+Agent-facing version of the path rules: `references/task-dir.md`.
 
 ### 4.5 The in-repo escape hatch
 

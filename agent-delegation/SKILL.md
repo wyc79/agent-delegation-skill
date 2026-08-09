@@ -13,13 +13,10 @@ task directory — they never see your reasoning, only what you write down.
 
 Task state lives **outside the repository** — shared by every worktree, never in
 git history. `$AGENT_DELEGATION_TASK_DIR` holds its absolute path; that value is
-`$TASK_DIR` throughout this skill. If unset, derive it (same key from any worktree):
-
-```bash
-CD=$(git rev-parse --path-format=absolute --git-common-dir)
-KEY="$(basename "$(dirname "$CD")")-$(printf %s "$CD" | shasum -a 256 | cut -c1-8)"
-ls "${XDG_STATE_HOME:-$HOME/.local/state}/agent-delegation/projects/$KEY/tasks/"
-```
+`$TASK_DIR` throughout this skill. If it is unset, derive it using
+`references/task-dir.md` (it gives the exact recipe for Linux, macOS, and
+Windows — do not improvise one, or you will read a different directory than the
+rest of the pipeline writes).
 
 **Never create the task directory yourself, and never write task artifacts into
 the repository.** If you cannot find it, stop. (Tool-forced exception: rule 2.)
