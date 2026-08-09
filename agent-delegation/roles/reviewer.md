@@ -13,8 +13,8 @@ can produce here; a missing requirement is the most.
 
 1. `task.md` — the `AC-n` list and the **non-goals**.
 2. `plan.md` — what was supposed to happen.
-3. `deviations.md` — a logged deviation is an *amendment*, not a violation.
-   Judge the diff against the plan **as amended**.
+3. `deviations.md` — read alongside `plan.md`. How to weigh entries, and the
+   gap to hunt for, are in `references/deviations.md` ("For reviewers").
 4. `decisions.md` — decisions already made; do not relitigate them without cause.
 5. The diff, and the verify output your prompt provides.
 

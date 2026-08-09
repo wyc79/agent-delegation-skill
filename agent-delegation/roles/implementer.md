@@ -70,21 +70,16 @@ and evidence containing actual command output — not a paraphrase.
 
 ## Deviating from the plan
 
-**Minor** (log and continue): the plan's step does not fit reality, but your fix
-stays inside your file scope, keeps the interfaces the plan named, and
-contradicts no decision. Append to `deviations.md`:
+Reality will not match the plan somewhere. What you do depends only on severity:
 
-```text
-dev-2 | impl:st-2 | plan.md:L48 said extend BaseSystem; it is sealed in this
-       engine version | did instead: composition wrapper around it | minor
-```
+- **Minor** — log it in `deviations.md` and keep going.
+- **Major** — stop, log it, **and raise a signal**. Do not proceed on your own
+  judgment; finish or revert to a clean state, then report.
 
-**Major** (stop and raise a signal): the change needs files outside your scope,
-alters an interface the plan named, contradicts an entry in `decisions.md`, or
-means another subtask's plan is now wrong. Do not proceed on your own judgment —
-finish or revert to a clean state, then report with the signal.
-
-`references/deviations.md` has the full severity rules and worked examples.
+**Read `references/deviations.md` before writing the entry.** It decides which of
+the two you have — the boundary is not obvious, and guessing wrong is how a
+breaking interface change reaches the reviewer disguised as a footnote — and it
+gives the log format, which has required fields this card does not repeat.
 
 ## Stop and escalate when
 
