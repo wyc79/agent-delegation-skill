@@ -29,11 +29,39 @@ the decision rather than hunt for it:
 | D7 | **Tests for complex tasks are authored from requirements, independently of the implementation** | Implementer writes own tests only | An implementer's tests confirm what it built, not what was asked. Independent authorship catches requirement gaps. (Implementers still practice TDD locally.) |
 | D8 | **Humans gate irreversible or expensive decisions asynchronously**; everything reversible inside a worktree is automated | Approve-every-step or full autonomy | Worktrees make almost everything reversible, which is what makes high autonomy safe. |
 | D9 | The MVP **reuses existing agent CLIs** (Claude Code, Codex CLI, Gemini CLI) as the agent runtime rather than building a tool-execution harness | Custom agent loop over raw APIs | Tool execution, sandboxing, and file editing are the hard 80% of an agent runtime, and they already exist. The orchestrator shells out; the protocol stays in files. |
-| D10 | **Provider auth and agent-session hosting are delegated to [herdr](https://herdr.dev)** — agent CLIs run as authenticated sessions in herdr panes, driven via its socket API; the orchestrator stores no provider credentials | Orchestrator-managed API keys and raw subprocess spawning | The subscription seats (§5.4) *are* authenticated CLI logins; herdr already persists those sessions, survives detach/reattach, and exposes programmatic control. Building a credential broker would duplicate it. The orchestrator still owns git rights, budgets, and gates — the trust boundary moves, the authority doesn't. |
+| D10 | Execution is reached through a **runtime adapter interface** (§4.6); [herdr](https://herdr.dev) is the reference adapter, local subprocess the fallback | Coupling the orchestrator directly to one runtime | Session hosting, worktrees, and provider auth are all runtime concerns that differ per environment (herdr is beta on Windows, absent in CI). An adapter keeps the orchestrator and the skill portable, and lets a good runtime supply credential handling for free without becoming a hard dependency. |
 
 ---
 
 ## 1. High-level architecture
+
+### 1.0 The layer boundary
+
+Four layers, and the rule is that **each one only knows about the layer directly
+below it**:
+
+```text
+User
+ └─ Orchestrator      deterministic: state machine, scheduling, routing, enforcement
+     └─ Skill         the protocol: roles, artifacts, handoffs, escalation vocabulary
+         └─ Agents    reasoning and coding execution (Planner/Implementer/Tester/Reviewer)
+             └─ Runtime adapter    herdr · local subprocess · anything else
+                 └─ Isolated git worktrees
+```
+
+What each layer must **not** do is the load-bearing part:
+
+| Layer | Owns | Must never |
+|---|---|---|
+| Orchestrator | State transitions, budgets, model routing, gates, git authority | Delegate enforcement to an agent's good behavior |
+| Skill | Protocol, role instructions, artifact conventions | **Name a model or provider, or perform routing**; reference a specific runtime |
+| Agents | Reasoning, code, evidence | Choose their own model, exceed their scope, invent state transitions |
+| Runtime adapter | Spawning, worktrees, prompting, liveness, notifications | Interpret artifacts or make workflow decisions |
+
+The skill describes escalation as "the orchestrator will move this to a stronger
+model" so agents know what happens to their report — but it never selects one.
+Routing lives in `registry.default.yaml` and the router (§5), which is
+orchestrator-side and never shipped into an agent's context.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────┐
@@ -428,10 +456,12 @@ herdr 0.8.0 on this machine:
   extension point. Writing our artifacts there would couple us to another tool's
   internals and risk being clobbered on upgrade.
 
-So the correct reading of "reuse herdr rather than reinvent" is: **reuse herdr's
-mechanisms, not its storage.** We adopt herdr's *conventions* (XDG state, a
-sibling directory) and delegate the things herdr genuinely owns — worktree
-lifecycle, env injection, agent lifecycle, notifications (§4.6).
+So the correct reading of "reuse herdr rather than reinvent" is: **reuse a
+runtime's mechanisms, not its storage.** We adopt the XDG convention as a
+sibling directory of our own, and delegate execution concerns — worktree
+lifecycle, env injection, agent lifecycle, notifications — through the runtime
+adapter (§4.6), where herdr is the reference implementation rather than a
+requirement.
 
 ### 4.1 Layout
 
@@ -517,7 +547,16 @@ in one resumable document:
   "repo": {"path": "/repos/my-game", "common_dir": "/repos/my-game/.git",
            "base_commit": "a1b2c3d", "integration_ref": "refs/adg/T-014/integration"},
   "classification": {"tier": "complex", "by": "heuristic+llm", "score": 0.81},
-  "budgets": {"usd_cap": 15, "usd_spent": 4.10, "iterations": {"st-2": 3}},
+  "limits": {
+    "max_cost_usd": 15.00,
+    "max_attempts_per_subtask": 8,
+    "max_review_loops": 2,
+    "max_replans": 1,
+    "max_parallel_agents": 3,
+    "escalation_ceiling": "t2",
+    "human_approval_required": ["plan", "merge", "dependency_change", "destructive_op"]
+  },
+  "spent": {"usd": 4.10, "attempts": {"st-2": 3}, "review_loops": 1, "replans": 0},
   "subtasks": [
     {"id": "st-2-combat-hooks", "status": "complete",
      "worktree": "/repos/.worktrees/T-014-st-2", "branch": "adg/T-014/st-2",
@@ -543,6 +582,29 @@ in one resumable document:
 `delegation_history` is append-only and is what makes §5.6 telemetry possible
 (which model, in which role, escalated how often, at what cost) as well as
 answering "how did this code come to exist" months later.
+
+**Limits are enforced by the orchestrator and fail closed.** `limits` is the
+complete set of hard stops; `spent` is the running count. The invariant:
+
+> Every limit is checked **before** the action that would consume it, never
+> after. A missing, unparseable, or out-of-range limit does not mean "unlimited"
+> — it parks the task in `NEEDS_HUMAN`.
+
+| Limit | Checked before | On breach |
+|---|---|---|
+| `max_cost_usd` | Every agent invocation, using the *projected* cost | Park; human raises the cap or abandons |
+| `max_attempts_per_subtask` | Each implementation iteration | Escalate one rung (§6.2); park if the ladder is exhausted |
+| `max_review_loops` | Sending findings back to an implementer | Force `REPLAN` |
+| `max_replans` | Re-entering PLAN | Park — repeated replanning means the task is ill-posed |
+| `max_parallel_agents` | Spawning a subtask agent | Queue it; never exceed, even when scopes are disjoint |
+| `escalation_ceiling` | Router selection (§5.3b) | Skip rung 2, fall through to replan/human |
+| `human_approval_required` | Entering the named stage | Block (attended) or park and notify (autonomous) |
+
+Three properties make this enforceable rather than advisory: agents never read
+or write `limits` (so they cannot negotiate with them), every counter is
+incremented by the orchestrator from observed events rather than self-reports,
+and limits **compose downward only** — a task may lower a deployment default,
+never raise it (§5.3b). Raising any limit is a human act, recorded in `gates`.
 
 **`task.md`** — human-readable; the original request verbatim, then a normalized
 restatement, then numbered acceptance criteria, then explicit non-goals. Non-goals
@@ -673,9 +735,9 @@ needs a PowerShell-aware equivalent (`Remove-Item -Recurse -Force`,
 
 **herdr caveat:** herdr ships stable binaries for Linux and macOS; **native
 Windows support is preview-only beta** (per its install docs). So on Windows the
-no-herdr fallback path from §4.6 is not a rarely-exercised branch — it may be the
-primary path, which is a good reason to keep that fallback real rather than
-theoretical. WSL2 is the pragmatic alternative, at the cost of slow cross-OS
+**local adapter** (§4.6) is not a rarely-exercised branch — it may be the primary
+path, which is a good reason to keep it a real implementation rather than a
+documented intention. WSL2 is the pragmatic alternative, at the cost of slow cross-OS
 filesystem access when the repo lives on the Windows side (keep it inside the
 WSL filesystem if you go that route).
 
@@ -722,35 +784,48 @@ Three supporting constraints keep this from becoming a side channel:
 
 Agent-facing version of this: `references/scratch-files.md`.
 
-### 4.6 Division of labor with herdr
+### 4.6 The runtime adapter
 
-The rule is **reuse herdr's mechanisms; own only the artifacts**. What each side
-does, and what we explicitly do *not* rebuild:
+The orchestrator never calls a runtime directly. It calls a small adapter
+interface, and a runtime implements it. herdr is the reference implementation;
+plain local subprocesses are the always-available fallback. **Neither the skill
+nor the state machine mentions any runtime** — the skill contains zero references
+to herdr, and that is a property to preserve.
 
-| Concern | Owner | Mechanism |
-|---|---|---|
-| Worktree create / open / remove | **herdr** | `herdr worktree create --branch <b> --base <ref> --path <p> --label <l>`, `worktree list`, `worktree remove` — not raw `git worktree` |
-| Terminal topology per task/subtask | **herdr** | `workspace create`, `tab create`, `pane split` |
-| Passing the task dir to an agent | **herdr** | `workspace create --env AGENT_DELEGATION_TASK_DIR=<abs path>` |
-| Launching a role agent on a chosen channel | **herdr** | `agent start <name> --kind <cli> --pane <id>` (the §5.4 channel selects `--kind`) |
-| Prompting and awaiting completion | **herdr** | `agent prompt <name> --wait`, `agent wait --until blocked` |
-| Liveness / stuck detection | **herdr** | agent lifecycle states: `idle`, `working`, `blocked`, `done`, `unknown` |
-| Surfacing gate requests to the human | **herdr** | `herdr notification show`, plus `workspace report-metadata` for at-a-glance status in the sidebar |
-| Provider auth | **herdr** | authenticated CLI sessions (D10) |
-| Task artifacts and their schemas | **us** | XDG state dir (§4.1) |
-| Lifecycle state machine, budgets, routing, gates | **us** | orchestrator (§2, §5, §9) |
+The whole interface is seven operations:
 
-Two boundary notes worth keeping straight. `workspace report-metadata` is
-**display-only** with a TTL — it is a good way to show `T-014 · implementing ·
-2/4 subtasks` in the UI, and a bad place to keep state; `task.json` remains the
-only source of truth. And herdr's agent lifecycle answers *"is this agent
-alive and idle?"*, never *"did it succeed?"* — that question is answered by a
-schema-valid report plus verify output, because an agent can go `idle` having
-accomplished nothing.
+| Operation | Contract | herdr adapter | local adapter |
+|---|---|---|---|
+| `create_worktree(branch, base, path)` | Isolated checkout exists | `herdr worktree create` | `git worktree add` |
+| `remove_worktree(path)` | Best-effort; may defer (§4.4b) | `herdr worktree remove` | `git worktree remove`, then `prune` |
+| `start_agent(role, channel, cwd, env)` | A live agent session, task dir in `env` | `workspace create --env` + `agent start --kind` | `spawn <cli> --cwd` with env |
+| `prompt(session, text) -> settled` | Returns when the agent settles | `agent prompt --wait` | write stdin, wait for exit |
+| `status(session)` | `working` / `idle` / `blocked` / `gone` | agent lifecycle states | process alive + exit code |
+| `notify(kind, brief)` | Human sees a gate request | `notification show`, `workspace report-metadata` | terminal prompt / stdout |
+| `teardown(session)` | Session released | `pane`/`workspace close` | kill process |
 
-When herdr is absent, every row above degrades to a local equivalent (`git
-worktree`, subprocess spawn, an env var, terminal prompts). The artifact layer is
-unchanged, which is the point of keeping the two separable.
+Everything else stays orchestrator-side: artifacts, state machine, budgets,
+routing, and gates. Two contract notes that apply to **every** adapter:
+
+- **`status()` answers "is it alive?", never "did it succeed?"** An agent can go
+  `idle` having accomplished nothing. Success is a schema-valid report plus
+  verify output — never a lifecycle state.
+- **Runtime-side display is not state.** herdr's `workspace report-metadata` is
+  display-only with a TTL and is a fine place to show `T-014 · implementing ·
+  2/4`, and a terrible place to keep anything; `task.json` remains the only
+  source of truth. Any adapter's status surface is treated the same way.
+
+What a *good* adapter contributes beyond the minimum is convenience, not
+capability: herdr supplies authenticated CLI sessions (so the orchestrator holds
+no provider credentials, §11.2), pane persistence across detach, and free
+liveness signals. The local adapter supplies none of that — the orchestrator then
+holds credentials itself and polls processes — and the workflow is identical
+either way. That is the test of whether the boundary is real.
+
+Adapter choice is configuration, not code: `runtime: herdr | local` per channel
+in `registry.default.yaml`. On Windows, where herdr is preview-only beta
+(§4.4b), the local adapter may be the primary path — which is precisely why it
+must stay a real implementation rather than a documented intention.
 
 ---
 
@@ -1631,6 +1706,35 @@ Deliberately deferred: parallelism/worktree-per-subtask, Integrator role,
 independent Test Author, circuit breakers (manual registry edit suffices),
 telemetry-driven recalibration, async approval transports, engine adapters beyond
 "run this shell command."
+
+### 15.1 Milestone 1 — prove one complete workflow
+
+The design is now ahead of the implementation, so the next work is an
+orchestrator, not more protocol. **Milestone 1 is one task travelling the full
+path end to end:**
+
+```text
+plan → isolated implementation → verify → independent review → merge
+```
+
+Done means, on a real repository:
+
+1. A plan artifact a *different* session can execute without asking questions.
+2. Implementation in a worktree the human never had to create.
+3. A deterministic verify run whose real output lands in `verify/`.
+4. A review by a session that **never saw the implementer's context**, producing
+   a schema-valid verdict with a row per acceptance criterion.
+5. A human landing the result — an applied uncommitted diff in `attended` mode,
+   or an opened PR in `autonomous`.
+
+Two things are worth *not* proving yet: multi-model routing (a single model in
+every role is a valid Milestone 1 — the point is the pipeline, not the savings)
+and parallelism (sequential subtasks exercise every artifact and gate). Both are
+optimizations over a loop that must first work at all.
+
+The most informative failure to look for is step 4: if the independent reviewer
+routinely approves work the human then rejects, the artifacts are not carrying
+enough for review to be real, and no amount of routing or parallelism fixes that.
 
 ## 16. Explicitly NOT automated initially
 

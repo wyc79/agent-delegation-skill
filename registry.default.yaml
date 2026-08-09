@@ -130,7 +130,14 @@ profiles:
 
 # ---------------------------------------------------------------------------
 # Access channels — how models are actually reachable. Written by
-# `delegate init` from detected herdr sessions; edit if detection is wrong.
+# `delegate init` from detected agent CLIs; edit if detection is wrong.
+#
+#   adapter    which runtime adapter runs it (DESIGN.md §4.6): herdr | local
+#   agent_kind which agent CLI to launch — adapter-independent
+#   session    herdr adapter only: the pre-authenticated session to attach to
+#
+# Swapping `adapter: herdr` for `adapter: local` must change nothing except who
+# spawns the process. If it changes the workflow, the boundary has leaked.
 #
 # For a subscription seat the marginal cost of a call is ~0 while the quota
 # window has headroom, so the router weights quota draw, not list price.
@@ -139,8 +146,9 @@ profiles:
 channels:
   claude-seat:
     type: subscription
-    runtime: claude-cli
-    herdr_session: claude
+    adapter: herdr
+    agent_kind: claude
+    session: claude                    # herdr adapter only; ignored by local
     exposes: [opus-class-strong, balanced-coder]
     quota: {window: 5h, est_capacity: 40, weekly_cap: true}
     reserve_for: [planner, reviewer]   # keep headroom for the calls only this seat can make
@@ -148,16 +156,18 @@ channels:
 
   cursor-seat:
     type: subscription
-    runtime: cursor-cli
-    herdr_session: cursor
+    adapter: herdr
+    agent_kind: cursor
+    session: cursor
     exposes: [balanced-coder, fast-cheap]
     quota: {window: monthly, est_capacity: 500}
 
-  # Metered overflow. Real money per call — budget-gated in autonomous mode.
-  # api-overflow:
-  #   type: metered
-  #   runtime: claude-cli
-  #   exposes: [balanced-coder, fast-cheap]
+  # Same seat without herdr — e.g. on Windows, or in CI. Identical workflow.
+  # claude-local:
+  #   type: subscription
+  #   adapter: local
+  #   agent_kind: claude
+  #   exposes: [opus-class-strong, balanced-coder]
 
 # ---------------------------------------------------------------------------
 # Policy. Composes DOWN only: a repo or a single task may lower these,
@@ -168,11 +178,15 @@ policy:
   escalation_ceiling:
     max_tier: t2                      # ultra tier is out of the ladder's reach
     max_marginal_cost_per_call: 2.50  # hard stop in USD, whatever the model
-  budgets:
-    default_task_usd: 15
-    max_iterations_per_subtask: 8
+  # Deployment defaults for task.json `limits` (DESIGN.md §4.2).
+  # A task may lower any of these; never raise. Missing/invalid -> fail closed.
+  limits:
+    max_cost_usd: 15
+    max_attempts_per_subtask: 8
     max_review_loops: 2
     max_replans: 1
+    max_parallel_agents: 3
+    human_approval_required: [plan, merge, dependency_change, destructive_op]
   escalation_thresholds:
     test_stuck_attempts: 3
     edit_churn_rewrites: 4
