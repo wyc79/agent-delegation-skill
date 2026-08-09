@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/subtask.schema.json",
+  "title": "Subtask block",
+  "description": "Schema for each entry in the YAML `## Subtasks` block of plan.md. Written by the planner; read by the orchestrator (for scheduling and scope enforcement) and by implementers (as their assignment).",
+  "type": "object",
+  "required": ["id", "goal", "file_scope", "acceptance"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^st-[0-9]+(-[a-z0-9-]+)?$",
+      "description": "e.g. st-2-combat-hooks. Stable for the life of the task."
+    },
+    "goal": {
+      "type": "string",
+      "description": "One sentence an implementer can act on without reading the rest of the plan."
+    },
+    "file_scope": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Write scope: globs this subtask may modify. Enforced — out-of-scope hunks are flagged at review. Be precise; an over-broad scope defeats parallel safety."
+    },
+    "reads": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Files this subtask depends on but must not modify."
+    },
+    "depends_on": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Subtask ids that must complete first. Empty means it can start immediately."
+    },
+    "parallel_group": {
+      "type": "string",
+      "description": "Subtasks sharing a group may run concurrently. The orchestrator still verifies scopes and demotes to sequential on any overlap."
+    },
+    "hotspots": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Unmergeable or high-coupling files this subtask must touch (engine scenes, project settings, central modules). Taken as exclusive locks."
+    },
+    "frozen_interfaces": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Exact signatures/signals this subtask must expose for others to code against. Changing one later is a major deviation."
+    },
+    "capability_hint": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Planner's read on difficulty; raises the router's requirements for this subtask.",
+      "properties": {
+        "reasoning": { "enum": ["low", "medium", "high", "very_high"] },
+        "coding": { "enum": ["low", "medium", "high", "very_high"] }
+      }
+    },
+    "estimated_loc": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Rough changed-line estimate. Used for iteration budgets and the scope_overrun signal, so an honest number matters more than a flattering one."
+    },
+    "acceptance": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "pattern": "^AC-[0-9]+$" },
+      "description": "Acceptance criteria from task.md this subtask satisfies. Every AC in task.md must be claimed by at least one subtask."
+    },
+    "test_notes": {
+      "type": "string",
+      "description": "How this should be verified, and whether the checks are fast (engine-free) or slow."
+    }
+  }
+}

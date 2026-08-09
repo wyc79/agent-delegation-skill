@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/verdict.schema.json",
+  "title": "Review verdict",
+  "description": "Written by the reviewer to .task/<task-id>/reports/review-reviewer.json. The verdict selects the pipeline's next transition, so the enum is exact.",
+  "type": "object",
+  "required": ["verdict", "ac_table", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {
+      "enum": ["APPROVE", "REQUEST_CHANGES", "REPLAN", "ESCALATE_TO_HUMAN"],
+      "description": "APPROVE: all criteria met, nothing blocking. REQUEST_CHANGES: blocking findings fixable within the current plan. REPLAN: the plan itself is wrong. ESCALATE_TO_HUMAN: reviewer/planner disagreement on intent, ill-posed task, or a product decision."
+    },
+    "ac_table": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One row per acceptance criterion in task.md. Every AC must appear, including ones that are fine.",
+      "items": {
+        "type": "object",
+        "required": ["ac", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "ac": { "type": "string", "pattern": "^AC-[0-9]+$" },
+          "status": {
+            "enum": ["met", "met_untested", "partial", "unmet", "not_applicable"],
+            "description": "met_untested is a real answer — use it rather than rounding to met or unmet."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Test name, file:line, or verify output supporting the status."
+          },
+          "finding": {
+            "type": "string",
+            "description": "Finding id, when the status is not met."
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Blocking and non-blocking defects. Every BLOCKING finding must carry a citation.",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "claim", "cite"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^f-[0-9]+$" },
+          "severity": { "enum": ["blocking", "minor"] },
+          "claim": {
+            "type": "string",
+            "description": "What is wrong, where, and what 'fixed' looks like — written so the implementer need not re-derive your reasoning."
+          },
+          "cite": {
+            "type": "string",
+            "minLength": 1,
+            "description": "task.md#AC-n, plan.md:Lnn, decisions.md#D-n, or verify output. Required: an uncited finding belongs in advisory and cannot block."
+          },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "suggested_owner": {
+            "type": "string",
+            "description": "Subtask id that should own the fix, e.g. impl:st-2."
+          }
+        }
+      }
+    },
+    "advisory": {
+      "type": "array",
+      "description": "Observations, taste, and future work. Recorded, never gating.",
+      "items": {
+        "type": "object",
+        "required": ["claim"],
+        "additionalProperties": false,
+        "properties": {
+          "claim": { "type": "string" },
+          "file": { "type": "string" }
+        }
+      }
+    },
+    "unlogged_scope_violations": {
+      "type": "array",
+      "description": "Diff hunks matching neither a subtask file_scope nor a logged deviation. Mechanically checkable; report all of them.",
+      "items": { "type": "string" }
+    },
+    "regression_surface": {
+      "type": "string",
+      "description": "Existing behavior sharing the touched code paths, and whether the verify run exercised it."
+    },
+    "previous_findings_addressed": {
+      "type": "boolean",
+      "description": "Second and later review rounds only."
+    }
+  }
+}

@@ -1,0 +1,180 @@
+# Default model registry — orchestrator-side config, NOT part of the skill.
+#
+# Agents never read this file. Only the router does. See DESIGN.md §5.
+#
+# Two things live here and they are different:
+#   * Capability scores + tier bands  -> reference data, the same for everyone.
+#     Inherit these; do not hand-tune them without evidence from §5.6 telemetry.
+#   * enrolled_roles + policy         -> yours. `delegate init` proposes them by
+#     detecting which agent CLIs are signed in; you confirm once.
+#
+# Enrollment is FAIL-CLOSED: a model with `enrolled_roles: []` is invisible to
+# the router no matter how capable. That is how the top tier stays off by
+# default — there is no denylist to maintain.
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Capability vocabulary (1-5 unless noted)
+#   reasoning   planning, tradeoffs, root-causing
+#   coding      writing correct code in-idiom
+#   adherence   stays in scope, follows the protocol, writes valid reports
+#   tool        agentic edit/run loops without derailing
+#   speed       1 slow ... 5 fast
+#   ctx         usable context window
+#   cost_*      USD per million tokens, list price (metered channels only)
+#   tier        t1 cheap/fast | t2 strong | t3 ultra (heaviest reasoning tiers)
+# ---------------------------------------------------------------------------
+
+models:
+  # --- t2: strong. The working ceiling for most deployments. ----------------
+  opus-class-strong:
+    tier: t2
+    reasoning: 5
+    coding: 5
+    adherence: 4
+    tool: 5
+    speed: 2
+    ctx: 200000
+    cost_in: 15
+    cost_out: 75
+    enrolled_roles: [planner, reviewer, integrator]
+    notes: Plan and review. Not the default implementer — see principle #1.
+
+  balanced-coder:
+    tier: t2
+    reasoning: 4
+    coding: 5
+    adherence: 4
+    tool: 5
+    speed: 4
+    ctx: 200000
+    cost_in: 3
+    cost_out: 15
+    enrolled_roles: [implementer, test-author, integrator]
+    notes: The workhorse. Most implementation should land here.
+
+  # --- t1: cheap/fast. Predictable work only. -------------------------------
+  fast-cheap:
+    tier: t1
+    reasoning: 2
+    coding: 3
+    adherence: 3
+    tool: 3
+    speed: 5
+    ctx: 1000000
+    cost_in: 0.3
+    cost_out: 1.5
+    enrolled_roles: [test-author, classifier, reporter]
+    notes: Classification, plain-language briefs, mechanical test writing.
+
+  # --- t3: ultra. Present, scored, DELIBERATELY UNUSED. ---------------------
+  # Enrolling this alone does nothing: policy.escalation_ceiling must also be
+  # raised to t3. Two independent switches, on purpose.
+  ultra-reasoner:
+    tier: t3
+    reasoning: 5
+    coding: 5
+    adherence: 4
+    tool: 5
+    speed: 1
+    ctx: 1000000
+    cost_in: 25
+    cost_out: 125
+    enrolled_roles: []
+    notes: >
+      Heaviest reasoning tier. Large marginal cost and latency for usually
+      marginal gain on coding work. Turn on only for a specific hard problem,
+      and prefer a re-plan or a human first.
+
+# ---------------------------------------------------------------------------
+# Role -> capability requirements. The workflow names roles; only this file
+# names models. Swapping providers is an edit here and nowhere else.
+# ---------------------------------------------------------------------------
+
+profiles:
+  planner:
+    require: {reasoning: 5, ctx: 150000}
+    weights: {reasoning: 3, adherence: 1}
+    cost_sensitivity: low
+
+  implementer:
+    require: {coding: 4, tool: 4}
+    weights: {coding: 3, adherence: 2, speed: 1}
+    cost_sensitivity: high
+
+  test-author:
+    require: {coding: 3}
+    weights: {adherence: 3, coding: 2}
+    cost_sensitivity: high
+
+  reviewer:
+    require: {reasoning: 4, coding: 4}
+    weights: {reasoning: 3, coding: 2}
+    cost_sensitivity: medium
+
+  integrator:
+    require: {reasoning: 4, coding: 4, adherence: 4}
+    weights: {reasoning: 2, adherence: 3}
+    cost_sensitivity: medium
+
+  classifier:
+    require: {}
+    weights: {speed: 2}
+    cost_sensitivity: max
+
+  reporter:
+    require: {}
+    weights: {speed: 2, adherence: 2}
+    cost_sensitivity: max
+
+# ---------------------------------------------------------------------------
+# Access channels — how models are actually reachable. Written by
+# `delegate init` from detected herdr sessions; edit if detection is wrong.
+#
+# For a subscription seat the marginal cost of a call is ~0 while the quota
+# window has headroom, so the router weights quota draw, not list price.
+# ---------------------------------------------------------------------------
+
+channels:
+  claude-seat:
+    type: subscription
+    runtime: claude-cli
+    herdr_session: claude
+    exposes: [opus-class-strong, balanced-coder]
+    quota: {window: 5h, est_capacity: 40, weekly_cap: true}
+    reserve_for: [planner, reviewer]   # keep headroom for the calls only this seat can make
+    reserve_fraction: 0.3
+
+  cursor-seat:
+    type: subscription
+    runtime: cursor-cli
+    herdr_session: cursor
+    exposes: [balanced-coder, fast-cheap]
+    quota: {window: monthly, est_capacity: 500}
+
+  # Metered overflow. Real money per call — budget-gated in autonomous mode.
+  # api-overflow:
+  #   type: metered
+  #   runtime: claude-cli
+  #   exposes: [balanced-coder, fast-cheap]
+
+# ---------------------------------------------------------------------------
+# Policy. Composes DOWN only: a repo or a single task may lower these,
+# never raise them.
+# ---------------------------------------------------------------------------
+
+policy:
+  escalation_ceiling:
+    max_tier: t2                      # ultra tier is out of the ladder's reach
+    max_marginal_cost_per_call: 2.50  # hard stop in USD, whatever the model
+  budgets:
+    default_task_usd: 15
+    max_iterations_per_subtask: 8
+    max_review_loops: 2
+    max_replans: 1
+  escalation_thresholds:
+    test_stuck_attempts: 3
+    edit_churn_rewrites: 4
+    scope_overrun_extra_files: 5
+  mode: attended                      # attended | autonomous  (DESIGN.md §9.2)

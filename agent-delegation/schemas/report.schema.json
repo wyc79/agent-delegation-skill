@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/report.schema.json",
+  "title": "Agent handoff report",
+  "description": "Written by every agent before it exits, to .task/<task-id>/reports/<stage>-<role|subtask>.json. Absence of a valid report means the agent crashed.",
+  "type": "object",
+  "required": ["stage", "role", "status", "summary", "evidence"],
+  "additionalProperties": false,
+  "properties": {
+    "stage": {
+      "enum": ["classify", "plan", "test", "implement", "review", "integrate"]
+    },
+    "role": {
+      "enum": ["planner", "test-author", "implementer", "reviewer", "integrator"]
+    },
+    "subtask": {
+      "type": "string",
+      "description": "Subtask id from plan.md, e.g. st-2-combat-hooks. Required for implement stage."
+    },
+    "status": {
+      "enum": ["complete", "blocked", "escalate"],
+      "description": "complete = did the job and verified it. blocked = cannot proceed, nothing further to try. escalate = needs a stronger model, a re-plan, or a human."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One paragraph written FOR THE NEXT AGENT: what changed, what surprised you, what they must know. Not for humans, not a restatement of the task."
+    },
+    "artifacts_written": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Repo-relative paths of every file created or modified, including .task/ artifacts."
+    },
+    "deviations": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^dev-[0-9]+$" },
+      "description": "Ids of entries appended to deviations.md during this session."
+    },
+    "decisions": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^D-[0-9]+$" }
+    },
+    "signals": {
+      "type": "array",
+      "description": "Escalation signals. See references/escalation.md.",
+      "items": {
+        "type": "object",
+        "required": ["type", "detail", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "enum": [
+              "test_stuck",
+              "edit_churn",
+              "scope_overrun",
+              "plan_conflict",
+              "ambiguous_requirement",
+              "blocked_command",
+              "missing_dependency",
+              "merge_conflict_cross",
+              "low_confidence"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "description": "What is wrong, citing an artifact and line where applicable."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Real command output or a concrete file reference. Never paraphrased or invented."
+          },
+          "attempted": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "What you already tried and why it failed, so the next agent does not repeat it."
+          },
+          "suggestion": { "type": "string" }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "description": "What you actually ran. Omit a field rather than guessing at it.",
+      "additionalProperties": false,
+      "properties": {
+        "commands_run": { "type": "array", "items": { "type": "string" } },
+        "tests": {
+          "type": "string",
+          "description": "Real result line, e.g. '214 passed, 0 failed'."
+        },
+        "build": { "type": "string" },
+        "not_verified": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Checks deliberately skipped, and why. Honesty here is required, not optional."
+        }
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "confidence": {
+      "enum": ["high", "medium", "low"],
+      "description": "Advisory only. Never triggers escalation on its own, and never cancels an objective threshold."
+    },
+    "role_data": {
+      "type": "object",
+      "description": "Role-specific extras named by your role card (e.g. planner subtask_ids, test-author ac_coverage).",
+      "additionalProperties": true
+    }
+  }
+}
