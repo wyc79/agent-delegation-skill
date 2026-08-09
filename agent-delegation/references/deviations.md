@@ -31,7 +31,7 @@ change is a broken integration nobody can explain.
 
 ## The log format
 
-Append to `.task/<id>/deviations.md`. Append only — never edit or delete existing
+Append to `$TASK_DIR/deviations.md`. Append only — never edit or delete existing
 entries, including your own.
 
 ```text

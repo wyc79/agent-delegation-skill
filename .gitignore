@@ -30,5 +30,7 @@ npm-debug.log*
 .env
 .env.*
 
-# Task runtime artifacts (generated per-run, not committed)
-.task/
+# NOTE: there is deliberately no `.task/` entry here.
+# Orchestration state lives outside the repository entirely, in
+# $XDG_STATE_HOME/agent-delegation/ — see DESIGN.md §4.0. Nothing about a run
+# is written into the working tree, so there is nothing to ignore.

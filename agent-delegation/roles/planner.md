@@ -8,7 +8,7 @@ You write **no production code**. Reading code is your main activity.
 
 ## Step 1 — Read the request and pin the requirements
 
-Read `.task/<id>/task.md`. If its acceptance criteria are not already numbered
+Read `$TASK_DIR/task.md`. If its acceptance criteria are not already numbered
 `AC-1`, `AC-2`, …, number them now: each must be a single, checkable statement
 ("old save files still load"), not a paragraph. Add explicit **non-goals** — they
 are what stops downstream agents from expanding scope.

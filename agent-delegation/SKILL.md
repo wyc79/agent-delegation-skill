@@ -1,22 +1,36 @@
 ---
 name: agent-delegation
-description: Use when taking part in a delegated multi-agent development workflow — when a prompt assigns you a role (planner, implementer, test author, reviewer, integrator) for a task id, when a `.task/<task-id>/` directory exists in the repo, or when asked to plan work that other agents will implement, implement one subtask of an existing plan, write tests from requirements for someone else's implementation, review an implementation against its plan, or hand results to a downstream agent. Defines the shared protocol — which artifacts to read and write, what constraints to respect, and when to stop and escalate instead of pushing through.
+description: Use when taking part in a delegated multi-agent development workflow — when a prompt assigns you a role (planner, implementer, test author, reviewer, integrator) for a task id, when `$AGENT_DELEGATION_TASK_DIR` is set in the environment, or when asked to plan work that other agents will implement, implement one subtask of an existing plan, write tests from requirements for someone else's implementation, review an implementation against its plan, or hand results to a downstream agent. Defines the shared protocol — which artifacts to read and write, what constraints to respect, and when to stop and escalate instead of pushing through.
 ---
 
 # Agent Delegation
 
 You are **one role in a pipeline**, not the whole system. Another agent planned
-this work, or will review it. You reach those agents only through files in
-`.task/<task-id>/` — they never see your reasoning, only what you write down.
+this work, or will review it. You reach those agents only through files in the
+task directory — they never see your reasoning, only what you write down.
 
-## Step 1 — Establish your assignment
+## Step 1 — Locate the task directory
 
-Your invoking prompt should give you a **role** and a **task id**. If either is
-missing, do not guess: list `.task/`, read `task.json` (its `status` names the
-active stage), and ask rather than assume. Working the wrong role corrupts
-artifacts other agents depend on.
+Task state lives **outside the repository** — shared by every worktree, never in
+git history. `$AGENT_DELEGATION_TASK_DIR` holds its absolute path; that value is
+`$TASK_DIR` throughout this skill. If unset, derive it (same key from any worktree):
 
-## Step 2 — Read exactly one role card
+```bash
+CD=$(git rev-parse --path-format=absolute --git-common-dir)
+KEY="$(basename "$(dirname "$CD")")-$(printf %s "$CD" | shasum -a 256 | cut -c1-8)"
+ls "${XDG_STATE_HOME:-$HOME/.local/state}/agent-delegation/projects/$KEY/tasks/"
+```
+
+**Never create the task directory yourself, and never write task artifacts into
+the repository.** If you cannot find it, stop. (Tool-forced exception: rule 2.)
+
+## Step 2 — Establish your assignment
+
+Your prompt should give you a **role** and a **task id**. If either is missing,
+do not guess: read `$TASK_DIR/task.json` (its `status` names the active stage)
+and ask. Working the wrong role corrupts artifacts other agents depend on.
+
+## Step 3 — Read exactly one role card
 
 | Your role | Read | Your job, in one line |
 |---|---|---|
@@ -30,11 +44,11 @@ Follow your card's numbered steps in order. Do not read the other cards.
 
 ## The task directory
 
-Everything lives in `.task/<task-id>/`:
+Everything below is relative to `$TASK_DIR` from Step 1:
 
 | File | Holds | Written by |
 |---|---|---|
-| `task.json` | Status, budgets, assignments | Orchestrator only — **never edit** |
+| `task.json` | Status, budgets, assignments, delegation history | Orchestrator only — **never edit** |
 | `task.md` | The request and its numbered acceptance criteria (`AC-n`) | Intake; amended only by humans |
 | `plan.md` | Approach plus one YAML block per subtask | Planner |
 | `deviations.md` | Append-only log of departures from the plan | Anyone who departs |
@@ -50,16 +64,19 @@ Everything lives in `.task/<task-id>/`:
 1. **Stay inside your declared file scope.** Touching files outside it is a
    deviation at minimum and usually an escalation. Wanting to fix something
    nearby is not permission to fix it.
-2. **Never `git push`, never switch branches, never touch another agent's
+2. **Task artifacts never enter the repo** — they belong in `$TASK_DIR`. If a
+   tool forces an in-repo path, it must be one `git check-ignore -q` already
+   accepts, and `git status` must be clean of it — see `references/scratch-files.md`.
+3. **Never `git push`, never switch branches, never touch another agent's
    worktree.** Commit checkpoints inside your own worktree freely.
-3. **Log every departure from the plan** in `deviations.md` as *plan said →
+4. **Log every departure from the plan** in `deviations.md` as *plan said →
    reality → what I did → severity*. An unlogged deviation reads as a defect.
-4. **An honest `blocked` is a success state.** Reporting that you are stuck with
+5. **An honest `blocked` is a success state.** Reporting that you are stuck with
    evidence beats a plausible-looking result that does not work. Never fabricate
    test output, never claim verification you did not run.
-5. **Do not expand scope.** Unrelated bugs, refactors, and cleanups belong in
+6. **Do not expand scope.** Unrelated bugs, refactors, and cleanups belong in
    `decisions.md` as observations, not in your diff.
-6. **Write your report before you exit** (Step 3). No report means you crashed.
+7. **Write your report before you exit** (Step 4). No report means you crashed.
 
 ## When to read more
 
@@ -71,11 +88,12 @@ Read these **only when the condition applies** — not preemptively:
 | You must depart from the plan and are unsure how severe it is | `references/deviations.md` |
 | You share files with another running agent, or hit a merge conflict | `references/parallelism.md` |
 | The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |
+| A tool or engine forces you to write a file inside the repo | `references/scratch-files.md` |
 | You are about to write an artifact and want the exact fields | `schemas/`, `templates/` |
 
-## Step 3 — Report before you exit
+## Step 4 — Report before you exit
 
-Write `reports/<stage>-<role>.json` matching `schemas/report.schema.json`:
+Write `$TASK_DIR/reports/<stage>-<role>.json` matching `schemas/report.schema.json`:
 status (`complete` / `blocked` / `escalate`), a summary **written for the next
 agent** (what changed, what surprised you, what they must know — no pleasantries,
 no restating the task), artifacts written, deviations raised, signals fired, and

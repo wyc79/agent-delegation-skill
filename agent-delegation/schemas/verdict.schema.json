@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/verdict.schema.json",
   "title": "Review verdict",
-  "description": "Written by the reviewer to .task/<task-id>/reports/review-reviewer.json. The verdict selects the pipeline's next transition, so the enum is exact.",
+  "description": "Written by the reviewer to $TASK_DIR/reports/review-reviewer.json. The verdict selects the pipeline's next transition, so the enum is exact.",
   "type": "object",
   "required": ["verdict", "ac_table", "findings"],
   "additionalProperties": false,

@@ -46,8 +46,18 @@ User request
     ↓  integrate          merge in dependency order, re-verify at each step
 ```
 
-Agents never message each other. Everything moves through files in
-`.task/<task-id>/`:
+Agents never message each other. Everything moves through files in a task
+directory that lives **outside the repository** — so orchestration state never
+touches your git history, and every worktree shares one copy:
+
+```text
+~/.local/state/agent-delegation/projects/<project-key>/tasks/<task-id>/
+```
+
+`<project-key>` is derived from `git rev-parse --git-common-dir`, which resolves
+identically from every worktree of a repo — so any agent, anywhere, finds the
+same task state with no configuration. The orchestrator also injects
+`$AGENT_DELEGATION_TASK_DIR` so the normal path is a single env read.
 
 | File | Holds | Authority |
 |---|---|---|
@@ -56,7 +66,11 @@ Agents never message each other. Everything moves through files in
 | `deviations.md` | Append-only log of departures from the plan | Amends `plan.md` |
 | `decisions.md` | Append-only design decisions and why | Context |
 | `reports/*.json` | One schema-validated handoff per agent | Evidence |
-| `task.json` | Status, budgets, assignments | Orchestrator-owned |
+| `verify/` | Build, test, and lint output by run id | Evidence |
+| `task.json` | Status, budgets, model assignments, delegation history | Orchestrator-owned |
+
+The repository keeps source, tests, and durable documentation. Nothing about a
+run — no `.task/`, not even ignored — is ever written into it.
 
 ## What's in the repo
 

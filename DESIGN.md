@@ -21,7 +21,7 @@ the decision rather than hunt for it:
 | # | Decision | Alternative rejected | Why |
 |---|----------|---------------------|-----|
 | D1 | The **orchestrator is deterministic code**, not an LLM | LLM-as-orchestrator | State machines, budgets, retries, and permissions must be auditable, cheap, and never hallucinate. LLM judgment is injected at specific points (classify, plan, review), not for control flow. |
-| D2 | The **protocol is files + JSON schemas**, not provider APIs | Shared message bus / provider-native agent frameworks | Files in a git worktree are durable, inspectable, diffable, provider-neutral, and survive crashes. Any model that can read/write files can participate. |
+| D2 | The **protocol is files + JSON schemas**, in a state directory **outside the repo** | Shared message bus; or `.task/` committed in the repo | Files are durable, inspectable, provider-neutral, and survive crashes — any model that can read/write files can participate. Keeping them out of the working tree (§4.0) is what makes worktree parallelism possible: artifacts shared by every worktree cannot conflict at merge, and git history stays free of run scaffolding. |
 | D3 | The **router is config-driven deterministic scoring**, not an LLM | LLM-based routing | Routing runs on every stage transition; it must be fast, free, reproducible, and debuggable. The only LLM in the routing path is the task *classifier*, and it's a cheap model with a heuristic pre-filter. |
 | D4 | **Escalation triggers on objective signals**; self-reported confidence is a tiebreaker only | "Ask the model if it's confident" | Models are poorly calibrated about their own work. Test failures, scope overruns, and edit churn are measurable. |
 | D5 | **Deterministic verification (build/test/lint) runs before any LLM review** | Review-first | Never pay reviewer tokens to discover a compile error. Cheapest check always runs first. |
@@ -60,7 +60,7 @@ the decision rather than hunt for it:
                             │ read/write
                             ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│               ARTIFACT STORE  —  .task/<task-id>/ in git           │
+│      ARTIFACT STORE — XDG state dir, OUTSIDE the repo (§4)         │
 │  task.json (state) · task.md (intent) · plan.md (approach)         │
 │  decisions.md · deviations.md · reports/*.json                     │
 └────────────────────────────────────────────────────────────────────┘
@@ -318,7 +318,7 @@ Conventions carried over from the reference repo:
 - **`SKILL.md` frontmatter** = `name` + a long, trigger-rich `description` that
   tells a host agent *when* to load the skill ("you have been assigned a role in
   a delegated development workflow", "you are the planner/implementer/reviewer for
-  task …", "a `.task/` directory with `task.json` exists in this repo").
+  task …", "`$AGENT_DELEGATION_TASK_DIR` is set in the environment").
 - **Numbered, imperative workflow steps** inside each role card (the reference
   skill's Step 0…N style), each ending with the artifact the step must write —
   so "produce the report" is a step, not an afterthought.
@@ -348,7 +348,7 @@ with **budgets treated as design constraints, not aspirations**:
 
 **What stays in `SKILL.md`** — only what *every* role needs before it knows
 anything else: how to identify your assigned role and find your card; the
-`.task/<id>/` map in a five-line table; the four or five hard rules that must never
+how to locate `$TASK_DIR` and its map in a short table; the hard rules that must never
 be missed (stay in your file scope, never push, log deviations, an honest
 `BLOCKED` beats a fabricated success, write the report before exiting); a
 one-line-per-item index of what's in `references/` **with its trigger**; and the
@@ -380,7 +380,7 @@ Every agent ends its session by writing `reports/<stage>-<agent>.json`:
   "subtask": "st-2-combat-hooks",
   "status": "complete | blocked | escalate",
   "summary": "one paragraph for the next agent, not for the human",
-  "artifacts_written": ["src/combat/hooks.gd", ".task/T-014/deviations.md"],
+  "artifacts_written": ["src/combat/hooks.gd", "$TASK_DIR/deviations.md"],
   "deviations": ["dev-3"],
   "signals": [{"type": "scope_overrun", "detail": "...", "evidence": "..."}],
   "evidence": {"tests": "42 passed, 0 failed", "verify_run_id": "v-129"},
@@ -397,48 +397,150 @@ the task, only what changed, what surprised you, and what the next role must kno
 
 ## 4. Planning artifacts
 
+### 4.0 Where artifacts live: outside the repository
+
+Orchestration state **never enters the working repository** — not as a committed
+directory, not as an ignored one. The reasons compound:
+
+- Worktrees make in-repo state actively wrong. A `.task/` on the integration
+  branch is invisible to subtask worktrees cut before it changed, and any
+  attempt to share it makes every agent's checkpoint commit a write to a file
+  every *other* agent is also writing. Report files would collide at every merge.
+- It pollutes history and diffs with churn that is not the deliverable, and
+  leaks planning scratch into any PR.
+- `.gitignore` does not fix it: ignored files still sit in the worktree, get
+  wiped by `git clean`, and are absent from a fresh worktree that needs them.
+
+**Investigated first: does herdr already have a place for this?** Findings from
+herdr 0.8.0 on this machine:
+
+- There is **no `~/.herdr/`**. herdr follows XDG: `~/.config/herdr/`
+  (`config.toml`, `session.json`, sockets, logs) and `~/.local/state/herdr/`
+  (runtime state — currently `agent-detection/`).
+- herdr has **no per-project document or artifact store** to reuse. Its
+  project-adjacent primitives are *terminal topology* (workspaces, tabs, panes),
+  *git worktree-backed workspaces*, and `workspace report-metadata`, which is
+  explicitly **display-only**, token/TTL-based, and meant for surfacing status in
+  the UI — not durable storage.
+- `~/.local/state/herdr/` is herdr's **private runtime state**, not a documented
+  extension point. Writing our artifacts there would couple us to another tool's
+  internals and risk being clobbered on upgrade.
+
+So the correct reading of "reuse herdr rather than reinvent" is: **reuse herdr's
+mechanisms, not its storage.** We adopt herdr's *conventions* (XDG state, a
+sibling directory) and delegate the things herdr genuinely owns — worktree
+lifecycle, env injection, agent lifecycle, notifications (§4.6).
+
 ### 4.1 Layout
 
 ```text
-.task/<task-id>/
-    task.json          # orchestrator-owned machine state  (AUTHORITATIVE: status)
-    task.md            # intent + acceptance criteria      (AUTHORITATIVE: what)
-    plan.md            # approach + subtask blocks         (AUTHORITATIVE: how)
-    test_plan.md       # complex tasks only
-    decisions.md       # append-only ADR-lite log
-    deviations.md      # append-only departures from plan.md
-    reports/           # per-stage JSON handoffs (§3.4)
-    verify/            # verify-runner outputs, referenced by run id
+$XDG_STATE_HOME/agent-delegation/            # default: ~/.local/state/agent-delegation
+├── index.json                               # project-key → repo path, for humans and tooling
+└── projects/
+    └── <project-key>/                       # e.g. my-game-3f9a1c2b
+        ├── project.json                     # repo identity, engine, hotspots, verify commands
+        └── tasks/
+            └── T-014/
+                ├── task.json                # machine state    (AUTHORITATIVE: status)
+                ├── task.md                  # intent + criteria (AUTHORITATIVE: what)
+                ├── plan.md                  # approach + subtasks (AUTHORITATIVE: how)
+                ├── decisions.md             # append-only ADR-lite log
+                ├── deviations.md            # append-only departures from plan.md
+                ├── brief.md                 # human-facing rendering (§9.4)
+                ├── reports/                 # per-stage JSON handoffs (§3.4)
+                └── verify/                  # verify-runner outputs, by run id
 ```
 
-Changes from the proposed layout, with reasons:
+**Project key — the mechanism that makes this work across worktrees.** Every
+worktree of a repo resolves to the *same* git common directory:
+
+```bash
+git rev-parse --path-format=absolute --git-common-dir
+# main checkout  → /repos/my-game/.git
+# any worktree   → /repos/my-game/.git      (identical — verified)
+```
+
+So the key is `<repo-basename>-<first 8 hex of sha256(realpath(common-dir))>`.
+Any agent, in any worktree, in any provider's CLI, derives the same project key
+from one git command with no configuration. The basename keeps the directory
+human-navigable; the hash keeps two same-named repos apart.
+
+**How an agent finds its task directory**, in order:
+
+1. `$AGENT_DELEGATION_TASK_DIR` — an absolute path injected by the orchestrator
+   when it creates the workspace (herdr's `workspace create --env KEY=VALUE`).
+   This is the normal path and requires no lookup.
+2. Derive the project key as above, then read
+   `projects/<key>/tasks/` and select by the task id in the prompt.
+3. If neither resolves, **stop and ask** — do not create a task directory and do
+   not fall back to writing inside the repo.
+
+**What stays in the repository:** source, tests, and durable documentation —
+including design docs, ADRs, and any artifact whose value outlives the task.
+Orchestration state (status, budgets, reports, verify logs, briefs) is
+scaffolding and stays out. The boundary test: *would this still be worth reading
+a year from now with the task long finished?* If yes, an agent may propose
+committing it as project documentation; the run's bookkeeping never is.
+
+Changes from the originally proposed in-repo layout, with reasons:
 
 - **`requirements.md` is merged into `task.md`.** Requirements separated from the
   task statement drift; a single intent document with numbered acceptance criteria
   (`AC-1`, `AC-2`, …) is what the Reviewer and Test Author both key off.
-- **`affected_files.md` is dissolved into `plan.md` subtask blocks.** A standalone
-  file list has no owner and goes stale; file scopes belong to the subtasks that
-  declare them, where the workspace manager reads them for lock decisions.
+- **`affected_files.md` is dissolved into two owners.** *Planned* scope lives in
+  `plan.md` subtask blocks (where the workspace manager reads it for lock
+  decisions); *actual* touched files live in `task.json`'s per-subtask record,
+  computed from git rather than self-reported. A standalone hand-maintained file
+  list has no owner and goes stale — this way the planned/actual divergence is
+  exactly what the reviewer's mechanical scope check compares.
 - **`task.json` is added** as the one purely machine-owned file. Agents never write
-  it. It carries status, stage history, budgets/counters, model assignments, and
-  worktree refs — everything needed to resume after a crash.
+  it. It carries status, stage history, budgets/counters, model assignments,
+  delegation history, and worktree refs — everything needed to resume after a crash.
 - **`deviations.md` is added** and is load-bearing (see 4.4).
+- **`test_plan.md` is dropped** as a separate file; the test plan is a section of
+  `plan.md` (same author, same lifecycle) and results live in `verify/`.
 
 ### 4.2 File contents
 
-**`task.json`** (orchestrator-owned):
+**`task.json`** (orchestrator-owned; agents read, never write). Covers task
+identity, implementation status, agent/model assignment, and delegation history
+in one resumable document:
+
 ```json
 {
   "id": "T-014",
   "mode": "attended",
   "status": "implementing",
+  "project_key": "my-game-3f9a1c2b",
+  "repo": {"path": "/repos/my-game", "common_dir": "/repos/my-game/.git",
+           "base_commit": "a1b2c3d", "integration_ref": "refs/adg/T-014/integration"},
   "classification": {"tier": "complex", "by": "heuristic+llm", "score": 0.81},
-  "budgets": {"tokens": 2500000, "spent": 914000, "iterations": {"st-2": 3}},
-  "assignments": {"planner": "modelA", "impl:st-2": "modelC"},
-  "worktrees": {"st-2": "../wt/T-014-st-2"},
-  "stage_history": [{"stage": "plan", "report": "reports/plan.json", "at": "..."}]
+  "budgets": {"usd_cap": 15, "usd_spent": 4.10, "iterations": {"st-2": 3}},
+  "subtasks": [
+    {"id": "st-2-combat-hooks", "status": "complete",
+     "worktree": "/repos/.worktrees/T-014-st-2", "branch": "adg/T-014/st-2",
+     "planned_scope": ["src/combat/combat_system.gd"],
+     "actual_files": ["src/combat/combat_system.gd", "src/combat/hooks.gd"],
+     "iterations": 3, "report": "reports/implement-st-2-combat-hooks.json"}
+  ],
+  "delegation_history": [
+    {"at": "2026-08-09T10:02:11Z", "stage": "plan", "role": "planner",
+     "model": "opus-class-strong", "channel": "claude-seat",
+     "herdr": {"workspace": "w3", "pane": "w3:p1", "agent": "planner-t014"},
+     "outcome": "complete", "usd": 1.80},
+    {"at": "2026-08-09T10:31:04Z", "stage": "implement", "role": "implementer",
+     "subtask": "st-2-combat-hooks", "model": "balanced-coder",
+     "channel": "cursor-seat", "outcome": "escalate",
+     "signals": ["test_stuck"], "rung": 0, "usd": 0.42}
+  ],
+  "gates": [{"kind": "plan_approval", "state": "approved",
+             "by": "human", "at": "2026-08-09T10:20:00Z"}]
 }
 ```
+
+`delegation_history` is append-only and is what makes §5.6 telemetry possible
+(which model, in which role, escalated how often, at what cost) as well as
+answering "how did this code come to exist" months later.
 
 **`task.md`** — human-readable; the original request verbatim, then a normalized
 restatement, then numbered acceptance criteria, then explicit non-goals. Non-goals
@@ -503,6 +605,77 @@ interface named in the plan, or contradicts an entry in `decisions.md` — major
 deviations fire an escalation signal (§6) instead of just a log line. The Reviewer
 cross-checks the diff against declared scopes mechanically (the orchestrator gives
 it the file-list diff), so unlogged deviations are detectable, not just discouraged.
+
+### 4.5 The in-repo escape hatch
+
+Some tools cannot be talked out of writing into the working tree: engine test
+runners that emit reports beside the project, build tools that accept only
+relative output paths, profilers, coverage writers. A rule with no exception
+here would just be violated quietly, so the exception is defined and checkable.
+
+**The rule:** if a file must land inside the repo, it must go where the repo
+**already ignores**, verified mechanically rather than by convention:
+
+```bash
+git check-ignore -v <path>     # exit 0 + the matching rule = safe; exit 1 = stop
+```
+
+**Agents may not create the condition that satisfies the rule.** Editing
+`.gitignore` is a change to the project and lands in the diff — it is precisely
+the pollution being avoided. When no suitable ignored location exists, the agent
+raises `blocked_command` and stops.
+
+**The orchestrator, not the agent, may provision one.** At task setup it can
+append a task-scoped entry to `.git/info/exclude` — repo-local, never committed,
+invisible to diffs and PRs, and (living in the git common dir) automatically
+shared by every worktree of the task. That is the one place a new ignore rule may
+come from, and it is cleaned up at task teardown.
+
+Three supporting constraints keep this from becoming a side channel:
+
+1. **Ephemeral by definition.** Ignored paths are wiped by `git clean -xdf`, are
+   absent from fresh worktrees, and may be cleared by the owning tool. Anything
+   cited as evidence must be copied into `$TASK_DIR` (verify output into
+   `verify/`), because the next agent may run in a different worktree.
+2. **`git status --porcelain` must be clean of it** before an agent exits — the
+   same mechanical check the reviewer already runs for scope. A scratch file that
+   appears there was never actually ignored.
+3. **Durable documentation is not scratch.** A design doc or ADR that outlives
+   the task belongs in the repo's normal docs path, committed and reviewed like
+   any other change — never hidden in an ignored directory to dodge review. The
+   inverse also holds: run bookkeeping never gets committed as "documentation."
+
+Agent-facing version of this: `references/scratch-files.md`.
+
+### 4.6 Division of labor with herdr
+
+The rule is **reuse herdr's mechanisms; own only the artifacts**. What each side
+does, and what we explicitly do *not* rebuild:
+
+| Concern | Owner | Mechanism |
+|---|---|---|
+| Worktree create / open / remove | **herdr** | `herdr worktree create --branch <b> --base <ref> --path <p> --label <l>`, `worktree list`, `worktree remove` — not raw `git worktree` |
+| Terminal topology per task/subtask | **herdr** | `workspace create`, `tab create`, `pane split` |
+| Passing the task dir to an agent | **herdr** | `workspace create --env AGENT_DELEGATION_TASK_DIR=<abs path>` |
+| Launching a role agent on a chosen channel | **herdr** | `agent start <name> --kind <cli> --pane <id>` (the §5.4 channel selects `--kind`) |
+| Prompting and awaiting completion | **herdr** | `agent prompt <name> --wait`, `agent wait --until blocked` |
+| Liveness / stuck detection | **herdr** | agent lifecycle states: `idle`, `working`, `blocked`, `done`, `unknown` |
+| Surfacing gate requests to the human | **herdr** | `herdr notification show`, plus `workspace report-metadata` for at-a-glance status in the sidebar |
+| Provider auth | **herdr** | authenticated CLI sessions (D10) |
+| Task artifacts and their schemas | **us** | XDG state dir (§4.1) |
+| Lifecycle state machine, budgets, routing, gates | **us** | orchestrator (§2, §5, §9) |
+
+Two boundary notes worth keeping straight. `workspace report-metadata` is
+**display-only** with a TTL — it is a good way to show `T-014 · implementing ·
+2/4 subtasks` in the UI, and a bad place to keep state; `task.json` remains the
+only source of truth. And herdr's agent lifecycle answers *"is this agent
+alive and idle?"*, never *"did it succeed?"* — that question is answered by a
+schema-valid report plus verify output, because an agent can go `idle` having
+accomplished nothing.
+
+When herdr is absent, every row above degrades to a local equivalent (`git
+worktree`, subprocess spawn, an env var, terminal prompts). The artifact layer is
+unchanged, which is the point of keeping the two separable.
 
 ---
 
@@ -867,13 +1040,23 @@ wall-clock. Pessimism wins (D6).
 ### 7.2 Git/worktree mechanics
 
 ```text
-main
- └── task/T-014            (integration branch, created at PLAN)
-      ├── wt: T-014-st-1   (worktree, parallel group A)
-      ├── wt: T-014-st-2   (worktree, parallel group A)
-      └── wt: T-014-st-4   (worktree, group B — created after A integrates)
+repo (user's checkout — untouched, no task files ever)
+ └── adg/T-014/integration        (integration branch, created at PLAN)
+      ├── wt: T-014-st-1          (worktree, parallel group A)
+      ├── wt: T-014-st-2          (worktree, parallel group A)
+      └── wt: T-014-st-4          (worktree, group B — after A integrates)
+
+~/.local/state/agent-delegation/projects/<key>/tasks/T-014/
+      task.json · plan.md · reports/ · verify/      (shared by all of the above)
 ```
 
+- Worktrees are created **through herdr** (`herdr worktree create --branch
+  adg/T-014/st-2 --base <integration> --path <dir> --label "T-014 st-2"`), so they
+  appear as real workspaces the human can look inside, and are removed with
+  `herdr worktree remove`. Their checkout path lives outside the user's
+  repository directory, not nested inside it.
+- Branch and ref names are namespaced `adg/<task-id>/…` so they never collide
+  with human branches and are trivially prunable.
 - One worktree per *running* subtask, branched from the integration branch.
 - Agents commit checkpoints inside their worktree freely (these commits are the
   crash-recovery and salvage mechanism).
@@ -883,8 +1066,15 @@ main
   already landed.
 - Conflict at rebase despite scope discipline (it happens: formatting, imports,
   generated files) → Integrator agent with both diffs and the plan.
-- `.task/` lives on the integration branch; subtask worktrees write only their
-  `reports/` files, which never conflict (per-agent filenames).
+- **No task artifacts exist on any branch.** Every worktree reads and writes the
+  same out-of-repo task directory (§4.1), located by
+  `$AGENT_DELEGATION_TASK_DIR` or derived from the shared git common dir. This
+  is what makes concurrent subtasks possible at all: artifact writes cannot
+  conflict at merge time, because they are not in the merge.
+- Concurrent writes to the shared task dir are kept safe by **partitioning, not
+  locking**: each agent writes only its own `reports/<stage>-<id>.json` (unique
+  filename), appends to the logs via atomic append, and never writes `task.json`
+  — the orchestrator is its single writer.
 
 ### 7.3 When parallelism is worth it at all
 
@@ -1052,7 +1242,7 @@ body, and park notification is rendered as a brief**, written to a single standa
 > A reasonably capable programmer who has **never seen this repo** should get the
 > idea in one read.
 
-**The brief format** (`.task/<id>/brief.md`, regenerated at each gate):
+**The brief format** (`$TASK_DIR/brief.md`, regenerated at each gate):
 
 1. **The decision needed now** — first, not last: what you're being asked, the
    default, and what happens on approve/reject. ("Approve this plan? It adds rate
@@ -1189,9 +1379,14 @@ still sufficient for the §5.4 quota shadow-pricing.
 
 ### 11.3 Agent-level sandbox
 
-- **Filesystem:** rw on own worktree + `.task/<id>/reports/`; ro on dependency
-  caches; no home-dir, no other worktrees. Enforced by container mounts (or OS
-  sandbox profiles on dev machines), *not* by prompt instructions.
+- **Filesystem:** rw on own worktree, plus a **narrow bind of the task
+  directory** — `$TASK_DIR/reports/` writable, the rest of `$TASK_DIR` read-only,
+  and `task.json` read-only always (the orchestrator is its only writer). Read-only
+  on dependency caches; no home-dir, no other worktrees, no other projects' task
+  dirs. Enforced by container mounts (or OS sandbox profiles on dev machines),
+  *not* by prompt instructions. Moving artifacts out of the repo makes this
+  boundary sharper than it was: the state store is now a mount point that can be
+  scoped per agent, rather than a directory inside a tree the agent must write to.
 - **Network:** default-deny for agent-spawned processes. Explicit allowlist for
   package registries when a gated dependency change was approved. Model API
   traffic is the agent CLI's own authenticated connection (managed by herdr, D10)
@@ -1240,7 +1435,8 @@ a sibling failed** — integrate what passed, replan the remainder.
 Task: *"Add rate limiting to our public API with per-key quotas, configurable via
 the admin panel."*
 
-1. **INTAKE** → `T-021/task.md`: request verbatim, ACs (`AC-1` limit enforcement,
+1. **INTAKE** → `~/.local/state/agent-delegation/projects/api-7c21f0a4/tasks/T-021/task.md`:
+   request verbatim, ACs (`AC-1` limit enforcement,
    `AC-2` per-key config, `AC-3` admin UI, `AC-4` 429 semantics), non-goals
    (no billing integration).
 2. **CLASSIFY** — heuristics: multi-layer keywords (API + UI + config) → COMPLEX
@@ -1330,17 +1526,20 @@ config files:
    Ceilings (§5.3b) reduce to two config fields worth keeping even in the MVP:
    `enrolled_roles` per model and a deployment `max_tier`, since together they're
    what stops a runaway ladder from finding the most expensive model available.
-4. **Artifacts**: `task.json`, `task.md`, `plan.md` (with YAML subtask blocks),
-   `deviations.md`, `reports/*.json` with schema validation. Skip `test_plan.md`
-   and `decisions.md` split — fold both into `plan.md` sections for now.
+4. **Artifacts**: in the XDG state dir from day one (§4.1) — retrofitting the
+   path later would touch every file in the skill. `task.json`, `task.md`,
+   `plan.md` (with YAML subtask blocks), `deviations.md`, `reports/*.json` with
+   schema validation. Fold `decisions.md` into a `plan.md` section for now. The
+   project-key helper is ~5 lines of shell; `index.json` can wait.
 5. **Skill**: the §3.3b repo layout (`agent-delegation/SKILL.md`, ≤100 lines) + 3
    role cards (Planner, Implementer, Reviewer; Test-Author folded into Implementer
    mode for now) + `references/escalation.md`, installable into any agent's skills
    folder. Keep the §3.3c budgets from day one — a skill that starts bloated never
    gets trimmed later.
-6. **Workspaces**: one worktree per task (not per subtask). **No parallelism** —
-   sequential subtasks in one worktree. Locks/hotspots reduced to a config list
-   the classifier uses to force COMPLEX.
+6. **Workspaces**: one worktree per task (not per subtask), created via
+   `herdr worktree create` with `git worktree` as the no-herdr fallback.
+   **No parallelism** — sequential subtasks in one worktree. Locks/hotspots
+   reduced to a config list the classifier uses to force COMPLEX.
 7. **Verify runner**: shell commands from project config (`build`, `test`,
    `lint`), pure/engine-bound split as two command sets.
 8. **Escalation**: exactly two signals — `test_stuck` (3 strikes) and

@@ -10,7 +10,7 @@ catches missing requirements — so do not go looking for the implementation to
 
 ## Step 1 — Work from requirements, not code
 
-Read `.task/<id>/task.md` (the `AC-n` list is your specification) and the
+Read `$TASK_DIR/task.md` (the `AC-n` list is your specification) and the
 approach section of `plan.md` — enough to know where tests belong and what the
 public seams are called.
 
