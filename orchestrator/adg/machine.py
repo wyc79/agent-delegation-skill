@@ -522,8 +522,10 @@ class Orchestrator:
         if session is not None:
             try:
                 self.adapter.teardown(session)
-            except Exception:  # teardown must never mask the real outcome
-                pass
+            except Exception as e:
+                # Teardown must never mask the real outcome, but swallowing it
+                # silently hides adapter bugs that only show up as leaked panes.
+                self.log("  warning: teardown failed: %s: %s" % (type(e).__name__, e))
 
     def _log_transcript(self, role, prompt, res):
         """Keep what the agent was asked and what it said. An agent that does

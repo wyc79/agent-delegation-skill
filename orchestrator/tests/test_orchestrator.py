@@ -242,9 +242,9 @@ class TestVerifyAndScope(unittest.TestCase):
 
 class TestSchema(unittest.TestCase):
     def test_valid_report_passes(self):
-        schema.validate_report({
+        self.assertTrue(schema.validate_report({
             "stage": "implement", "role": "implementer", "status": "complete",
-            "summary": "did the thing", "evidence": {"tests": "3 passed"}})
+            "summary": "did the thing", "evidence": {"tests": "3 passed"}}))
 
     def test_missing_evidence_is_rejected(self):
         with self.assertRaises(schema.Invalid):
