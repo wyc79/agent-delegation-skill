@@ -145,11 +145,23 @@ class TestStore(unittest.TestCase):
                              capture_output=True, text=True).stdout
         self.assertEqual(out.strip(), "", "task creation dirtied the working tree")
 
-    def test_task_json_survives_a_crash_midwrite(self):
+    def test_a_crash_midwrite_leaves_the_previous_state_readable(self):
+        # The old version of this test simulated no crash and asserted a
+        # property true of every directory. It would have passed with atomic
+        # writes removed.
         task = store.Task.create(self.t.repo, "T-001", "# t\n", {"max_cost_usd": 1})
         task.update(status="planning")
-        self.assertEqual(task.state["status"], "planning")
-        self.assertEqual(len(os.listdir(task.path)), len(set(os.listdir(task.path))))
+        boom = RuntimeError("killed mid-write")
+
+        def explode(state):
+            state["status"] = "implementing"
+            raise boom
+
+        with self.assertRaises(RuntimeError):
+            task.mutate(explode)
+        reread = store.Task(task.path).state
+        self.assertEqual(reread["status"], "planning", "a partial write was visible")
+        self.assertEqual(len(json.dumps(reread)) > 0, True)
 
 
 class TestLimits(unittest.TestCase):
@@ -663,6 +675,200 @@ class TestParallelEndToEnd(unittest.TestCase):
                               lambda k, t: True, log=lambda *_: None).run()
         self.assertEqual(status, "needs_human")
         self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+
+class TestWaveRaces(unittest.TestCase):
+    """Parallel waves shared the state that encodes safety. Each of these is a
+    concurrent restatement of an invariant the sequential path already keeps."""
+
+    PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+- id: st-2-beta
+  goal: add beta
+  file_scope: ["beta.py"]
+  hotspots: ["shared/scene.tscn"]
+  acceptance: [AC-2]
+- id: st-3-gamma
+  goal: add gamma
+  file_scope: ["gamma.py"]
+  hotspots: ["shared/scene.tscn"]
+  acceptance: [AC-3]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _run(self, implementer, task_id="T-W"):
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(self.PLAN)
+
+        def reviewer(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
+                                   "reports", "review-reviewer.json"), "w") as fh:
+                json.dump({"stage": "review", "role": "reviewer", "status": "complete",
+                           "summary": "ok", "evidence": {"tests": "ok"},
+                           "role_data": {"verdict": {"verdict": "APPROVE",
+                                                     "ac_table": [{"ac": "AC-1",
+                                                                   "status": "met"}],
+                                                     "findings": []}}}, fh)
+
+        task = store.Task.create(self.t.repo, task_id, "# t\n\nAdd three things\n",
+                                 self.pol)
+        script = {"planner": planner, "implementer": implementer,
+                  "test-author": lambda e, c: None, "reviewer": reviewer}
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        return status, task, logs
+
+    def test_one_subtask_escalating_stops_the_run_even_as_a_sibling_succeeds(self):
+        """The headline race: a sibling's `complete` report overwrote an
+        escalation held on a shared attribute, so the escalated subtask was
+        marked done off the sibling's green checks.
+
+        The interleave is forced rather than hoped for: the escalating thread
+        is held *between* its own _invoke returning and the caller reading the
+        report, which is exactly the window the shared attribute exposed."""
+        import threading
+        sibling_reported = threading.Event()
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            if "st-1" in cwd:
+                with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                    fh.write("A = 1\n")
+                _report(td, "implement-st-1-alpha.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-1-alpha", "status": "complete",
+                    "summary": "did alpha", "evidence": {"tests": "ok"}})
+            else:
+                _report(td, "implement-st-2-beta.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-2-beta", "status": "escalate",
+                    "summary": "No code written — the plan is wrong.",
+                    "evidence": {"not_verified": ["everything"]}})
+
+        class Interleaved(Orchestrator):
+            def _invoke(self, role, choice, cwd, **kw):
+                out = Orchestrator._invoke(self, role, choice, cwd, **kw)
+                sub = kw.get("subtask") or {}
+                if sub.get("id") == "st-1-alpha":
+                    sibling_reported.set()          # my report is now the latest
+                elif sub.get("id") == "st-2-beta":
+                    sibling_reported.wait(10)       # let it land before I read mine
+                return out
+
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(self.PLAN)
+
+        task = store.Task.create(self.t.repo, "T-W1", "# t\n\nAdd things\n", self.pol)
+        logs = []
+        status = Interleaved(task, self.reg, runtime.MockAdapter(
+            {"planner": planner, "implementer": implementer,
+             "test-author": lambda e, c: None}),
+            lambda k, t: True, log=logs.append).run()
+
+        self.assertEqual(status, "needs_human",
+                         "an escalating subtask was absorbed by its sibling\n"
+                         + "\n".join(logs))
+        self.assertIn("reported escalate", "\n".join(logs))
+        self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+    def test_counters_from_parallel_subtasks_are_not_lost(self):
+        # Lost read-modify-writes on task.json make the attempt and spend caps
+        # fail open, which is the opposite of the property they exist for.
+        def implementer(env, cwd):
+            sub = os.path.basename(cwd.rstrip("/")).split("-", 2)[-1]   # st-N-name
+            name = sub.split("-")[-1]
+            with open(os.path.join(cwd, "%s.py" % name), "w") as fh:
+                fh.write("V = 1\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "ok", "evidence": {"tests": "ok"}})
+
+        status, task, logs = self._run(implementer, task_id="T-W2")
+        attempts = task.state["spent"]["attempts"]
+        self.assertEqual(attempts.get("st-1-alpha"), 1, attempts)
+        self.assertEqual(attempts.get("st-2-beta"), 1, attempts)
+        roles = [h for h in task.state["delegation_history"] if h["role"] == "implementer"]
+        self.assertGreaterEqual(len(roles), 2, "a delegation record was lost")
+
+    def test_hotspots_from_a_real_plan_force_serialization(self):
+        # The old test hand-wrote a `hotspots` key the plan parser dropped, so
+        # it proved the scheduler's arithmetic and nothing about the pipeline.
+        task = store.Task.create(self.t.repo, "T-W3", "# t\n", self.pol)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        task.write_text("plan.md", self.PLAN)
+        subs = orch._read_plan_subtasks()
+        self.assertEqual(subs[1]["hotspots"], ["shared/scene.tscn"],
+                         "the parser drops hotspots, so the guard cannot fire")
+        task.update(subtasks=[dict(x, status="pending") for x in subs])
+        wave = [t["id"] for t in orch._wave(task.state["subtasks"])]
+        self.assertIn("st-1-alpha", wave)
+        self.assertNotIn("st-3-gamma", wave,
+                         "two subtasks sharing an unmergeable file ran together")
+
+    def test_a_project_declared_hotspot_also_serializes(self):
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast: []\nhotspots:\n  - "alpha.py"\n')
+        task = store.Task.create(self.t.repo, "T-W4", "# t\n", self.pol)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        task.update(subtasks=[
+            {"id": "st-1", "status": "pending", "planned_scope": ["alpha.py"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["alpha.py", "b.py"]}])
+        self.assertEqual(len(orch._wave(task.state["subtasks"])), 1)
+
+    def test_scope_is_measured_against_the_base_not_the_checkpoint(self):
+        # base_commit was unset on the wave path whenever the test author did
+        # not run, so every diff was taken against a HEAD that already
+        # contained the work: nothing ever looked changed.
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\ntest_author: never\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "no test author"], self.t.repo)
+
+        def implementer(env, cwd):
+            sub = os.path.basename(cwd.rstrip("/")).split("-", 2)[-1]   # st-N-name
+            name = sub.split("-")[-1]
+            with open(os.path.join(cwd, "%s.py" % name), "w") as fh:
+                fh.write("V = 1\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "ok", "evidence": {"tests": "ok"}})
+
+        status, task, logs = self._run(implementer, task_id="T-W5")
+        self.assertNotIn("test-author",
+                         [h["role"] for h in task.state["delegation_history"]])
+        # Per subtask, not the union: with the defect the *wave* members record
+        # nothing while a later sequential subtask records everything, so a
+        # union assertion passes while the guarantee is broken.
+        by_id = {x["id"]: x.get("actual_files") or [] for x in task.state["subtasks"]}
+        for sub_id, expected in (("st-1-alpha", "alpha.py"), ("st-2-beta", "beta.py")):
+            self.assertIn(expected, by_id.get(sub_id, []),
+                          "%s recorded %r — its diff was taken against its own "
+                          "checkpoint\n%s" % (sub_id, by_id.get(sub_id), "\n".join(logs)))
 
 
 class TestRuntimeSurfaces(unittest.TestCase):

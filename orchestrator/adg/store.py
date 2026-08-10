@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 
@@ -82,6 +83,19 @@ class Task:
 
     def __init__(self, path):
         self.path = path
+        # Wave threads all mutate this file. Atomic replace prevents a torn
+        # file; it does nothing about lost updates, so every read-modify-write
+        # goes through one lock. Without it the attempt and spend counters --
+        # the things the limits are made of -- silently drop writes.
+        self._lock = threading.RLock()
+
+    def mutate(self, fn):
+        """Apply fn(state) to task.json under the lock and persist it."""
+        with self._lock:
+            state = self.state
+            fn(state)
+            self.write_json("task.json", state)
+            return state
 
     # --- construction -----------------------------------------------------
     @classmethod
@@ -166,10 +180,7 @@ class Task:
         return self.read_json("task.json")
 
     def update(self, **changes):
-        s = self.state
-        s.update(changes)
-        self.write_json("task.json", s)
-        return s
+        return self.mutate(lambda s: s.update(changes))
 
     def id(self):
         return self.state["id"]
@@ -178,18 +189,13 @@ class Task:
         return self.state["repo"]["path"]
 
     def record_delegation(self, entry):
-        s = self.state
         entry.setdefault("at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        s["delegation_history"].append(entry)
-        self.write_json("task.json", s)
+        self.mutate(lambda s: s["delegation_history"].append(entry))
 
     def record_gate(self, kind, decision, note=""):
-        s = self.state
-        s["gates"].append({
-            "kind": kind, "state": decision, "by": "human", "note": note,
-            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
-        self.write_json("task.json", s)
+        entry = {"kind": kind, "state": decision, "by": "human", "note": note,
+                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        self.mutate(lambda s: s["gates"].append(entry))
 
     def reports(self):
         d = self.file("reports")

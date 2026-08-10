@@ -67,9 +67,6 @@ class Orchestrator:
         self.log = log
         self.dry_run = dry_run
         self.budget = lim.Budget(task)
-        self._last_failure = None
-        self._last_report = None
-        self._last_report = None
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
 
@@ -295,12 +292,12 @@ a planner does that next, from your design.
                       if installed else
                       "Explore the code before proposing anything.")
         self.log("brainstorm: %s via %s" % (choice.model, choice.channel))
-        self._close(self._invoke(
+        self._run_once(
             "planner", choice, cwd=self.repo,
             extra=self.BRAINSTORM_PROMPT % {
                 "discipline": discipline,
                 "spec": self.task.file("spec.md"),
-                "request": self.task.read_text("task.md", "").strip()[:4000]}))
+                "request": self.task.read_text("task.md", "").strip()[:4000]})
         spec = self.task.read_text("spec.md", "")
         if not spec.strip():
             self.log("brainstorm: produced no design — planning from the request alone")
@@ -323,7 +320,7 @@ a planner does that next, from your design.
                       "the approach, so decompose and scope rather than redesigning. "
                       "Departing from it is a decision to record in decisions.md."
                       % self.task.file("spec.md"))
-        self._close(self._invoke("planner", choice, cwd=self.repo, extra=extra))
+        self._run_once("planner", choice, cwd=self.repo, extra=extra)
         subtasks = self._read_plan_subtasks()
         if not subtasks:
             raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
@@ -348,11 +345,11 @@ a planner does that next, from your design.
             return
         base = self._ensure_worktree()
         self.log("tests: %s via %s" % (choice.model, choice.channel))
-        self._close(self._invoke(
+        self._run_once(
             "test-author", choice, cwd=base,
             extra="Write failing tests for the acceptance criteria in task.md now. "
                   "Do not implement the feature and do not read any implementation. "
-                  "Run them and capture the failure output as evidence."))
+                  "Run them and capture the failure output as evidence.")
         # Red is the expected state here, so a failing run is not a problem --
         # but a *passing* one means the tests do not test the new requirement.
         result = verify.run(self.task, self.repo, base, "fast")
@@ -381,6 +378,8 @@ a planner does that next, from your design.
                         "reads": s.get("reads") or [],
                         "acceptance": s.get("acceptance") or [],
                         "depends_on": s.get("depends_on") or [],
+                        "hotspots": s.get("hotspots") or [],
+                        "frozen_interfaces": s.get("frozen_interfaces") or [],
                     })
                 return out
         return []
@@ -399,8 +398,13 @@ a planner does that next, from your design.
         nobody can merge; a wrong serial one costs wall clock."""
         cap = int(self.budget.limits["max_parallel_agents"])
         wave, claimed = [], []
+        declared = [h for h in (self.vcfg.get("hotspots") or []) if h]
         for t in self._ready(subtasks):
             scope = list(t.get("planned_scope") or ["**"]) + list(t.get("hotspots") or [])
+            # A file the project calls a hotspot is unmergeable regardless of who
+            # declared it, so it claims exclusivity whenever a scope can reach it.
+            scope += [h for h in declared
+                      if verify.scopes_overlap([h], t.get("planned_scope") or ["**"])]
             if any(verify.scopes_overlap(scope, other) for other in claimed):
                 continue
             wave.append(t)
@@ -410,6 +414,10 @@ a planner does that next, from your design.
         return wave or self._ready(subtasks)[:1]
 
     def _stage_implement(self):
+        # Establishes base_commit. Without it every diff below is taken against
+        # HEAD *inside* a worktree that has already committed its checkpoint,
+        # which reads as "nothing changed" and silently voids scope checking.
+        self._ensure_worktree()
         state = self.task.state
         if not state.get("subtasks"):
             # Resuming into implement with a plan already on disk: re-read it
@@ -436,17 +444,18 @@ a planner does that next, from your design.
 
     def _one_subtask(self, sub, base):
         role_choice = self._pick("implementer")
-        attempts, session, report = 0, None, None
+        # All per-subtask state stays local: this method runs concurrently in a
+        # wave, and anything on self is shared with the siblings.
+        attempts, session, report, failure = 0, None, None, None
         while True:
             self.budget.check_attempt(sub["id"])
             self.budget.check_cost(0.0)
             attempts += 1
             self.log("implement %s: attempt %d (%s%s)" % (
                 sub["id"], attempts, role_choice.model, "" if session is None else ", continued"))
-            session = self._invoke("implementer", role_choice, cwd=base, subtask=sub,
-                                   session=session, failure=self._last_failure,
-                                   extra=self._findings_brief(sub))
-            report = self._last_report
+            session, report = self._invoke(
+                "implementer", role_choice, cwd=base, subtask=sub,
+                session=session, failure=failure, extra=self._findings_brief(sub))
             self.budget.used_attempt(sub["id"])
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
@@ -460,11 +469,10 @@ a planner does that next, from your design.
                            "before it ran — passing tests are not evidence of work"
                            % sub["id"])
             if result.ok:
-                self._last_failure = None
                 self._close(session)
-                self._checkpoint(base, "adg %s: %s" % (sub["id"], sub.get("goal", ""))[:72])
+                self._checkpoint(base, ("adg %s: %s" % (sub["id"], sub.get("goal", "")))[:72])
                 break
-            self._last_failure = "\n".join(
+            failure = "\n".join(
                 "$ %s\n%s" % (f["cmd"], f["output"][-1500:]) for f in result.failures())
             # Signal: test_stuck. Escalate one rung rather than letting the
             # same model try the same idea a fourth time (§6).
@@ -489,10 +497,13 @@ a planner does that next, from your design.
         dependency order. Threads are fine here: every agent is a subprocess."""
         import threading
         results = {}
+        # Serial creation: concurrent `git worktree add` against one repo
+        # contends on .git locks and fails intermittently on a healthy run.
+        trees = {t["id"]: self._subtask_worktree(t) for t in wave}
 
         def work(sub):
             try:
-                results[sub["id"]] = self._one_subtask(sub, self._subtask_worktree(sub))
+                results[sub["id"]] = self._one_subtask(sub, trees[sub["id"]])
             except Exception as e:  # a failed branch must not kill its siblings
                 results[sub["id"]] = e
 
@@ -543,11 +554,11 @@ a planner does that next, from your design.
             raise Halt("needs_human", "merge conflict in %s and no integrator: %s"
                        % (sub["id"], e))
         self.log("  integrator: %s" % choice.model)
-        self._close(self._invoke(
+        self._run_once(
             "integrator", choice, cwd=cwd, subtask=sub,
             extra="A merge conflict is in the working tree. Resolve it, then "
                   "`git add -A && git commit`. Conflict output:\n\n%s"
-                  % conflict_text[-2000:]))
+                  % conflict_text[-2000:])
         left = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U"],
                               cwd=cwd, capture_output=True, text=True).stdout.strip()
         if left:
@@ -665,7 +676,7 @@ a planner does that next, from your design.
                       "block if they independently land on authority — an acceptance "
                       "criterion, a plan line, or a stated non-goal. Otherwise record "
                       "them under `advisory`." % chaff)
-        self._close(self._invoke("reviewer", choice, cwd=base, extra=extra))
+        self._run_once("reviewer", choice, cwd=base, extra=extra)
         verdict = self._read_verdict()
         self.log("review: %s" % verdict["verdict"])
         self.task.update(review_outcome={"reviewed": True, "verdict": verdict["verdict"]})
@@ -764,8 +775,9 @@ a planner does that next, from your design.
             note += "\n\n" + chaff
         text, problems = brief.write(
             self.task, "merge",
-            "Land this change? It is complete and its checks pass. In attended mode "
-            "the diff is applied to your working tree, uncommitted, for you to commit.",
+            "Land this change? It is complete and its checks pass. Nothing has been "
+            "committed: attended mode leaves a patch file for you to apply and commit "
+            "yourself.",
             files=files, verify=result, extra="## Review\n\n" + note,
             polish=self._polish)
         for p in problems:
@@ -777,8 +789,8 @@ a planner does that next, from your design.
         self.task.update(status="done")
 
     def _land(self):
-        """attended: apply an uncommitted diff to the user's checkout and stop.
-        The orchestrator has no commit or push path at all (§9.2)."""
+        """attended: write the diff as a patch for the human to apply. The
+        orchestrator has no path that commits to the user's branch (§9.2)."""
         state = self.task.state
         wt = state.get("worktree")
         if not wt or self.dry_run:
@@ -877,6 +889,12 @@ a planner does that next, from your design.
                 n += 1
             os.replace(os.path.join(src, name), target)
 
+    def _run_once(self, role, choice, cwd, **kw):
+        """Invoke, close, and return the report. For roles that get one turn."""
+        session, report = self._invoke(role, choice, cwd, **kw)
+        self._close(session)
+        return report
+
     def _invoke(self, role, choice, cwd, subtask=None, extra=None,
                 session=None, failure=None):
         """Run one turn. With `session`, it continues that agent instead of
@@ -885,7 +903,7 @@ a planner does that next, from your design.
         session so a caller can continue it again."""
         if self.dry_run:
             self.log("  [dry-run] would run %s as %s" % (choice.model, role))
-            return None
+            return None, None
         # Reports are matched by mtime after this point: on a rework loop the
         # previous attempt's report is still on disk, and accepting it would
         # read a stale success as a fresh one.
@@ -903,7 +921,7 @@ a planner does that next, from your design.
         self._bill(res, choice)
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
         report, problems = self._collect_report(role, subtask, since=started)
-        self._last_report = report
+
         if report is None:
             outcome = "blocked"
         self.task.record_delegation({
@@ -918,7 +936,10 @@ a planner does that next, from your design.
         if outcome == "blocked" and res.get("settled") == "timeout":
             self._close(session)
             raise Halt("needs_human", "%s agent timed out" % role)
-        return session
+        # Returned, never stashed on self: wave threads share this object, and
+        # a sibling overwriting the attribute is how an escalation gets read as
+        # a success.
+        return session, report
 
     def _close(self, session):
         if session is not None:
