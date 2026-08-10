@@ -44,9 +44,10 @@ Work in increments you can verify. After each, run the project's fast checks
 
 Rules while you work:
 
-- **Stay in `file_scope`.** Needing a change outside it is a signal, not a
-  free action. Small mechanical exceptions (an import, a registration line) are
-  deviations — log them. Anything structural is an escalation.
+- **Stay in `file_scope`.** Needing a change outside it is a signal, not a free
+  action. `references/deviations.md` decides whether a given out-of-scope edit is
+  minor or major; do not judge it from memory, because the boundary is narrower
+  than it feels.
 - **Match the surrounding code.** Its naming, its idioms, its comment density.
   Your diff should be hard to pick out of the file.
 - **Do not fix unrelated things.** Note them in `decisions.md` as observations.

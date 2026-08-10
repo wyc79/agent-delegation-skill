@@ -24,8 +24,9 @@ the repository.** If you cannot find it, stop. (Tool-forced exception: rule 2.)
 ## Step 2 — Establish your assignment
 
 Your prompt should give you a **role** and a **task id**. If either is missing,
-do not guess: read `$TASK_DIR/task.json` (its `status` names the active stage)
-and ask. Working the wrong role corrupts artifacts other agents depend on.
+do not guess and do not pick one: write a `blocked` report saying what was
+missing. Nobody is listening for a question here — the report is how you ask.
+Working the wrong role corrupts artifacts other agents depend on.
 
 ## Step 3 — Read exactly one role card
 
@@ -46,11 +47,11 @@ Everything below is relative to `$TASK_DIR` from Step 1:
 | File | Holds | Written by |
 |---|---|---|
 | `task.json` | Status, budgets, assignments, delegation history | Orchestrator only — **never edit** |
-| `task.md` | The request and its numbered acceptance criteria (`AC-n`) | Intake; amended only by humans |
+| `task.md` | The request and its numbered acceptance criteria (`AC-n`) | Intake or a human. The planner may add criteria if there are none; nobody else edits it |
 | `plan.md` | Approach plus one YAML block per subtask | Planner |
 | `deviations.md` | Append-only log of departures from the plan | Anyone who departs |
 | `decisions.md` | Append-only design decisions and their reasons | Anyone deciding |
-| `reports/` | One JSON handoff per agent, per stage | Every agent, at exit |
+| `reports/` | One JSON handoff per agent, per stage (`verify/` holds check output) | Every agent, at exit |
 
 **Authority when they disagree:** `task.md` (what was asked) outranks
 `plan.md` + `deviations.md` (how it is being done) outranks the code. Never
@@ -91,7 +92,7 @@ Read these **only when the condition applies** — not preemptively:
 
 ## Step 4 — Report before you exit
 
-Write `$TASK_DIR/reports/<stage>-<role>.json` matching `schemas/report.schema.json`:
+Write `$TASK_DIR/reports/<stage>-<role-or-subtask>.json` matching `schemas/report.schema.json`:
 status (`complete` / `blocked` / `escalate`), a summary **written for the next
 agent** (what changed, what surprised you, what they must know — no pleasantries,
 no restating the task), artifacts written, deviations raised, signals fired, and

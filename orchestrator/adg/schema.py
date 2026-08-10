@@ -55,6 +55,9 @@ def _check(data, schema, path, errs):
             for i, item in enumerate(data):
                 _check(item, schema["items"], "%s[%d]" % (path, i), errs)
     if isinstance(data, dict):
+        if "minProperties" in schema and len(data) < schema["minProperties"]:
+            errs.append("%s: needs at least %d field(s)"
+                        % (path or "<root>", schema["minProperties"]))
         for key in schema.get("required", []):
             if key not in data:
                 errs.append("%s: missing required field %r" % (path or "<root>", key))

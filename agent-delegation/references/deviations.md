@@ -12,7 +12,10 @@ longer hold.
 
 A deviation is **major** if *any* of these is true:
 
-- It touches files outside your subtask's `file_scope`.
+- It changes a file outside your subtask's `file_scope`. **One exception:** a
+  single mechanical line that makes your own scoped change work — an import, a
+  registration, an export — is minor. Editing logic in that file is not, however
+  few lines it takes.
 - It changes an interface the plan named (a signature, a signal, a schema, a
   file format) — especially one the plan *froze* for another subtask.
 - It contradicts an entry in `decisions.md`.
@@ -31,20 +34,26 @@ change is a broken integration nobody can explain.
 
 ## The log format
 
-Append to `$TASK_DIR/deviations.md`. Append only — never edit or delete existing
+Append to `$TASK_DIR/deviations.md` (`decisions.md` uses the same namespacing, `D-<your-subtask-or-role>-<n>`). Append only — never edit or delete existing
 entries, including your own.
 
 ```text
-dev-<n> | <role>:<subtask> | <what the plan said, with a line reference>
+dev-<your-subtask-or-role>-<n> | <role>:<subtask> | <what the plan said, with a line reference>
         | did instead: <what you actually did>
         | why: <the reason reality differed>
         | severity: minor|major
 ```
 
+**Namespace the id with your own subtask** — `dev-st-2-1`, `dev-st-2-2` — and
+number within it. Other agents may be appending to this same file at the same
+moment; a bare `dev-3` collides with theirs and the two entries become
+indistinguishable in every report that cites one. **Write each entry as a single
+append**, not line by line, so a concurrent writer cannot interleave with you.
+
 Worked example:
 
 ```text
-dev-3 | impl:st-2 | plan.md:L48 said extend BaseSystem
+dev-st-2-1 | impl:st-2 | plan.md:L48 said extend BaseSystem
       | did instead: composition wrapper holding a BaseSystem instance
       | why: BaseSystem is final in engine 4.3; subclassing fails to compile
       | severity: major (plan.md:L52 has st-4 expecting a BaseSystem subclass)

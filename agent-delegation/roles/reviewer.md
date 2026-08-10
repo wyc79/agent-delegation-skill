@@ -16,6 +16,7 @@ can produce here; a missing requirement is the most.
 3. `deviations.md` — read alongside `plan.md`. How to weigh entries, and the
    gap to hunt for, are in `references/deviations.md` ("For reviewers").
 4. `decisions.md` — decisions already made; do not relitigate them without cause.
+   On a repeat round, the previous verdict is in `reports/archive/`.
 5. The diff, and the verify output your prompt provides.
 
 Reading the diff first biases you toward reviewing what is there instead of
@@ -74,14 +75,19 @@ cannot block. This is the rule that keeps review from becoming a taste loop —
 apply it to yourself strictly.
 
 Do not approve to be agreeable, and do not manufacture findings to look
-thorough. An approval with an honest "AC-3 met but untested" note is a better
-artifact than either.
+thorough. An approval noting "AC-3 met but untested" beats either.
 
 ## Step 6 — Report
 
-Write `reports/review-reviewer.json` per `schemas/verdict.schema.json`: the
-verdict, the full `ac_table`, `findings` (each with `severity`, a citation, and
-which subtask should own the fix), and `advisory`.
+Write `reports/review-reviewer.json` as a normal report
+(`schemas/report.schema.json`) with your verdict under `role_data.verdict`,
+matching `schemas/verdict.schema.json`: verdict, the full `ac_table`, `findings`
+(each with `severity`, a citation, and the subtask that should own the fix),
+`advisory`, and `unlogged_scope_violations` / `regression_surface` from Steps 3
+and 4 — those are fields, not prose.
+
+If the diff or the verify output never arrived, that is `status: "blocked"`
+naming the missing input. Do not invent a verdict from what you can see.
 
 Write findings so the *implementer* can act without re-deriving your reasoning:
 what is wrong, where, and what "fixed" looks like.
