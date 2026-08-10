@@ -18,7 +18,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from adg import brief, limits, prompts, router, runtime, schema, store, verify, winnow, yamlite
-from adg.machine import Orchestrator
+from adg.machine import Halt, Orchestrator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REGISTRY = os.path.join(REPO_ROOT, "registry.default.yaml")
@@ -800,6 +800,134 @@ class TestLiveRunRegressions(unittest.TestCase):
         self.assertIn("different repository", str(cm.exception))
 
 
+class TestIntakeAndBrainstorm(unittest.TestCase):
+    """Acceptance criteria for every task, and a design step for complex ones."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _adapter(self, verdict="SIMPLE -- tiny", criteria=True, spec=None, script=None):
+        crit = ("## Acceptance criteria\n\n- **AC-1** — subtract works\n"
+                "- **AC-2** — old callers still work\n") if criteria else "nothing useful"
+
+        class A(runtime.MockAdapter):
+            def prompt(inner, session, text, timeout):
+                role = session.handle["role"]
+                if role == "intake":
+                    return {"settled": "idle", "output": crit, "code": 0}
+                if role == "classifier":
+                    return {"settled": "idle", "output": "VERDICT: %s" % verdict, "code": 0}
+                if role == "planner" and spec is not None:
+                    with open(os.path.join(session.handle["env"]["AGENT_DELEGATION_TASK_DIR"],
+                                           "spec.md"), "w") as fh:
+                        fh.write(spec)
+                return runtime.MockAdapter.prompt(inner, session, text, timeout)
+
+        return A(script or {})
+
+    def _task(self, request="Add subtract", mode="attended"):
+        return store.Task.create(self.t.repo, "T-I", "# t\n\n%s\n" % request,
+                                 self.pol, mode=mode)
+
+    def test_every_task_gets_acceptance_criteria(self):
+        task = self._task()
+        orch = Orchestrator(task, self.reg, self._adapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        orch._stage_intake()
+        self.assertIn("**AC-1**", task.read_text("task.md"))
+
+    def test_criteria_already_written_by_a_human_are_left_alone(self):
+        task = store.Task.create(self.t.repo, "T-I2",
+                                 "# t\n\n- **AC-1** — mine\n", self.pol)
+        called = []
+
+        class A(runtime.MockAdapter):
+            def prompt(inner, session, text, timeout):
+                called.append(session.handle["role"])
+                return runtime.MockAdapter.prompt(inner, session, text, timeout)
+
+        Orchestrator(task, self.reg, A(), lambda k, t: True,
+                     log=lambda *_: None)._stage_intake()
+        self.assertNotIn("intake", called, "overwrote human-written criteria")
+
+    def test_unusable_criteria_do_not_corrupt_the_task(self):
+        task = self._task()
+        before = task.read_text("task.md")
+        Orchestrator(task, self.reg, self._adapter(criteria=False), lambda k, t: True,
+                     log=lambda *_: None)._stage_intake()
+        self.assertEqual(task.read_text("task.md"), before)
+
+    def test_complex_attended_tasks_brainstorm_first(self):
+        task = self._task("Migrate the save format")
+        orch = Orchestrator(task, self.reg,
+                            self._adapter(verdict="COMPLEX -- shared format"),
+                            lambda k, t: True, log=lambda *_: None)
+        orch._stage_classify()
+        self.assertEqual(task.state["status"], "brainstorm")
+
+    def test_autonomous_runs_skip_the_dialogue(self):
+        # Nobody is there to answer, so a design conversation is theatre.
+        task = self._task("Migrate the save format", mode="autonomous")
+        orch = Orchestrator(task, self.reg,
+                            self._adapter(verdict="COMPLEX -- shared format"),
+                            lambda k, t: True, log=lambda *_: None)
+        orch._stage_classify()
+        self.assertEqual(task.state["status"], "plan")
+
+    def test_simple_tasks_never_brainstorm(self):
+        task = self._task()
+        orch = Orchestrator(task, self.reg, self._adapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        orch._stage_classify()
+        self.assertEqual(task.state["status"], "implement")
+
+    def test_the_design_is_gated_and_reaches_the_human(self):
+        task = self._task("Migrate the save format")
+        seen = {}
+        orch = Orchestrator(
+            task, self.reg,
+            self._adapter(verdict="COMPLEX", spec="# Design\n\nUse a version field.\n"),
+            lambda k, t: seen.setdefault(k, t) and True, log=lambda *_: None)
+        orch._stage_brainstorm()
+        self.assertIn("design", seen)
+        self.assertIn("version field", seen["design"])
+        self.assertEqual(task.state["status"], "plan")
+
+    def test_a_design_that_never_appeared_does_not_block_planning(self):
+        task = self._task("Migrate the save format")
+        orch = Orchestrator(task, self.reg, self._adapter(verdict="COMPLEX"),
+                            lambda k, t: True, log=lambda *_: None)
+        orch._stage_brainstorm()
+        self.assertEqual(task.state["status"], "plan")
+
+    def test_the_planner_is_told_to_plan_against_the_design(self):
+        task = self._task("Migrate the save format")
+        task.write_text("spec.md", "# Design\n\nUse a version field.\n")
+        prompts_seen = []
+
+        class A(runtime.MockAdapter):
+            def prompt(inner, session, text, timeout):
+                if session.handle["role"] == "planner":
+                    prompts_seen.append(text)
+                return runtime.MockAdapter.prompt(inner, session, text, timeout)
+
+        orch = Orchestrator(task, self.reg, A(), lambda k, t: True, log=lambda *_: None)
+        try:
+            orch._stage_plan()
+        except Halt:
+            pass                      # no subtasks written by the mock; fine
+        self.assertTrue(prompts_seen)
+        self.assertIn("approved design", prompts_seen[0])
+        self.assertIn("rather than redesigning", prompts_seen[0])
+
+
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
     nothing looks exactly like a clean scan."""
@@ -920,8 +1048,10 @@ class TestEndToEnd(unittest.TestCase):
 
         state = task.state
         # every role actually ran, in order
-        roles = [h["role"] for h in state["delegation_history"]]
-        self.assertEqual(roles, ["planner", "test-author", "implementer", "reviewer"])
+        steps = [(h["stage"], h["role"]) for h in state["delegation_history"]]
+        self.assertEqual(steps, [("brainstorm", "planner"), ("plan", "planner"),
+                                 ("plan", "test-author"), ("implement", "implementer"),
+                                 ("review", "reviewer")])
         # the plan produced a real subtask, completed, with files from git
         self.assertEqual(state["subtasks"][0]["status"], "complete")
         self.assertEqual(state["subtasks"][0]["actual_files"], ["app.py"])

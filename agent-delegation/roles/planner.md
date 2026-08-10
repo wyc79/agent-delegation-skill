@@ -44,10 +44,13 @@ otherwise question. Skip the obvious.
 
 ## Step 4 — Decompose into subtasks
 
-Split when the work exceeds roughly 400 changed lines or 8 files, spans
-independently testable seams, or has parts with different difficulty. **Do not**
-split into pieces that must edit the same files — that trades one agent's
-sequential work for two agents' handoff overhead plus a merge conflict.
+**A subtask is the smallest unit that carries its own test cycle and is worth a
+fresh reviewer's gate.** Split only where a reviewer could meaningfully reject
+one piece while approving its neighbour; fold setup, config and scaffolding into
+the subtask whose deliverable needs them. Size is a symptom, not the test —
+roughly 400 changed lines or 8 files usually means you have crossed that line
+already. **Do not** split into pieces that must edit the same files: that trades
+one agent's sequential work for two agents' handoff overhead plus a conflict.
 
 Prefer **vertical slices** (a feature end to end) over horizontal layers when
 systems are coupled. When two slices must interact, *freeze the interface in the

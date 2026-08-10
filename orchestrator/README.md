@@ -42,6 +42,7 @@ hotspots:                   # force COMPLEX classification when mentioned
   - "src/combat/combat_system.gd"
 ignore:                     # extra generated paths to exclude from scope accounting
   - "Build/*"
+brainstorm: auto            # auto: design dialogue on complex attended tasks | always | never
 test_author: auto           # auto (default) | never — independent tests on complex tasks
 winnow: auto                # auto (default) | never — deterministic chaff scan
 winnow_scan: ~/.claude/skills/code-winnow/scripts/scan.py   # only if autodetect misses
