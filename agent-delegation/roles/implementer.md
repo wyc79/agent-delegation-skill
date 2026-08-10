@@ -32,7 +32,8 @@ written 300 lines against it.
 
 ## Step 3 — Write a failing test first
 
-Unless a test author already covered your subtask (check the test suite), write
+Unless a test author already covered your subtask, or you inherited this worktree
+from an agent that already wrote it (check the test suite and `git log`), write
 the test before the code, and **run it to watch it fail**. A test that has never
 failed proves nothing. If the change is genuinely untestable (pure wiring,
 engine-only behavior), say so in your report — do not fake a test.
