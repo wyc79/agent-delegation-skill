@@ -26,25 +26,29 @@ def blocked(text, code=1):
     return {"settled": "blocked", "output": text, "code": code}
 
 
+# One row per shipped agent kind, mirroring quota.PATTERNS: adding a provider
+# should be a data edit here too, not another copy of the same test body.
+PROVIDER_SHAPES = [
+    ("claude", "Claude AI usage limit reached. Your limit will reset at 3pm."),
+    ("claude", "API Error: 429 {\"type\":\"rate_limit_error\"}"),
+    ("codex", "stream error: 429 Too Many Requests (rate_limit_exceeded)"),
+    ("codex", "ERROR: insufficient_quota — you have run out of usage limit"),
+    ("gemini", "[API Error: Quota exceeded for quota metric 'Generate requests'. "
+               "RESOURCE_EXHAUSTED]"),
+    ("gemini", "GaxiosError: 429 Too Many Requests"),
+    ("cursor", "You are out of requests for this billing period"),
+]
+
+
 class TestClassification(unittest.TestCase):
     """AC-5. A wrong `quota_exhausted` hides a working provider for hours, so
     the table must be narrow and everything unmatched must stay `other`."""
 
-    def test_claude_usage_limit_is_quota(self):
-        kind, _ = quota.classify("claude", blocked(
-            "Claude AI usage limit reached. Your limit will reset at 3pm."), T0)
-        self.assertEqual(kind, "quota_exhausted")
-
-    def test_codex_rate_limit_is_quota(self):
-        kind, _ = quota.classify("codex", blocked(
-            "stream error: 429 Too Many Requests (rate_limit_exceeded)"), T0)
-        self.assertEqual(kind, "quota_exhausted")
-
-    def test_gemini_quota_is_quota(self):
-        kind, _ = quota.classify("gemini", blocked(
-            "[API Error: Quota exceeded for quota metric 'Generate requests'. "
-            "RESOURCE_EXHAUSTED]"), T0)
-        self.assertEqual(kind, "quota_exhausted")
+    def test_every_shipped_provider_shape_is_quota(self):
+        for kind, message in PROVIDER_SHAPES:
+            with self.subTest(kind=kind, message=message[:40]):
+                got, _ = quota.classify(kind, blocked(message), T0)
+                self.assertEqual(got, "quota_exhausted")
 
     def test_a_stack_trace_is_other(self):
         kind, at = quota.classify("claude", blocked(
@@ -61,6 +65,9 @@ class TestClassification(unittest.TestCase):
         self.assertEqual(kind, "other")
 
     def test_a_timeout_mentioning_rate_limits_is_still_other(self):
+        # Deliberately not folded into the test above: this one fails the moment
+        # the timeout check moves *after* the pattern table, which is the actual
+        # regression to guard against.
         kind, _ = quota.classify("claude", {
             "settled": "timeout", "code": None,
             "output": "waiting on rate limit ..."}, T0)
@@ -73,6 +80,7 @@ class TestClassification(unittest.TestCase):
         self.assertIsNone(kind)
 
     def test_an_unknown_agent_kind_falls_back_to_other(self):
+        # A provider nobody wrote a table for must not inherit claude's.
         kind, _ = quota.classify("nobody-ships-this", blocked("usage limit reached"), T0)
         self.assertEqual(kind, "other")
 
@@ -89,11 +97,16 @@ class TestResetParsing(unittest.TestCase):
         at = quota.parse_reset("limit resets at 2025-08-10T12:00:00Z", T0)
         self.assertIsNotNone(at)
 
+    # Three separate rejections, not one: a stamp in the past, a stamp too far
+    # ahead to believe, and no stamp at all fail at different guards, and each
+    # falls back to the configured window for a different reason.
+
     def test_a_reset_in_the_past_is_refused(self):
         # Better to fall back to the window than to reopen a dead channel now.
         self.assertIsNone(quota.parse_reset("resets at 1999-01-01T00:00:00Z", T0))
 
     def test_an_absurd_reset_is_refused(self):
+        # A month-long breaker from a misparse is worse than no breaker.
         self.assertIsNone(quota.parse_reset("try again in 900 days", T0))
 
     def test_no_time_at_all(self):
@@ -328,8 +341,9 @@ class TestRuntimeClassification(unittest.TestCase):
         self.assertIsNone(res["failure"])
 
     def test_a_json_result_still_sees_the_raw_stderr(self):
-        # claude --output-format json parses stdout into `output`, which would
-        # drop the stderr the rate-limit message actually arrived on.
+        # Not a duplicate of the plain-text case above: this one goes down the
+        # JSON branch, where `output` is replaced by the parsed result field and
+        # would drop the stderr the rate-limit message actually arrived on.
         res = runtime._result('{"result": "partial"}', "HTTP 429 rate limit", 1,
                               kind="claude", now=T0)
         self.assertEqual(res["failure"], "quota_exhausted")
@@ -717,9 +731,13 @@ class TestResumeAtTheWindow(unittest.TestCase):
         self.assertIsNone(self.task.state.get("park"))
 
     def test_a_task_parked_for_any_other_reason_is_untouched(self):
+        # The guard owns exactly one park reason. Clearing someone else's would
+        # let a budget-parked task resume as though its cap had been raised.
         from adg import cli
-        self.task.update(park=None)
+        self.task.update(park={"reason": "budget_exhausted", "reopen_at": T0 + 3600})
         cli._quota_guard(self.task, when_open=False, clock=lambda: T0)  # no exit
+        self.assertEqual((self.task.state.get("park") or {}).get("reason"),
+                         "budget_exhausted", "the guard cleared a park it does not own")
 
 
 if __name__ == "__main__":
