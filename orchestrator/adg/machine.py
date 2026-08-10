@@ -1512,7 +1512,18 @@ a planner does that next, from your design.
         Liveness is not success -- an agent can settle idle having done
         nothing (§4.6), so the report is the evidence, not the exit code."""
         for name, data in sorted(self.task.reports().items()):
-            if role not in name and not (subtask and subtask["id"] in name):
+            # When a subtask is named, its id is the ONLY thing that identifies
+            # its report. Accepting `role in name` as an alternative could not
+            # tell two concurrent implementers apart: every sibling in a wave
+            # runs as "implementer", SKILL.md permits `<stage>-<role>.json`, and
+            # sorted() then handed the same file to all of them. An escalating
+            # subtask read a sibling's `complete` and the run delivered a patch
+            # built on work that had asked to stop. Subtask ids are unique, so
+            # matching on the id alone cannot cross threads.
+            if subtask:
+                if subtask["id"] not in name:
+                    continue
+            elif role not in name:
                 continue
             try:
                 if os.path.getmtime(self.task.file("reports", name)) < since:

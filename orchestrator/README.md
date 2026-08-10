@@ -214,20 +214,42 @@ Everything else reaches the ladder through the agent, in `report.signals`, and
 guessing on the agent's behalf spends real money on a guess. `low_confidence` is
 not routable on its own, which is D4 enforced rather than restated.
 
-## Known defect
+## The wave defect — root cause found, and what is still open
 
-`TestWaveRaces.test_one_subtask_escalating_stops_the_run_even_as_a_sibling_succeeds`
-and `TestParallelEndToEnd.test_two_subtasks_get_two_worktrees_and_both_land`
-fail intermittently — roughly 1 run in 8 of the **full** suite, never
-reproducible in isolation (12/12 clean runs of the test alone). Both are
-parallel-path tests, and in the captured failure an implementer's `escalate`
-report did not reach the halt check, so a wave subtask completed that should
-have parked.
+The symptom was an implementer's `escalate` failing to reach the halt check, so
+a wave subtask completed that should have parked. It was chased for a while as a
+timing race, on the strength of an intermittent ~1-in-8 full-suite failure.
 
-Serializing `task.json` mutations and making verify/transcript ids unique per
-invocation reduced it from 2/8 to 1/8 without removing it, so at least one
-shared-state race remains in the wave path. **Treat parallel mode as
-unfinished.** `registry.default.yaml` therefore ships `max_parallel_agents: 1`;
-the two tests above set their own concurrency, because a parallel test that
-inherits the safe default is a sequential test that still passes. The sequential
-path is not affected.
+**It was not a race.** `_collect_report` identified a report by substring, and
+when a subtask was named it accepted `role in name` as an *alternative* to the
+subtask id. Every sibling in a wave runs as `implementer`, `SKILL.md` permitted
+`<stage>-<role>.json`, and `sorted()` then handed the first such file to all of
+them. One substring match that cannot tell two concurrent agents apart — no
+interleaving required, which is why rerunning the suite was the wrong instrument
+and why it never reproduced in isolation.
+
+Now a named subtask is identified by its id alone, and ids are unique, so no
+thread can read another's report. `SKILL.md` requires the id in the filename to
+match. `TestWaveRaces.test_a_sibling_report_named_for_the_role_is_never_read_as_mine`
+pins it deterministically: it fails on the old code every time, not one time in
+eight.
+
+The symptom was also worse than first recorded. With the escalating agent
+leaving a file behind — which it normally has, since it checkpoints — the run
+did not merely mis-mark a subtask: it reached `done` and emitted a patch built
+on work whose own report said nothing had been verified.
+
+**Still open, and why the default has not moved.** An earlier pass reduced the
+failure rate from 2/8 to 1/8 by serializing `task.json` mutations, and the note
+then inferred that at least one more race remained. This defect explains the
+residual, but 12 clean full-suite runs since the fix is only 20% surprising at
+the old rate — corroboration, not proof, and it says nothing about whatever else
+may be in the wave path. `registry.default.yaml` therefore still ships
+`max_parallel_agents: 1`. About 25 consecutive clean runs would put a chance
+streak under 5%; that, or another root cause found by reading rather than
+sampling, is what should move it. The sequential path was never exposed: with
+one implementer at a time there is no sibling whose report could be read as
+yours.
+
+The parallel tests set their own concurrency — `TestWaveRaces` at 3, because it
+plans three subtasks and a lower cap never opens the window it exists to probe.

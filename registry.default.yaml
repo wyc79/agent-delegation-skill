@@ -200,10 +200,12 @@ policy:
     max_attempts_per_subtask: 8
     max_review_loops: 2
     max_replans: 1
-    # 1, not 3, until the wave race in orchestrator/README.md "Known defect" is
-    # closed. Shipping the unsafe number and documenting the safe one asks every
-    # reader to notice a paragraph before their first run; the sequential path
-    # loses nothing but wall-clock. Raise it deliberately, not by default.
+    # 1, not 3, until the wave path is settled -- see "The wave defect" in
+    # orchestrator/README.md. One root cause is found and fixed; the evidence
+    # that nothing else remains is not yet strong enough to raise this. The
+    # sequential path loses nothing but wall-clock, and shipping the unsafe
+    # number while documenting the safe one asks every reader to notice a
+    # paragraph before their first run. Raise it deliberately, not by default.
     max_parallel_agents: 1
     human_approval_required: [plan, merge, dependency_change, destructive_op]
   escalation_thresholds:

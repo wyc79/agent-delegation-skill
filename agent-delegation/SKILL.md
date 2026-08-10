@@ -77,7 +77,7 @@ settles neither scope nor sequencing, and never outranks a criterion.
 
 ## When to read more — only once the condition applies
 
-The triggers every role shares. Your card carries its own; nobody carries another's.
+Shared triggers; your card carries its own, and nobody carries another's.
 
 | Condition | Read |
 |---|---|
@@ -89,12 +89,12 @@ The triggers every role shares. Your card carries its own; nobody carries anothe
 
 ## Step 3 — Report before you exit
 
-Write `$TASK_DIR/reports/<stage>-<role-or-subtask>.json` against
-`schemas/report.schema.json`: status (`complete` / `blocked` / `escalate`), a
-summary **written for the next agent** (what changed, what surprised you, what
-they must know — no pleasantries, no restating the task), artifacts, deviations,
-signals, and evidence that is real output. Your card names the rest.
+Write `$TASK_DIR/reports/<stage>-<subtask-id>.json`, or `<stage>-<role>.json`
+with no subtask. **The id is not optional when you have one** — siblings share
+your role name, so a role-named file cannot be attributed and counts as no
+report. Match `schemas/report.schema.json`: status (`complete` / `blocked` /
+`escalate`), a summary **for the next agent** (what changed, what surprised you,
+what they must know), artifacts, deviations, signals, and real command output.
 
-**`escalate` is routed by your `signals`, not your prose.** A signal naming its
-type, citing an artifact and carrying real output reaches a stronger model or the
-planner; an `escalate` with nothing routable stops the run for a human.
+**`escalate` is routed by your `signals`, not your prose** — one that names its
+type, cites an artifact and carries real output. Nothing routable stops the run.

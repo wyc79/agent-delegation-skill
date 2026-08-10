@@ -889,7 +889,7 @@ class TestWaveRaces(unittest.TestCase):
         #
         # 3, not 2, and it matters: this class plans three independent subtasks,
         # so a cap of 2 runs them two-then-one and never opens the three-way
-        # window the Known defect was measured in. The number here is the width
+        # window the wave defect was measured in. The number here is the width
         # of the race this class exists to hunt.
         self.pol = dict(self.reg["policy"]["limits"],
                         escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
@@ -976,6 +976,57 @@ class TestWaveRaces(unittest.TestCase):
                          + "\n".join(logs))
         self.assertIn("reported escalate", "\n".join(logs))
         self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+    def test_a_sibling_report_named_for_the_role_is_never_read_as_mine(self):
+        """The wave defect's symptom, reachable with no timing at all.
+
+        SKILL.md permits `<stage>-<role-or-subtask>.json`, so
+        `implement-implementer.json` is a legal name for a subtask's report.
+        _collect_report accepted a file on `role in name` alone, and sorted()
+        made that file win for *every* sibling — so the escalating subtask read
+        a sibling's `complete` and carried on. Nothing here races: it is one
+        substring match that cannot tell two concurrent agents apart."""
+        import threading
+        alpha_landed = threading.Event()
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            if "st-1" in cwd:
+                with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                    fh.write("A = 1\n")
+                # Legal under SKILL.md, and it sorts ahead of every sibling's.
+                _report(td, "implement-implementer.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-1-alpha", "status": "complete",
+                    "summary": "did alpha", "evidence": {"tests": "ok"}})
+                alpha_landed.set()
+            elif "st-2" in cwd:
+                alpha_landed.wait(10)   # alpha's file is on disk before I report
+                # It MUST leave a file behind. An escalating agent normally has
+                # checkpointed something, and without that the unrelated
+                # "changed no files" guard parks the run for its own reason and
+                # hides the misread this test is about.
+                with open(os.path.join(cwd, "beta.py"), "w") as fh:
+                    fh.write("B = 1\n")
+                _report(td, "implement-st-2-beta.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-2-beta", "status": "escalate",
+                    "summary": "the plan contradicts the tree — nothing verified",
+                    "evidence": {"not_verified": ["everything"]}})
+            else:
+                with open(os.path.join(cwd, "gamma.py"), "w") as fh:
+                    fh.write("G = 1\n")
+                _report(td, "implement-st-3-gamma.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-3-gamma", "status": "complete",
+                    "summary": "did gamma", "evidence": {"tests": "ok"}})
+
+        status, task, logs = self._run(implementer, task_id="T-WNAME")
+        self.assertEqual(status, "needs_human",
+                         "st-2-beta escalated and the run absorbed it by reading "
+                         "a sibling's report\n" + "\n".join(logs))
+        self.assertFalse(os.path.exists(task.file("integrate.patch")),
+                         "it produced a deliverable from a subtask that escalated")
 
     def test_counters_from_parallel_subtasks_are_not_lost(self):
         # Lost read-modify-writes on task.json make the attempt and spend caps
