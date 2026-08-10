@@ -66,7 +66,7 @@ Everything below is relative to `$TASK_DIR` from Step 1:
    tool forces an in-repo path, it must be one `git check-ignore -q` already
    accepts, and `git status` must be clean of it — see `references/scratch-files.md`.
 3. **Never `git push`, never switch branches, never touch another agent's
-   worktree.** Commit checkpoints inside your own worktree freely.
+   worktree.** Checkpoint inside your own often — uncommitted work is lost work.
 4. **Log every departure from the plan** in `deviations.md` as *plan said →
    reality → what I did → severity*. An unlogged deviation reads as a defect.
 5. **An honest `blocked` is a success state.** Reporting that you are stuck with
@@ -82,6 +82,7 @@ Read these **only when the condition applies** — not preemptively:
 
 | Condition | Read |
 |---|---|
+| Your prompt says you are continuing work another agent started | `references/handover.md` |
 | You are stuck, tests failed 3+ times, or scope is ballooning | `references/escalation.md` |
 | You must depart from the plan and are unsure how severe it is | `references/deviations.md` |
 | You share files with another running agent, or hit a merge conflict | `references/parallelism.md` |

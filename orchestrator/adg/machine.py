@@ -14,7 +14,8 @@ import re
 import subprocess
 import time
 
-from . import brief, companions, limits as lim, prompts, router as routing, schema, verify, winnow, yamlite
+from . import (brief, companions, cooldown, limits as lim, prompts, quota,
+               router as routing, schema, verify, winnow, yamlite)
 from .store import git
 
 STAGES = ["intake", "classify", "plan", "implement", "verify", "review", "integrate", "done"]
@@ -53,6 +54,13 @@ _LOG_SEQ = [0]
 _LOG_LOCK = __import__("threading").Lock()
 
 
+def _stamp(epoch):
+    """A reopen time a human can act on, in their own zone."""
+    if not epoch:
+        return "an unknown time"
+    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(float(epoch)))
+
+
 class Halt(Exception):
     """Stop cleanly and leave the task resumable."""
 
@@ -62,7 +70,8 @@ class Halt(Exception):
 
 
 class Orchestrator:
-    def __init__(self, task, registry, adapter, gate, log=print, dry_run=False):
+    def __init__(self, task, registry, adapter, gate, log=print, dry_run=False,
+                 clock=time.time):
         self.task = task
         self.reg = registry
         self.router = routing.Router(registry)
@@ -70,6 +79,11 @@ class Orchestrator:
         self.gate = gate            # callable(kind, brief_text) -> bool
         self.log = log
         self.dry_run = dry_run
+        # The machine's only wall clock. Cooldown expiry, utilisation windows
+        # and reopen times all derive from it, so a run replays under a fixed
+        # clock exactly as it ran.
+        self.clock = clock
+        self._warned_channels = False
         self.budget = lim.Budget(task)
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
@@ -85,6 +99,12 @@ class Orchestrator:
                 if handler is None:
                     raise Halt("needs_human", "no handler for stage %r" % status)
                 handler()
+        except routing.AllChannelsCooled as q:
+            # Ahead of the generic handler: this is not a crash and not a
+            # registry mistake, and reporting it as either sends the reader to
+            # the wrong fix.
+            self._quota_park(q)
+            return "needs_human"
         except Halt as h:
             self.task.update(status=h.status)
             self.log("\n== %s: %s" % (h.status.upper(), h))
@@ -153,18 +173,12 @@ admits only one sensible reading.
         text = self.task.read_text("task.md", "")
         if re.search(r"^\s*[-*]?\s*\*\*AC-\d", text, re.M) or self.dry_run:
             return                      # already stated by whoever wrote the task
-        try:
-            choice = self._pick("classifier")   # cheap tier; this is not judgement
-        except routing.NoModelAvailable:
+        # Routed on the cheap classifier tier; this is not judgement.
+        res = self._optional("intake", self.CRITERIA_PROMPT % {
+            "request": text.strip()[:4000], "facts": self._repo_facts()},
+            pick_as="classifier")
+        if res is None:
             return
-        session = self.adapter.start_agent("intake", choice.agent_kind, self.repo,
-                                           prompts.env_for(self.task))
-        try:
-            res = self.adapter.prompt(session, self.CRITERIA_PROMPT % {
-                "request": text.strip()[:4000], "facts": self._repo_facts()}, timeout=180)
-        finally:
-            self._close(session)
-        self._bill(res, choice)
         out = (res.get("output") or "").strip()
         if "AC-1" not in out:
             self.log("intake: no criteria derived — the reviewer will have less to check")
@@ -204,19 +218,13 @@ admits only one sensible reading.
     def _ask_classifier(self, text):
         if self.dry_run:
             return "simple", "dry run", "stub"
-        try:
-            choice = self._pick("classifier")
-        except routing.NoModelAvailable as e:
-            return "complex", "no classifier model available (%s)" % e, "fallback"
         prompt = CLASSIFY_PROMPT % {"request": text.strip()[:4000],
                                     "facts": self._repo_facts()}
-        session = self.adapter.start_agent("classifier", choice.agent_kind,
-                                           self.repo, prompts.env_for(self.task))
-        try:
-            res = self.adapter.prompt(session, prompt, timeout=180)
-        finally:
-            self.adapter.teardown(session)
-        self._bill(res, choice)
+        res = self._optional("classifier", prompt)
+        if res is None:
+            # Fail safe, exactly as an unparseable verdict does: over-planning a
+            # small task wastes time, under-planning a large one wastes the run.
+            return "complex", "no classifier model available", "fallback"
         out = (res.get("output") or "")
         m = re.search(r"VERDICT:\s*(SIMPLE|COMPLEX)\s*-*\s*(.*)", out, re.I)
         if not m:
@@ -224,9 +232,10 @@ admits only one sensible reading.
             # under-planning a large one wastes the whole run.
             return "complex", "classifier gave no usable verdict", "fallback"
         self.task.record_delegation({"stage": "classify", "role": "classifier",
-                                     "model": choice.model, "channel": choice.channel,
+                                     "model": res.get("model"), "channel": res.get("channel"),
                                      "adapter": self.adapter.name, "outcome": "complete"})
-        return m.group(1).lower(), m.group(2).strip()[:200] or "no reason given", choice.model
+        return (m.group(1).lower(),
+                m.group(2).strip()[:200] or "no reason given", res.get("model"))
 
     def _classified(self, tier, why, by):
         self.log("classify: %s (%s)" % (tier, why))
@@ -457,7 +466,7 @@ a planner does that next, from your design.
             attempts += 1
             self.log("implement %s: attempt %d (%s%s)" % (
                 sub["id"], attempts, role_choice.model, "" if session is None else ", continued"))
-            session, report = self._invoke(
+            session, report, role_choice = self._invoke(
                 "implementer", role_choice, cwd=base, subtask=sub,
                 session=session, failure=failure, extra=self._findings_brief(sub))
             self.budget.used_attempt(sub["id"])
@@ -485,8 +494,10 @@ a planner does that next, from your design.
             threshold = int((self.reg["policy"].get("escalation_thresholds") or {})
                             .get("test_stuck_attempts", 3))
             if attempts >= threshold:
+                _, cooled, util, _ = self._channel_state()
                 stronger = self.router.escalate("implementer", role_choice,
-                                                ceiling=self.budget.ceiling())
+                                                ceiling=self.budget.ceiling(),
+                                                cooldowns=cooled, utilization=util)
                 if stronger is None:
                     raise Halt("needs_human",
                                "%s still failing after %d attempts and nothing stronger is "
@@ -520,6 +531,12 @@ a planner does that next, from your design.
             t.join()
         for sub in wave:
             outcome = results.get(sub["id"])
+            if isinstance(outcome, routing.AllChannelsCooled):
+                # Re-raised, not flattened into a Halt: a quota park carries a
+                # reopen time and drives `resume --when-open`. Downgrading it
+                # here left a wave-mode run with no `park` record at all, so the
+                # sequential and parallel paths disagreed about the same event.
+                raise outcome
             if isinstance(outcome, Exception):
                 raise Halt("needs_human", "%s failed: %s" % (sub["id"], outcome))
         self._integrate_wave(wave)
@@ -852,18 +869,109 @@ a planner does that next, from your design.
         return "delegated change"
 
     # ---------------------------------------------------------------- infra
-    def _pick(self, role, boost=None):
+    def _channel_state(self):
+        """-> (now, cooled, utilization, entries). One clock read feeds routing,
+        so every gate in a single selection sees the same instant."""
+        now = self.clock()
+        cools, usage, warning = cooldown.read(now)
+        if warning and not self._warned_channels:
+            # Once per run: a corrupt breaker file would otherwise repeat this
+            # on every selection and bury the rest of the log.
+            self._warned_channels = True
+            self.log("channels: %s" % warning)
+        util = {}
+        for name, chan in (self.reg.get("channels") or {}).items():
+            util[name] = cooldown.utilization(usage.get(name), chan.get("quota"), now)
+        return now, set(cools), util, cools
+
+    def _pick(self, role, boost=None, exclude=(), min_reasoning=None):
         """Best candidate this runtime can actually launch. The registry says
         what a deployment could use; only the adapter knows what is installed,
-        so an uninstalled CLI is skipped rather than crashing the run."""
-        candidates = self.router.candidates(role, ceiling=self.budget.ceiling(), boost=boost)
-        for c in candidates:
+        so an uninstalled CLI is skipped rather than crashing the run.
+
+        Channels in a quota cooldown are filtered exactly like `disabled`, and
+        when a cooldown is the *only* reason nothing is left, the caller gets an
+        error that knows when the seats come back."""
+        _, cooled, util, entries = self._channel_state()
+        blocked = cooled | set(exclude or ())
+
+        def ask(ignore_reserve):
+            return self.router.candidates(role, ceiling=self.budget.ceiling(),
+                                          boost=boost, cooldowns=blocked,
+                                          utilization=util,
+                                          ignore_reserve=ignore_reserve)
+
+        # Two passes, and the order matters. A reservation only withholds a seat
+        # while the role has somewhere else to go, and "somewhere else" means a
+        # CLI this runtime can actually launch -- which the router cannot know.
+        # Deciding it there withheld a healthy seat and killed the run instead.
+        candidates = ask(False)
+        pool = candidates + ask(True)
+        if min_reasoning is not None:
+            # A floor, not a `boost`: boost only strengthens capabilities the
+            # role's profile already requires, and no profile requires
+            # `reasoning` of its implementer -- so passing it there does nothing.
+            strong = [c for c in pool
+                      if int(c.spec.get("reasoning", 0) or 0) >= min_reasoning
+                      and self.adapter.can_run(c.agent_kind)]
+            if strong:
+                return strong[0]
+            raise routing.NoModelAvailable(
+                "no runnable model for role %r at reasoning >= %s"
+                % (role, min_reasoning))
+        for c in pool:
             if self.adapter.can_run(c.agent_kind):
+                if c.demoted:
+                    self.log("  reserve: %s on %s anyway — no alternative"
+                             % (role, c.channel))
                 return c
+        if blocked:
+            # Would this role have had somewhere to go with nothing filtered?
+            # If so this is a quota event with a known reopen time, not a
+            # registry mistake, and the two want different answers.
+            free = [c for c in self.router.candidates(
+                        role, ceiling=self.budget.ceiling(), boost=boost,
+                        utilization=util)
+                    if self.adapter.can_run(c.agent_kind)]
+            hit = sorted({c.channel for c in free} & blocked)
+            if hit:
+                reopen = cooldown.earliest_reopen(entries, hit)
+                raise routing.AllChannelsCooled(
+                    role, hit, reopen,
+                    "every channel enrolled for role %r is in a quota cooldown "
+                    "(%s); the first reopens at %s. `delegate channels` shows "
+                    "them, `delegate channels --clear <name>` overrides one."
+                    % (role, ", ".join(hit), _stamp(reopen)))
         raise routing.NoModelAvailable(
             "no runnable model for role %r: %s" % (
                 role, ", ".join("%s needs %s" % (c.model, c.agent_kind)
                                 for c in candidates) or "nothing enrolled"))
+
+    def _meter(self, choice):
+        """Count one invocation against the channel's window (§5.4). An
+        estimate by construction -- no provider exposes a meter -- kept so the
+        router drifts off a filling seat before it hits the wall."""
+        window = quota.parse_window((choice.chan_spec.get("quota") or {}).get("window"))
+        cooldown.record_use(choice.channel, window, self.clock())
+
+    def _reopen_at(self, choice, res):
+        """The provider's own reset time, else the channel's configured window
+        from now. A parse failure is logged, never silently swallowed."""
+        stated = res.get("reset_at")
+        if stated:
+            return float(stated)
+        spec = choice.chan_spec.get("quota") or {}
+        window = quota.parse_window(spec.get("window"))
+        self.log("  quota: %s stated no reset time — assuming its %s window"
+                 % (choice.channel, spec.get("window") or "default 5h"))
+        return self.clock() + window
+
+    def _cool(self, choice, res):
+        """Open the breaker for a channel that just said it is out."""
+        at = self._reopen_at(choice, res)
+        cooldown.open_breaker(choice.channel, "quota", at, self.clock(),
+                              detail=(res.get("output") or "")[-200:])
+        return at
 
     def _ensure_worktree(self):
         state = self.task.state
@@ -899,33 +1007,123 @@ a planner does that next, from your design.
 
     def _run_once(self, role, choice, cwd, **kw):
         """Invoke, close, and return the report. For roles that get one turn."""
-        session, report = self._invoke(role, choice, cwd, **kw)
+        session, report, _ = self._invoke(role, choice, cwd, **kw)
         self._close(session)
         return report
 
+    def _optional(self, role, text, timeout=180, pick_as=None):
+        """A text-reply role whose absence is survivable -> the result, or None.
+
+        `pick_as` is the *capability profile* to route on when it differs from
+        the agent's role name: intake is a classifier-tier job that the agent
+        still runs as "intake", and only profiles named in the registry can be
+        routed.
+
+        Selection and invocation are guarded together on purpose. A seat that is
+        already cooled and a seat that goes dark mid-call are the same fact to
+        these callers, and guarding only the pick meant the second one escaped
+        as a quota park -- parking a finished task because its brief could not
+        be prettified."""
+        try:
+            choice = self._pick(pick_as or role)
+            return self._direct(role, choice, text, timeout, pick_as=pick_as)
+        except routing.NoModelAvailable as e:
+            self.log("  %s: skipped — %s" % (role, e))
+            return None
+
+    def _direct(self, role, choice, text, timeout=180, pick_as=None, cooled=()):
+        """One prompt, one answer, no report file -- the text-reply roles
+        (§4.6). Shares the metering, billing and quota failover that `_invoke`
+        gives every other role, which three hand-rolled copies of this dance
+        did not. `pick_as` is the capability profile to re-route on, for roles
+        whose name is not a profile (see `_optional`)."""
+        session = self.adapter.start_agent(role, choice.agent_kind, self.repo,
+                                           prompts.env_for(self.task))
+        try:
+            res = self.adapter.prompt(session, text, timeout=timeout)
+        finally:
+            self._close(session)
+        if res.get("failure") == "quota_exhausted":
+            at = self._cool(choice, res)
+            # Accumulated, exactly as `_invoke` does: if the breaker could not be
+            # written -- an unwritable state dir, or a concurrent `--clear` --
+            # excluding only the last seat lets this bounce A->B->A->B through
+            # real, billed invocations until the stack runs out.
+            cooled = tuple(cooled) + (choice.channel,)
+            nxt = self._pick(pick_as or role, exclude=cooled)
+            self.log("failover: %s %s -> %s (quota, reopens %s)"
+                     % (role, choice.channel, nxt.channel, _stamp(at)))
+            return self._direct(role, nxt, text, timeout, pick_as=pick_as,
+                                cooled=cooled)
+        self._meter(choice)
+        self._bill(res, choice)
+        # Who actually ran it. After a failover that is not the channel the
+        # caller picked, and the delegation record must name the one that did.
+        res["model"], res["channel"] = choice.model, choice.channel
+        return res
+
+    # A quota wall is the seat's fault, not the approach's, so the hop happens
+    # here rather than in the callers: the failed invocation never returns, so
+    # no caller can bill it against an attempt budget, and every role -- not
+    # just the implementer -- gets failover for free.
     def _invoke(self, role, choice, cwd, subtask=None, extra=None,
                 session=None, failure=None):
         """Run one turn. With `session`, it continues that agent instead of
         starting a fresh one -- a retry keeps everything the agent already
         learned, which is most of the wall clock on a short task. Returns the
-        session so a caller can continue it again."""
+        session and the channel that actually ran, so a caller that later
+        escalates escalates from the right one."""
         if self.dry_run:
             self.log("  [dry-run] would run %s as %s" % (choice.model, role))
-            return None, None
-        # Reports are matched by mtime after this point: on a rework loop the
-        # previous attempt's report is still on disk, and accepting it would
-        # read a stale success as a fresh one.
-        started = time.time() - 1
-        if session is None:
-            text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
-                                   verify_cfg=self.vcfg)
-            session = self.adapter.start_agent(role, choice.agent_kind, cwd,
-                                               prompts.env_for(self.task))
-            res = self.adapter.prompt(session, text, timeout=3600)
-        else:
-            text = prompts.retry(failure)
-            res = self.adapter.follow_up(session, text, timeout=3600)
-        self._log_transcript(role, text, res)
+            return None, None, choice
+        cooled, base_extra = [], extra
+        while True:
+            # Reports are matched by mtime after this point: on a rework loop the
+            # previous attempt's report is still on disk, and accepting it would
+            # read a stale success as a fresh one.
+            started = time.time() - 1
+            if session is None:
+                text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
+                                       verify_cfg=self.vcfg)
+                session = self.adapter.start_agent(role, choice.agent_kind, cwd,
+                                                   prompts.env_for(self.task))
+                res = self.adapter.prompt(session, text, timeout=3600)
+            else:
+                text = prompts.retry(failure)
+                res = self.adapter.follow_up(session, text, timeout=3600)
+            self._log_transcript(role, text, res)
+            if res.get("failure") != "quota_exhausted":
+                break
+            # Close first: `_cool` touches a shared file, and letting it run
+            # ahead of teardown meant a write failure leaked the session -- under
+            # the herdr adapter, an orphaned pane.
+            # Close first: `_cool` touches a shared file, and letting it run
+            # ahead of teardown meant a write failure leaked the session -- under
+            # the herdr adapter, an orphaned pane.
+            self._close(session)
+            self._salvage(cwd, role, subtask)
+            at = self._cool(choice, res)
+            cooled.append(choice.channel)
+            self.task.record_delegation({
+                "stage": self.task.state["status"], "role": role,
+                "subtask": subtask.get("id") if subtask else None,
+                "model": choice.model, "channel": choice.channel,
+                "adapter": self.adapter.name, "outcome": "quota_exhausted",
+                "reopens_at": at})
+            # Excluded explicitly as well as through the breaker: if the state
+            # file could not be written, the loop must still terminate.
+            nxt = self._replacement(role, choice, cooled)
+            self.log("failover: %s %s -> %s (quota, reopens %s)"
+                     % (role, choice.channel, nxt.channel, _stamp(at)))
+            # A fresh session on the new seat, in the *same* worktree: every
+            # checkpoint commit is still there, so the replacement continues
+            # from the last one rather than restarting the subtask (§5.5).
+            # From the caller's `extra`, never from the previous hop's: on a
+            # second hop, feeding the note back in appended it to a string that
+            # already ended with it, and the replacement read the paragraph twice.
+            extra = self._handover(base_extra, failure)
+            choice, session, failure = nxt, None, None
+        self._meter(choice)
         self._bill(res, choice)
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
         report, problems = self._collect_report(role, subtask, since=started)
@@ -947,7 +1145,60 @@ a planner does that next, from your design.
         # Returned, never stashed on self: wave threads share this object, and
         # a sibling overwriting the attribute is how an escalation gets read as
         # a success.
-        return session, report
+        return session, report, choice
+
+    def _replacement(self, role, choice, cooled):
+        """The same rung on another seat.
+
+        A quota hop must not walk back down the escalation ladder. If this
+        subtask had already escalated to a stronger model, re-selecting on plain
+        role requirements would quietly hand the work to a weaker one and log it
+        as an ordinary failover -- the run would look like it was still climbing
+        while it was descending. Ask for at least the current model's reasoning
+        first; only drop below it when no seat can hold the rung, and say so."""
+        floor = int(choice.spec.get("reasoning", 0) or 0)
+        try:
+            return self._pick(role, exclude=tuple(cooled), min_reasoning=floor)
+        except routing.AllChannelsCooled:
+            raise
+        except routing.NoModelAvailable:
+            nxt = self._pick(role, exclude=tuple(cooled))
+            self.log("  note: no seat left at %s's strength — continuing on %s, "
+                     "which is weaker" % (choice.model, nxt.model))
+            return nxt
+
+    def _salvage(self, cwd, role, subtask):
+        """Commit whatever the killed agent left, so the replacement inherits a
+        checkpoint rather than a dirty tree.
+
+        A quota kill is involuntary -- the agent gets no turn to tidy up -- and
+        `_checkpoint` otherwise runs only after a green verify, so a seat that
+        dies on the first attempt leaves nothing committed at all. Without this
+        the handover note below would be asserting something usually false.
+
+        Guarded on the worktree: planner and brainstorm run with `cwd=self.repo`,
+        and this program has no path that commits to the user's own branch."""
+        if os.path.abspath(cwd) == os.path.abspath(self.repo):
+            return False
+        label = subtask.get("id") if subtask else role
+        if self._checkpoint(cwd, "adg %s: salvaged before quota failover" % label):
+            self.log("  salvaged %s's uncommitted work as a checkpoint" % label)
+            return True
+        return False
+
+    def _handover(self, extra, failure):
+        """What the replacement agent is told. It inherits a worktree holding the
+        predecessor's checkpoints, including the one `_salvage` just made — but
+        it is told to look rather than to assume, because a hop can land after a
+        turn that produced nothing at all."""
+        note = ("The agent that started this ran out of its provider's quota "
+                "part-way through. Whatever it finished is committed in this "
+                "worktree — check `git log` before you do anything, read what is "
+                "there, and continue from it. Do not start over, and do not "
+                "revert work you find.")
+        if failure:
+            note += "\n\nThe checks it left failing:\n\n%s" % failure
+        return "%s\n\n%s" % (extra, note) if extra else note
 
     def _close(self, session):
         if session is not None:
@@ -1034,17 +1285,9 @@ Rules:
         rewrite falls back to the template rather than replacing it."""
         if self.dry_run:
             return text
-        try:
-            choice = self._pick("reporter")
-        except routing.NoModelAvailable:
+        res = self._optional("reporter", self.REPORT_PROMPT % text)
+        if res is None:
             return text
-        session = self.adapter.start_agent("reporter", choice.agent_kind, self.repo,
-                                           prompts.env_for(self.task))
-        try:
-            res = self.adapter.prompt(session, self.REPORT_PROMPT % text, timeout=180)
-        finally:
-            self._close(session)
-        self._bill(res, choice)
         out = (res.get("output") or "").strip()
         if len(out) < 80 or brief.lint(out):
             return text
@@ -1062,3 +1305,35 @@ Rules:
         if not self.gate(kind, text):
             raise Halt("needs_human", "%s declined by human" % kind)
         self.task.record_gate(kind, "approved")
+
+    def _quota_park(self, exc):
+        """Park on quota rather than on a generic 'no model available'. The
+        difference matters to the reader: nothing is wrong with the task, and
+        it will run again by itself once the window reopens."""
+        self.task.update(park={"reason": "quota_all_exhausted",
+                               "reopen_at": exc.reopen_at,
+                               "channels": exc.channels,
+                               "role": exc.role})
+        when = _stamp(exc.reopen_at)
+        tid = self.task.state["id"]
+        files = sorted({f for s in self.task.state.get("subtasks") or []
+                        for f in s.get("actual_files", [])})
+        # Deliberately unpolished: the reporter runs on the same seats that just
+        # went dark, and a second failure to render a brief helps nobody.
+        text, problems = brief.write(
+            self.task, "paused",
+            "Every provider seat enrolled for the %s step has hit its usage "
+            "limit, so this task is paused rather than failed. Nothing is wrong "
+            "with the work: %s comes back at %s. Resume then with `delegate "
+            "resume --id %s`, or leave `delegate resume --when-open --id %s` "
+            "running and it will pick itself up."
+            % (exc.role, " and ".join(exc.channels), when, tid, tid),
+            files=files,
+            extra="## Paused seats\n\n"
+                  + "\n".join("- `%s`" % c for c in exc.channels)
+                  + "\n\nOverride with `delegate channels --clear <name>` if you "
+                    "believe a seat is actually available.")
+        for p in problems:
+            self.log("  brief lint: %s" % p)
+        self.task.update(status="needs_human")
+        self.log("\n== PAUSED (quota): %s" % exc)

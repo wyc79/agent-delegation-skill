@@ -70,6 +70,11 @@ The orchestrator walks a ladder: retry with your context → a different model a
 the same tier → a stronger model within the deployment's ceiling → back to the
 planner → a human. You do not choose the rung and you do not know the ceiling.
 
+**Not every replacement is a rung.** If you were started to continue work another
+agent left part-way — because its capacity ran out, not because its approach
+failed — the ladder has not moved and nothing has been spent. See
+`references/handover.md`.
+
 Your job is to **stop in a resumable state**:
 
 1. Leave the worktree consistent — either your work committed as a checkpoint, or

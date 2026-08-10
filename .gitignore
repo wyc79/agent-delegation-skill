@@ -37,3 +37,6 @@ npm-debug.log*
 
 # Orchestrator worktrees (created as siblings of the repo, but just in case)
 .adg-worktrees/
+
+# Local agent/editor working docs (specs, plans, scratch) — never part of the repo
+.claude/

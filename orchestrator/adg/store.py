@@ -63,9 +63,10 @@ def project_dir(repo):
     return os.path.join(state_root(), "projects", project_key(repo))
 
 
-def _atomic_write(path, text):
+def atomic_write(path, text):
     """Write via temp file + replace so a crash never leaves a half file --
-    task.json is the resume point and a truncated one loses the run."""
+    task.json is the resume point and a truncated one loses the run, and
+    channels.json is shared between concurrent processes."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
     try:
@@ -161,7 +162,7 @@ class Task:
             return default
 
     def write_text(self, name, text):
-        _atomic_write(self.file(name), text)
+        atomic_write(self.file(name), text)
 
     def read_json(self, name):
         return json.loads(self.read_text(name))

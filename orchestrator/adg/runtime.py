@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 
+from . import quota
 from .store import git
 
 
@@ -24,9 +25,13 @@ class RuntimeError_(RuntimeError):
     pass
 
 
-def _result(stdout, stderr, code):
+def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
     """Normalise a CLI run. Structured output carries the cost; plain text does
-    not, and a missing cost is reported as unknown rather than as zero."""
+    not, and a missing cost is reported as unknown rather than as zero.
+
+    Classification happens here, where the *raw* streams are still in scope: a
+    JSON `--output-format` run replaces `output` with the parsed result field,
+    and the rate-limit message usually arrived on stderr."""
     raw = (stdout or "") + (stderr or "")
     text, cost = raw, None
     try:
@@ -41,8 +46,22 @@ def _result(stdout, stderr, code):
                 cost = float(data[key])
                 break
         usage = _tokens(data.get("usage"))
-    return {"settled": "idle" if code == 0 else "blocked",
-            "output": text, "code": code, "cost_usd": cost, "usage": usage}
+        if isinstance(data.get("error"), dict):
+            error_code = error_code or data["error"].get("code")
+    res = {"settled": "idle" if code == 0 else "blocked",
+           "output": text, "code": code, "cost_usd": cost, "usage": usage,
+           "error_code": error_code}
+    return classify(res, kind, now, raw)
+
+
+def classify(res, kind, now=None, text=None):
+    """Attach `failure` and `reset_at` to an adapter result. One seam, so every
+    adapter answers the quota question the same way (§5.5)."""
+    probe = dict(res, output=text if text is not None else res.get("output"))
+    failure, reset_at = quota.classify(
+        kind, probe, now if now is not None else time.time())
+    res["failure"], res["reset_at"] = failure, reset_at
+    return res
 
 
 def _tokens(usage):
@@ -206,13 +225,17 @@ class LocalAdapter(Adapter):
         # Prompt goes on stdin, not argv: variadic flags such as claude's
         # --add-dir will otherwise swallow a trailing positional prompt, and
         # stdin has no argument-length limit.
+        kind = (session.handle or {}).get("kind")
         try:
             p = subprocess.run(argv or session.handle["argv"], cwd=session.cwd,
                                env=session.handle["env"], input=text,
                                capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            return {"settled": "timeout", "output": "", "code": None}
-        return _result(p.stdout, p.stderr, p.returncode)
+            # Never quota: a timeout says nothing about the provider's window,
+            # and a wrong five-hour breaker hides a healthy seat.
+            return {"settled": "timeout", "output": "", "code": None,
+                    "failure": "other", "reset_at": None}
+        return _result(p.stdout, p.stderr, p.returncode, kind=kind)
 
     def follow_up(self, session, text, timeout):
         flag = self.CONTINUE.get(session.handle.get("kind"))
@@ -338,13 +361,15 @@ class HerdrAdapter(LocalAdapter):
     def prompt(self, session, text, timeout, argv=None):
         if not (session.handle or {}).get("herdr"):
             return LocalAdapter.prompt(self, session, text, timeout, argv)
+        kind = (session.handle or {}).get("kind")
         res = self._cli(["agent", "prompt", session.name, text, "--wait",
                          "--timeout", str(int(timeout * 1000))], check=False)
         if res is None:
             why = getattr(self, "last_error", "") or "unknown"
-            return {"settled": "timeout" if "timeout" in why else "blocked",
-                    "output": "herdr refused the prompt: %s" % why,
-                    "code": None, "cost_usd": None}
+            return classify({"settled": "timeout" if "timeout" in why else "blocked",
+                             "output": "herdr refused the prompt: %s" % why,
+                             "code": None, "cost_usd": None,
+                             "error_code": why}, kind)
         read = self._cli(["agent", "read", session.name, "--source",
                           "recent-unwrapped", "--lines", "400"], check=False) or {}
         out = ((read.get("result") or {}).get("text")
@@ -353,9 +378,10 @@ class HerdrAdapter(LocalAdapter):
         state = agent.get("agent_status") or agent.get("state") or "idle"
         # herdr reports liveness, never success -- `blocked` means it is waiting
         # on a human, which for an unattended run is a failure to report.
-        return {"settled": "blocked" if state == "blocked" else "idle",
-                "output": out, "code": 0 if state != "blocked" else 1,
-                "cost_usd": None}
+        return classify({"settled": "blocked" if state == "blocked" else "idle",
+                         "output": out, "code": 0 if state != "blocked" else 1,
+                         "cost_usd": None,
+                         "error_code": agent.get("error_code")}, kind)
 
     def follow_up(self, session, text, timeout):
         if not (session.handle or {}).get("herdr"):
@@ -381,9 +407,12 @@ class MockAdapter(Adapter):
 
     name = "mock"
 
-    def __init__(self, script=None):
+    def __init__(self, script=None, now=None):
         self.script = script or {}
         self.calls = []
+        # Injected so failover tests classify against a fixed clock and the
+        # suite never sleeps.
+        self.now = now or time.time
 
     def create_worktree(self, repo, branch, base, path):
         return LocalAdapter.create_worktree(self, repo, branch, base, path)
@@ -395,16 +424,24 @@ class MockAdapter(Adapter):
         return True
 
     def start_agent(self, role, kind, cwd, env):
-        return Session("%s-mock" % role, cwd, handle={"role": role, "env": env})
+        return Session("%s-mock" % role, cwd,
+                       handle={"role": role, "kind": kind, "env": env})
 
     def prompt(self, session, text, timeout):
         role = session.handle["role"]
         self.calls.append((role, text))
         fn = self.script.get(role)
         if fn is None:
-            return {"settled": "idle", "output": "", "code": 0}
-        fn(session.handle["env"], session.cwd)
-        return {"settled": "idle", "output": "mock:%s" % role, "code": 0}
+            return classify({"settled": "idle", "output": "", "code": 0},
+                            session.handle.get("kind"), self.now())
+        # A script may return a result dict to stand in for a real CLI failure
+        # -- run it through the same classifier the local adapter uses, so a
+        # test proves the shipped table and not a stub.
+        res = {"settled": "idle", "output": "mock:%s" % role, "code": 0}
+        override = fn(session.handle["env"], session.cwd)
+        if isinstance(override, dict):
+            res = dict(res, **override)
+        return classify(res, session.handle.get("kind"), self.now())
 
     def follow_up(self, session, text, timeout):
         self.calls.append(("follow_up", session.handle["role"]))
