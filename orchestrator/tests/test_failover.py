@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from adg import cooldown, quota, store                           # noqa: E402
+from adg import cooldown, quota, router, store                   # noqa: E402
 from test_orchestrator import REGISTRY, TempRepo, _report, sh    # noqa: E402,F401
 
 T0 = 1754800000.0        # a fixed epoch; every test clock starts here
@@ -208,6 +208,109 @@ class TestCooldownStore(unittest.TestCase):
         cooldown.open_breaker("cursor-seat", "quota", T0 + 3600, T0)
         cools, _, _ = cooldown.read(T0)
         self.assertEqual(cooldown.earliest_reopen(cools), T0 + 3600)
+
+
+class TestRouterCooldowns(unittest.TestCase):
+    def setUp(self):
+        self.reg = router.load_registry(REGISTRY)
+        self.r = router.Router(self.reg)
+
+    def test_a_cooled_channel_is_filtered_exactly_like_disabled(self):
+        before = {c.channel for c in self.r.candidates("implementer")}
+        self.assertIn("claude-seat", before)
+        after = {c.channel for c in self.r.candidates(
+            "implementer", cooldowns={"claude-seat"})}
+        self.assertNotIn("claude-seat", after)
+        self.assertIn("cursor-seat", after)
+
+    def test_cooling_every_channel_leaves_nothing(self):
+        self.assertEqual(self.r.candidates(
+            "implementer", cooldowns={"claude-seat", "cursor-seat"}), [])
+
+    def test_select_still_names_the_fix_when_nothing_is_left(self):
+        with self.assertRaises(router.NoModelAvailable):
+            self.r.select("implementer", cooldowns={"claude-seat", "cursor-seat"})
+
+
+class TestShadowPrice(unittest.TestCase):
+    """§5.4: a subscription seat with headroom is ~free; as its window fills it
+    prices itself above a metered key."""
+
+    def setUp(self):
+        self.reg = router.load_registry(REGISTRY)
+        self.r = router.Router(self.reg)
+        self.sub = {"type": "subscription"}
+        self.metered = {"type": "metered"}
+        self.spec = {"cost_out": 10.0}
+
+    def test_an_empty_seat_is_free(self):
+        self.assertEqual(self.r._cost(self.spec, self.sub, 0.0), 0.0)
+
+    def test_cost_rises_with_utilization(self):
+        half = self.r._cost(self.spec, self.sub, 0.5)
+        full = self.r._cost(self.spec, self.sub, 0.9)
+        self.assertGreater(half, 0.0)
+        self.assertGreater(full, half)
+
+    def test_a_nearly_full_seat_costs_more_than_metered(self):
+        self.assertGreater(self.r._cost(self.spec, self.sub, 0.9),
+                           self.r._cost(self.spec, self.metered, 0.0))
+
+    def test_utilization_never_divides_by_zero(self):
+        self.assertGreater(self.r._cost(self.spec, self.sub, 1.0), 0.0)
+        self.assertGreater(self.r._cost(self.spec, self.sub, 5.0), 0.0)
+
+    def test_metered_ignores_utilization_entirely(self):
+        self.assertEqual(self.r._cost(self.spec, self.metered, 0.9),
+                         self.r._cost(self.spec, self.metered, 0.0))
+
+    def test_a_drawn_seat_loses_a_cost_sensitive_role_to_the_emptier_one(self):
+        # implementer is cost_sensitivity: high, and both seats expose
+        # balanced-coder, so the only thing separating them is the window.
+        drained = self.r.candidates("implementer",
+                                    utilization={"claude-seat": 0.6, "cursor-seat": 0.0})
+        self.assertEqual(drained[0].channel, "cursor-seat")
+        fresh = self.r.candidates("implementer",
+                                  utilization={"claude-seat": 0.0, "cursor-seat": 0.6})
+        self.assertEqual(fresh[0].channel, "claude-seat")
+
+
+class TestReserve(unittest.TestCase):
+    """claude-seat reserves 30% for planner/reviewer in registry.default.yaml."""
+
+    def setUp(self):
+        self.reg = router.load_registry(REGISTRY)
+        self.r = router.Router(self.reg)
+
+    def test_a_reserved_role_keeps_the_seat_at_any_draw(self):
+        got = self.r.candidates("reviewer", utilization={"claude-seat": 0.95})
+        self.assertIn("claude-seat", {c.channel for c in got})
+
+    def test_a_non_reserved_role_is_filtered_past_the_floor(self):
+        got = self.r.candidates("implementer",
+                                utilization={"claude-seat": 0.8, "cursor-seat": 0.0})
+        self.assertNotIn("claude-seat", {c.channel for c in got})
+
+    def test_below_the_floor_nothing_is_filtered(self):
+        got = self.r.candidates("implementer",
+                                utilization={"claude-seat": 0.5, "cursor-seat": 0.0})
+        self.assertIn("claude-seat", {c.channel for c in got})
+
+    def test_the_seat_comes_back_demoted_when_it_is_the_only_one(self):
+        # A guarantee that parks work it could have done is not worth having.
+        got = self.r.candidates("implementer",
+                                utilization={"claude-seat": 0.8},
+                                cooldowns={"cursor-seat"})
+        self.assertEqual([c.channel for c in got], ["claude-seat"])
+        self.assertTrue(got[0].demoted)
+
+    def test_a_nonsense_reserve_fraction_refuses_rather_than_ignoring_it(self):
+        reg = router.load_registry(REGISTRY)
+        reg["channels"]["claude-seat"]["reserve_fraction"] = "most of it"
+        with self.assertRaises(router.RoutingError) as cm:
+            router.Router(reg).candidates("implementer",
+                                          utilization={"claude-seat": 0.9})
+        self.assertIn("reserve_fraction", str(cm.exception))
 
 
 if __name__ == "__main__":
