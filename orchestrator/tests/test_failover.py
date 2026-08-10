@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from adg import quota                                            # noqa: E402
+from adg import cooldown, quota, store                           # noqa: E402
 from test_orchestrator import REGISTRY, TempRepo, _report, sh    # noqa: E402,F401
 
 T0 = 1754800000.0        # a fixed epoch; every test clock starts here
@@ -115,6 +115,99 @@ class TestWindowAndCapacityParsing(unittest.TestCase):
         self.assertEqual(quota.parse_capacity("40u"), 40.0)
         self.assertEqual(quota.parse_capacity("500req"), 500.0)
         self.assertIsNone(quota.parse_capacity("lots"))
+
+
+class TestCooldownStore(unittest.TestCase):
+    """AC-2, AC-4. The file is shared across projects on purpose: a quota
+    belongs to a seat, not to a repository."""
+
+    def setUp(self):
+        self.t = TempRepo()
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_it_lives_beside_projects_not_inside_one(self):
+        p = cooldown.path()
+        self.assertTrue(p.startswith(store.state_root()))
+        self.assertNotIn("projects", p)
+        self.assertNotIn(self.t.repo, p)
+
+    def test_open_then_read_back(self):
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0, "usage limit")
+        cools, _, warn = cooldown.read(T0 + 10)
+        self.assertIsNone(warn)
+        self.assertEqual(cools["claude-seat"]["reopen_at"], T0 + 3600)
+        self.assertEqual(cools["claude-seat"]["reason"], "quota")
+        self.assertEqual(cooldown.active(T0 + 10), {"claude-seat"})
+
+    def test_an_expired_breaker_is_invisible_and_then_pruned(self):
+        cooldown.open_breaker("claude-seat", "quota", T0 + 60, T0)
+        self.assertEqual(cooldown.active(T0 + 61), set())
+        cooldown.open_breaker("cursor-seat", "quota", T0 + 999, T0 + 61)
+        with open(cooldown.path()) as fh:
+            raw = json.load(fh)
+        self.assertNotIn("claude-seat", raw["cooldowns"], "expired entry was not pruned")
+
+    def test_clear_removes_one_and_reports_whether_it_did(self):
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        self.assertTrue(cooldown.clear("claude-seat"))
+        self.assertEqual(cooldown.active(T0 + 10), set())
+        self.assertFalse(cooldown.clear("claude-seat"))
+
+    def test_a_corrupt_file_is_empty_plus_a_warning_never_a_crash(self):
+        os.makedirs(os.path.dirname(cooldown.path()), exist_ok=True)
+        with open(cooldown.path(), "w") as fh:
+            fh.write("{not json at all")
+        cools, usage, warn = cooldown.read(T0)
+        self.assertEqual(cools, {})
+        self.assertEqual(usage, {})
+        self.assertIsNotNone(warn)
+        self.assertIn(cooldown.path(), warn, "the warning must name the file to delete")
+
+    def test_a_missing_file_is_simply_empty_and_quiet(self):
+        cools, usage, warn = cooldown.read(T0)
+        self.assertEqual((cools, usage, warn), ({}, {}, None))
+
+    def test_a_concurrent_writer_is_merged_not_clobbered(self):
+        # Two projects sharing a seat write the same file. A last-writer-wins
+        # implementation loses one of these silently.
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        cooldown.open_breaker("cursor-seat", "quota", T0 + 7200, T0)
+        self.assertEqual(cooldown.active(T0 + 10), {"claude-seat", "cursor-seat"})
+
+    def test_extending_a_breaker_never_shortens_it(self):
+        cooldown.open_breaker("claude-seat", "quota", T0 + 7200, T0)
+        cooldown.open_breaker("claude-seat", "quota", T0 + 60, T0)
+        cools, _, _ = cooldown.read(T0)
+        self.assertEqual(cools["claude-seat"]["reopen_at"], T0 + 7200)
+
+    def test_usage_is_metered_and_pruned_to_the_window(self):
+        for i in range(4):
+            cooldown.record_use("claude-seat", 3600, T0 + i)
+        _, usage, _ = cooldown.read(T0 + 5)
+        self.assertEqual(len(usage["claude-seat"]), 4)
+        cooldown.record_use("claude-seat", 3600, T0 + 4000)
+        _, usage, _ = cooldown.read(T0 + 4000)
+        self.assertEqual(len(usage["claude-seat"]), 1, "stale stamps outlived the window")
+
+    def test_utilization_is_calls_over_capacity_inside_the_window(self):
+        spec = {"window": "5h", "est_capacity": "40u"}
+        stamps = [T0 + i for i in range(10)]
+        self.assertAlmostEqual(cooldown.utilization(stamps, spec, T0 + 60), 0.25)
+        self.assertEqual(cooldown.utilization(stamps, spec, T0 + 6 * 3600), 0.0)
+
+    def test_utilization_is_zero_when_capacity_is_unknown(self):
+        # No estimate means no shadow price. Guessing one would move routing on
+        # a number nobody supplied.
+        self.assertEqual(cooldown.utilization([T0], {"window": "5h"}, T0), 0.0)
+        self.assertEqual(cooldown.utilization([T0], None, T0), 0.0)
+
+    def test_earliest_reopen_picks_the_soonest(self):
+        cooldown.open_breaker("claude-seat", "quota", T0 + 7200, T0)
+        cooldown.open_breaker("cursor-seat", "quota", T0 + 3600, T0)
+        cools, _, _ = cooldown.read(T0)
+        self.assertEqual(cooldown.earliest_reopen(cools), T0 + 3600)
 
 
 if __name__ == "__main__":
