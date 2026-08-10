@@ -1021,15 +1021,32 @@ class TestCostBreakdown(unittest.TestCase):
         self.assertIn("classifier", out)
         self.assertIn("planner", out)
 
-    def test_unreported_cost_is_never_shown_as_zero(self):
+    def test_a_pane_run_says_it_cannot_be_measured(self):
+        # Structural, not a hiccup: the user chose a mode that cannot bill.
         out = "\n".join(brief._cost_section(self.STATE))
-        self.assertIn("not reported", out)
-        self.assertIn("the real total is higher", out)
+        self.assertIn("cannot be measured in a pane", out)
+        self.assertIn("cannot be billed", out)
+        self.assertIn("--no-panes", out)
         self.assertNotIn("$0.00", out)
 
-    def test_pane_runs_are_labelled_so_the_gap_is_explicable(self):
+    def test_a_silent_subprocess_is_called_unexpected_instead(self):
         out = "\n".join(brief._cost_section(self.STATE))
-        self.assertIn("terminal pane", out)
+        self.assertIn("which is unexpected", out)
+
+    def test_pane_only_run_makes_no_unexpected_claim(self):
+        state = dict(self.STATE, delegation_history=[
+            {"role": "implementer", "model": "balanced-coder", "channel": "claude-seat",
+             "adapter": "herdr", "usd": None}])
+        out = "\n".join(brief._cost_section(state))
+        self.assertIn("cannot be billed", out)
+        self.assertNotIn("unexpected", out)
+
+    def test_estimated_cost_is_labelled_as_estimated(self):
+        state = dict(self.STATE, delegation_history=[
+            {"role": "classifier", "model": "fast-cheap", "channel": "cursor-seat",
+             "adapter": "local", "usd": 0.02, "usd_estimated": True}])
+        out = "\n".join(brief._cost_section(state))
+        self.assertIn("estimated from tokens", out)
 
     def test_a_fully_priced_run_makes_no_excuses(self):
         state = dict(self.STATE, delegation_history=[

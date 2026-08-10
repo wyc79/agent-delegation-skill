@@ -64,34 +64,48 @@ def _cost_section(state):
 
     rows = {}
     for h in state.get("delegation_history") or []:
-        key = (h.get("model") or "unknown", h.get("channel") or "unknown",
-               h.get("adapter") or "")
-        row = rows.setdefault(key, {"steps": [], "usd": 0.0, "unpriced": 0})
+        in_pane = (h.get("adapter") == "herdr")
+        key = (h.get("model") or "unknown", h.get("channel") or "unknown", in_pane)
+        row = rows.setdefault(key, {"steps": [], "usd": 0.0, "silent": 0, "est": False})
         row["steps"].append(h.get("role") or h.get("stage") or "step")
         if isinstance(h.get("usd"), (int, float)):
             row["usd"] += float(h["usd"])
+            row["est"] = row["est"] or bool(h.get("usd_estimated"))
         else:
-            row["unpriced"] += 1
+            row["silent"] += 1
+
+    # Two different facts, and collapsing them misleads. An agent in a terminal
+    # pane *cannot* be billed -- that is how the mode works, and the user chose
+    # it. A subprocess that returned no cost is a surprise worth flagging.
+    paned = sum(r["silent"] for k, r in rows.items() if k[2])
+    unexplained = sum(r["silent"] for k, r in rows.items() if not k[2])
 
     if rows:
         md += ["| Model | Provider | Did | Cost |", "|---|---|---|---|"]
-        for (model, channel, adapter), row in sorted(rows.items()):
-            cost = "$%.2f" % row["usd"] if row["usd"] else ""
-            if row["unpriced"]:
-                note = "%d run%s not reported" % (row["unpriced"],
-                                                  "" if row["unpriced"] == 1 else "s")
+        for (model, channel, in_pane), row in sorted(rows.items()):
+            cost = ("~$%.2f (estimated from tokens)" if row["est"] else "$%.2f") % row["usd"] \
+                if row["usd"] else ""
+            if row["silent"]:
+                note = ("cannot be measured in a pane" if in_pane
+                        else "%d run%s reported none" % (row["silent"],
+                                                         "" if row["silent"] == 1 else "s"))
                 cost = "%s (%s)" % (cost, note) if cost else note
             md.append("| `%s` | %s%s | %s | %s |" % (
-                model, channel, " (in a terminal pane)" if adapter == "herdr" else "",
+                model, channel, " — in a terminal pane" if in_pane else "",
                 ", ".join(sorted(set(row["steps"]))), cost))
         md.append("")
 
     total = float(spent.get("usd", 0.0))
     cap = float(limits_.get("max_cost_usd", 0))
     md.append("- Total billed: $%.2f of a $%.2f cap." % (total, cap))
-    if any(r["unpriced"] for r in rows.values()):
-        md.append("- Some runs reported no cost, so the real total is higher than "
-                  "the figure above and the cap could not be enforced against them.")
+    if paned:
+        md.append("- Agents running in a terminal pane cannot be billed — you can "
+                  "watch them work, but they report nothing back, so their spend is "
+                  "absent from the total above and the cap does not apply to them. "
+                  "Re-run with `--no-panes` if you need the cap enforced.")
+    if unexplained:
+        md.append("- Some runs outside a pane reported no cost, which is unexpected. "
+                  "The real total is higher than the figure above.")
     md.append("")
     return md
 

@@ -33,14 +33,33 @@ def _result(stdout, stderr, code):
         data = json.loads(stdout or "")
     except ValueError:
         data = None
+    usage = None
     if isinstance(data, dict):
         text = data.get("result") or data.get("output") or raw
         for key in ("total_cost_usd", "cost_usd"):
             if isinstance(data.get(key), (int, float)):
                 cost = float(data[key])
                 break
+        usage = _tokens(data.get("usage"))
     return {"settled": "idle" if code == 0 else "blocked",
-            "output": text, "code": code, "cost_usd": cost}
+            "output": text, "code": code, "cost_usd": cost, "usage": usage}
+
+
+def _tokens(usage):
+    """Normalise the two token shapes we see. Cost can then be derived from our
+    own price table when a CLI reports usage but not money."""
+    if not isinstance(usage, dict):
+        return None
+    def pick(*names):
+        for n in names:
+            if isinstance(usage.get(n), (int, float)):
+                return int(usage[n])
+        return 0
+    got = {"in": pick("input_tokens", "inputTokens")
+                 + pick("cache_read_input_tokens", "cacheReadTokens")
+                 + pick("cache_creation_input_tokens", "cacheWriteTokens"),
+           "out": pick("output_tokens", "outputTokens")}
+    return got if (got["in"] or got["out"]) else None
 
 
 class Session:
@@ -105,7 +124,7 @@ class LocalAdapter(Adapter):
         "claude": ["claude", "-p", "--permission-mode", "bypassPermissions",
                    "--output-format", "json"],
         "codex": ["codex", "exec", "--full-auto"],
-        "cursor": ["cursor-agent", "-p", "--force"],
+        "cursor": ["cursor-agent", "-p", "--force", "--output-format", "json"],
         "gemini": ["gemini", "-y", "-p"],
     }
 

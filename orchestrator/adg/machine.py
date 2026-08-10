@@ -163,8 +163,7 @@ admits only one sensible reading.
                 "request": text.strip()[:4000], "facts": self._repo_facts()}, timeout=180)
         finally:
             self._close(session)
-        if res.get("cost_usd"):
-            self.budget.spend(res["cost_usd"])
+        self._bill(res, choice)
         out = (res.get("output") or "").strip()
         if "AC-1" not in out:
             self.log("intake: no criteria derived — the reviewer will have less to check")
@@ -216,8 +215,7 @@ admits only one sensible reading.
             res = self.adapter.prompt(session, prompt, timeout=180)
         finally:
             self.adapter.teardown(session)
-        if res.get("cost_usd"):
-            self.budget.spend(res["cost_usd"])
+        self._bill(res, choice)
         out = (res.get("output") or "")
         m = re.search(r"VERDICT:\s*(SIMPLE|COMPLEX)\s*-*\s*(.*)", out, re.I)
         if not m:
@@ -871,8 +869,7 @@ a planner does that next, from your design.
             text = prompts.retry(failure)
             res = self.adapter.follow_up(session, text, timeout=3600)
         self._log_transcript(role, text, res)
-        if res.get("cost_usd"):
-            self.budget.spend(res["cost_usd"])
+        self._bill(res, choice)
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
         report, problems = self._collect_report(role, subtask, since=started)
         self._last_report = report
@@ -884,6 +881,7 @@ a planner does that next, from your design.
             "model": choice.model, "channel": choice.channel,
             "adapter": self.adapter.name, "outcome": outcome,
             "usd": res.get("cost_usd"),
+            "usd_estimated": bool(res.get("cost_estimated")) or None,
             "report_problems": problems or None,
         })
         if outcome == "blocked" and res.get("settled") == "timeout":
@@ -899,6 +897,25 @@ a planner does that next, from your design.
                 # Teardown must never mask the real outcome, but swallowing it
                 # silently hides adapter bugs that only show up as leaked panes.
                 self.log("  warning: teardown failed: %s: %s" % (type(e).__name__, e))
+
+    def _bill(self, res, choice):
+        """Charge a run. Some CLIs report money, some report only tokens; those
+        get priced from our own registry and marked as an estimate, because a
+        derived number and a billed one are different facts."""
+        if res.get("cost_usd"):
+            self.budget.spend(res["cost_usd"])
+            return res["cost_usd"]
+        tok = res.get("usage")
+        if not tok or not choice:
+            return None
+        spec = choice.spec or {}
+        usd = (tok["in"] / 1e6) * float(spec.get("cost_in", 0)) + \
+              (tok["out"] / 1e6) * float(spec.get("cost_out", 0))
+        if usd <= 0:
+            return None
+        res["cost_usd"], res["cost_estimated"] = round(usd, 6), True
+        self.budget.spend(res["cost_usd"])
+        return res["cost_usd"]
 
     def _log_transcript(self, role, prompt, res):
         """Keep what the agent was asked and what it said. An agent that does
@@ -964,8 +981,7 @@ Rules:
             res = self.adapter.prompt(session, self.REPORT_PROMPT % text, timeout=180)
         finally:
             self._close(session)
-        if res.get("cost_usd"):
-            self.budget.spend(res["cost_usd"])
+        self._bill(res, choice)
         out = (res.get("output") or "").strip()
         if len(out) < 80 or brief.lint(out):
             return text
