@@ -239,17 +239,32 @@ leaving a file behind — which it normally has, since it checkpoints — the ru
 did not merely mis-mark a subtask: it reached `done` and emitted a patch built
 on work whose own report said nothing had been verified.
 
-**Still open, and why the default has not moved.** An earlier pass reduced the
-failure rate from 2/8 to 1/8 by serializing `task.json` mutations, and the note
-then inferred that at least one more race remained. This defect explains the
-residual, but 12 clean full-suite runs since the fix is only 20% surprising at
-the old rate — corroboration, not proof, and it says nothing about whatever else
-may be in the wave path. `registry.default.yaml` therefore still ships
-`max_parallel_agents: 1`. About 25 consecutive clean runs would put a chance
-streak under 5%; that, or another root cause found by reading rather than
-sampling, is what should move it. The sequential path was never exposed: with
-one implementer at a time there is no sibling whose report could be read as
-yours.
+**A second failure mode is still live, and it is not this one.** The substring
+defect is fixed and pinned deterministically, but it did not account for the
+intermittent failure, and saying it did was getting ahead of the evidence.
+`test_one_subtask_escalating_stops_the_run_even_as_a_sibling_succeeds` still
+fails at roughly 1 run in 19 of the full suite, and about 1 round in 10 with two
+suites running concurrently — contention raises the rate, which is what a real
+race looks like and what an ordering bug does not.
+
+The captured evidence, verbatim from a failing run: `st-2-beta`'s implementer
+wrote an `escalate` report, the log has no `reported escalate` line at all, and
+the wave carried on into review. So `_collect_report` did not return a report
+that was on disk — the same *symptom* as the substring defect, a different and
+still-undiagnosed cause. Note it is caught by the assertion on the **reason**,
+not the one on the status: the run does park, just for an unrelated reason. An
+outcome assertion alone would have called this green.
+
+`registry.default.yaml` therefore still ships `max_parallel_agents: 1`, and this
+is now a known-live defect rather than a suspected one. The sequential path is
+unaffected: with one implementer at a time there is no sibling to be confused
+with, and the failure has never been observed outside a wave.
+
+One thing ruled out by reading: that test's `Interleaved` hook used to wrap
+`_invoke`, which *contains* the report read, so the window it documents was
+never opened and it had been passing on the strength of a comment. The hook now
+wraps `_collect_report`. It still passes in isolation, so the forced ordering is
+not the trigger either.
 
 The parallel tests set their own concurrency — `TestWaveRaces` at 3, because it
 plans three subtasks and a lower cap never opens the window it exists to probe.

@@ -354,6 +354,19 @@ Add a subtract function beside the existing add.
 """
 
 
+def _slurp(path):
+    """Read a file and close it. Bare `open(...).read()` in an assertion leaks a
+    handle, and a suite that prints ResourceWarnings teaches its readers to skim
+    warnings -- which is where the next real one goes to hide."""
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _spit(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
 def _report(cwd_task, name, payload):
     with open(os.path.join(cwd_task, "reports", name), "w") as fh:
         json.dump(payload, fh)
@@ -951,13 +964,17 @@ class TestWaveRaces(unittest.TestCase):
                     "evidence": {"not_verified": ["everything"]}})
 
         class Interleaved(Orchestrator):
-            def _invoke(self, role, choice, cwd, **kw):
-                out = Orchestrator._invoke(self, role, choice, cwd, **kw)
-                sub = kw.get("subtask") or {}
+            # Hooked on _collect_report, not _invoke. _invoke *contains* the
+            # report read, so ordering around it let both threads read before
+            # either signalled -- the window this test documents was never
+            # opened, and it has been passing on the strength of a comment.
+            def _collect_report(self, role, subtask, before=None):
+                sub = subtask or {}
+                if sub.get("id") == "st-2-beta":
+                    sibling_reported.wait(10)   # alpha's report lands first
+                out = Orchestrator._collect_report(self, role, subtask, before=before)
                 if sub.get("id") == "st-1-alpha":
-                    sibling_reported.set()          # my report is now the latest
-                elif sub.get("id") == "st-2-beta":
-                    sibling_reported.wait(10)       # let it land before I read mine
+                    sibling_reported.set()      # mine is on disk and read
                 return out
 
         def planner(env, cwd):
@@ -1624,7 +1641,8 @@ class TestSkillContract(unittest.TestCase):
     def test_every_field_a_card_names_is_legal(self):
         # Fields a role card tells an agent to write must exist in the schema or
         # be explicitly routed to role_data.
-        report = json.load(open(os.path.join(self.SKILL, "schemas", "report.schema.json")))
+        report = json.loads(_slurp(os.path.join(self.SKILL, "schemas",
+                                            "report.schema.json")))
         allowed = set(report["properties"])
         for role, named in [("planner", ["subtask_ids", "estimated_total_loc"]),
                             ("test-author", ["ac_coverage"])]:
@@ -1653,14 +1671,14 @@ class TestSkillContract(unittest.TestCase):
                                     "status": "complete", "summary": "s", "evidence": {}})
 
     def test_out_of_scope_severity_is_stated_once_and_agrees(self):
-        ref = open(os.path.join(self.SKILL, "references", "deviations.md")).read()
+        ref = _slurp(os.path.join(self.SKILL, "references", "deviations.md"))
         impl = self._card("implementer")
         self.assertIn("One exception:", ref, "the carve-out belongs with the rule")
         self.assertNotIn("Small mechanical exceptions", impl,
                          "implementer.md restates the severity rule differently again")
 
     def test_task_md_authority_matches_what_the_planner_is_told(self):
-        skill = open(os.path.join(self.SKILL, "SKILL.md")).read()
+        skill = _slurp(os.path.join(self.SKILL, "SKILL.md"))
         self.assertNotIn("amended only by humans", skill)
         self.assertIn("planner may add criteria", skill)
         self.assertIn("missing entirely", self._card("planner"))
@@ -1670,7 +1688,7 @@ class TestSkillContract(unittest.TestCase):
         a scratch directory loads this protocol -- including a foreign skill's
         pass dispatched through the same runtime, which then holds two sets of
         instructions naming different output files."""
-        desc = open(os.path.join(self.SKILL, "SKILL.md")).read().split("---")[1]
+        desc = _slurp(os.path.join(self.SKILL, "SKILL.md")).split("---")[1]
         self.assertIn("$AGENT_DELEGATION_ROLE", desc)
         self.assertNotIn("$AGENT_DELEGATION_TASK_DIR", desc,
                          "the task directory is a location, not an assignment")
@@ -1695,7 +1713,7 @@ class TestRoundVersioning(unittest.TestCase):
         orch._archive_reports("review-")
         archived = sorted(os.listdir(task.file("reports", "archive")))
         self.assertEqual(archived, ["review-reviewer-r1.json", "review-reviewer-r2.json"])
-        rounds = [json.load(open(task.file("reports", "archive", a)))["round"]
+        rounds = [json.loads(_slurp(task.file("reports", "archive", a)))["round"]
                   for a in archived]
         self.assertEqual(rounds, [1, 2], "an earlier round was overwritten")
 
@@ -2168,9 +2186,9 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(status, "done", "\n".join(logs))
         wt = task.state["worktree"]
         self.assertTrue(os.path.isdir(wt))
-        self.assertNotIn("def subtract", open(os.path.join(self.t.repo, "app.py")).read(),
+        self.assertNotIn("def subtract", _slurp(os.path.join(self.t.repo, "app.py")),
                          "change leaked into the user's checkout")
-        self.assertIn("def subtract", open(os.path.join(wt, "app.py")).read())
+        self.assertIn("def subtract", _slurp(os.path.join(wt, "app.py")))
 
     def test_attended_mode_produces_a_patch_and_never_commits(self):
         script, _ = self._script()
@@ -2327,8 +2345,8 @@ class TestEndToEnd(unittest.TestCase):
 
     def test_unparseable_plan_parks_rather_than_guessing(self):
         script, _ = self._script()
-        script["planner"] = lambda env, cwd: open(
-            os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w").write("no yaml here")
+        script["planner"] = lambda env, cwd: _spit(
+            os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "no yaml here")
         status, task, _, _ = self._run(script)
         self.assertEqual(status, "needs_human")
 
