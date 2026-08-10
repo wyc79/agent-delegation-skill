@@ -116,24 +116,7 @@ cost curve moves them there on its own.
 
 ## What is missing on this side
 
-Enrollment alone does not make this run. Four gaps, in the order they bite:
-
-**0. The passes write into the working repository, and the scanner does not.**
-This is the one that changes an invariant rather than adding machinery.
-code-winnow's Step 0 creates `.code-winnow/` in the repo under review and
-git-excludes it through `.git/info/exclude`; Steps 2 through 6 write rounds,
-reports, fix plans and pre-fix backups there. `scan.py --json` writes nothing —
-verified, which is why the wired path costs this nothing today.
-
-An excluded path satisfies `references/scratch-files.md` rule 2, since
-`git check-ignore` honours `info/exclude`. It does **not** satisfy the stronger
-promise both READMEs make, that nothing about a run is ever written into the
-repository. Three honest ways out, and the choice belongs to whoever wires this:
-run the passes in the throwaway worktree and let the directory die with it;
-teach code-winnow a root outside the repo; or narrow the README claim to
-*orchestration state* and say plainly that an enrolled review package writes an
-excluded directory. Deciding it silently is the one option that is not
-available — the invariant is load-bearing enough that it is tested.
+Enrollment alone does not make this run. Three gaps, in the order they bite:
 
 **1. ~~`AGENT_DELEGATION_TASK_DIR` activates this skill.~~ Fixed.** It used to
 be both the location of the artifacts and the trigger in `SKILL.md`'s
@@ -158,6 +141,26 @@ match exactly, and `tests/test_passes.py` fails when one goes stale. Copying
 prompt bodies into orchestrator config drifts undetectably and nothing reports
 it. Read them out of the installed skill at dispatch time, the way
 `winnow.find()` already locates `scan.py`.
+
+## `.code-winnow/` is not this system's business
+
+Worth stating, because it looks like an invariant violation and is not.
+code-winnow's Step 0 creates `.code-winnow/` in the repo under review and
+git-excludes it through `.git/info/exclude`; Steps 2 through 6 write rounds,
+reports, fix plans and pre-fix backups there. `scan.py --json` writes nothing at
+all — verified — so the wired path never creates it today.
+
+When the passes are enrolled, it will exist, and that is fine. **A package's own
+artifacts are governed by that package's rules**, and code-winnow excludes its
+own directory as its first step. The invariant here is narrower than it looks
+from a distance: *agent-delegation's* artifacts — task state, plans, reports,
+verify output — never enter the repository, which is what
+`test_full_pipeline_reaches_done` asserts when it checks the checkout is clean.
+That claim stays exactly as true with `.code-winnow/` present.
+
+The rule this does imply for any future package: an enrolled package must
+exclude what it writes, and a dispatcher must not write a package's artifacts on
+its behalf. Both are already true here.
 
 ## Two things that do not change
 

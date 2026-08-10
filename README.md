@@ -70,8 +70,10 @@ same task state with no configuration. The orchestrator also injects
 | `verify/` | Build, test, and lint output by run id | Evidence |
 | `task.json` | Status, budgets, model assignments, delegation history | Orchestrator-owned |
 
-The repository keeps source, tests, and durable documentation. Nothing about a
-run — no `.task/`, not even ignored — is ever written into it.
+The repository keeps source, tests, and durable documentation. None of this
+system's state — no `.task/`, not even ignored — is ever written into it. (A
+companion skill's own artifacts are its own business, under its own exclusion
+rule; nothing here writes them.)
 
 ## What's in the repo
 

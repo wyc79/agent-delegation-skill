@@ -143,9 +143,11 @@ provider gave.
 
 ## Invariants worth not breaking
 
-- **Nothing is written into the working repository.** Task state lives in
-  `$XDG_STATE_HOME/agent-delegation/`; the project key comes from
-  `git rev-parse --git-common-dir`, which is identical from every worktree.
+- **None of this system's state is written into the working repository.** Task
+  state lives in `$XDG_STATE_HOME/agent-delegation/`; the project key comes from
+  `git rev-parse --git-common-dir`, which is identical from every worktree. An
+  enrolled package that writes its own excluded directory is not an exception to
+  this — see [`winnow-passes.md`](winnow-passes.md).
 - **Attended mode never commits to your branch**, and no mode merges. The
   terminal state is a patch file or a pushed branch. There is no commit path to
   the user's branch in this codebase — checkpoint commits happen only inside
