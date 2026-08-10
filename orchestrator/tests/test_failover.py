@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from adg import cooldown, quota, router, runtime, store          # noqa: E402
+from adg.machine import Orchestrator                             # noqa: E402
 from test_orchestrator import REGISTRY, TempRepo, _report, sh    # noqa: E402,F401
 
 T0 = 1754800000.0        # a fixed epoch; every test clock starts here
@@ -360,6 +361,75 @@ class TestRuntimeClassification(unittest.TestCase):
         res = {"settled": "blocked", "output": "", "code": 1,
                "error_code": "rate_limited"}
         self.assertEqual(quota.classify("claude", res, T0)[0], "quota_exhausted")
+
+
+def _orch(reg, adapter, task, clock=None, logs=None):
+    return Orchestrator(task, reg, adapter, lambda k, x: True,
+                        log=(logs.append if logs is not None else (lambda *_: None)),
+                        clock=clock or (lambda: T0))
+
+
+class TestMachineSelection(unittest.TestCase):
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        self.task = store.Task.create(self.t.repo, "T-001", "# t\n\nDo it\n", self.pol)
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_pick_skips_a_cooled_channel(self):
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        self.assertEqual(orch._pick("implementer").channel, "cursor-seat")
+
+    def test_pick_uses_a_cooled_channel_again_once_it_reopens(self):
+        # AC-2: expiry is on read, so no command has to remember to sweep.
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        later = _orch(self.reg, runtime.MockAdapter(), self.task,
+                      clock=lambda: T0 + 3601)
+        self.assertEqual({c.channel for c in later.router.candidates(
+            "implementer", cooldowns=later._channel_state()[1])},
+            {"claude-seat", "cursor-seat"})
+
+    def test_pick_raises_the_quota_error_when_every_channel_is_cooled(self):
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        cooldown.open_breaker("cursor-seat", "quota", T0 + 7200, T0)
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        with self.assertRaises(router.AllChannelsCooled) as cm:
+            orch._pick("implementer")
+        self.assertEqual(cm.exception.reopen_at, T0 + 3600, "earliest reopen wins")
+        self.assertIn("claude-seat", cm.exception.channels)
+
+    def test_an_unenrolled_role_is_still_a_plain_no_model_error(self):
+        # Not every empty candidate list is a quota problem, and saying so would
+        # send the user to `delegate channels` for a registry mistake.
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        self.reg["profiles"]["nobody"] = {"require": {"reasoning": 9}, "weights": {}}
+        with self.assertRaises(router.NoModelAvailable) as cm:
+            orch._pick("nobody")
+        self.assertNotIsInstance(cm.exception, router.AllChannelsCooled)
+
+    def test_a_corrupt_channels_file_is_logged_and_ignored(self):
+        # AC-4: fail closed and honest -- no cooldowns, and say why.
+        os.makedirs(os.path.dirname(cooldown.path()), exist_ok=True)
+        with open(cooldown.path(), "w") as fh:
+            fh.write("[[[")
+        logs = []
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task, logs=logs)
+        self.assertEqual(orch._pick("implementer").channel, "claude-seat")
+        self.assertTrue(any("unreadable" in x for x in logs), logs)
+
+    def test_invocations_are_metered_against_the_window(self):
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        choice = orch._pick("implementer")
+        orch._meter(choice)
+        orch._meter(choice)
+        _, usage, _ = cooldown.read(T0)
+        self.assertEqual(len(usage[choice.channel]), 2)
 
 
 if __name__ == "__main__":

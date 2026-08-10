@@ -14,7 +14,8 @@ import re
 import subprocess
 import time
 
-from . import brief, companions, limits as lim, prompts, router as routing, schema, verify, winnow, yamlite
+from . import (brief, companions, cooldown, limits as lim, prompts, quota,
+               router as routing, schema, verify, winnow, yamlite)
 from .store import git
 
 STAGES = ["intake", "classify", "plan", "implement", "verify", "review", "integrate", "done"]
@@ -53,6 +54,13 @@ _LOG_SEQ = [0]
 _LOG_LOCK = __import__("threading").Lock()
 
 
+def _stamp(epoch):
+    """A reopen time a human can act on, in their own zone."""
+    if not epoch:
+        return "an unknown time"
+    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(float(epoch)))
+
+
 class Halt(Exception):
     """Stop cleanly and leave the task resumable."""
 
@@ -62,7 +70,8 @@ class Halt(Exception):
 
 
 class Orchestrator:
-    def __init__(self, task, registry, adapter, gate, log=print, dry_run=False):
+    def __init__(self, task, registry, adapter, gate, log=print, dry_run=False,
+                 clock=time.time):
         self.task = task
         self.reg = registry
         self.router = routing.Router(registry)
@@ -70,6 +79,11 @@ class Orchestrator:
         self.gate = gate            # callable(kind, brief_text) -> bool
         self.log = log
         self.dry_run = dry_run
+        # The machine's only wall clock. Cooldown expiry, utilisation windows
+        # and reopen times all derive from it, so a run replays under a fixed
+        # clock exactly as it ran.
+        self.clock = clock
+        self._warned_channels = False
         self.budget = lim.Budget(task)
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
@@ -157,14 +171,8 @@ admits only one sensible reading.
             choice = self._pick("classifier")   # cheap tier; this is not judgement
         except routing.NoModelAvailable:
             return
-        session = self.adapter.start_agent("intake", choice.agent_kind, self.repo,
-                                           prompts.env_for(self.task))
-        try:
-            res = self.adapter.prompt(session, self.CRITERIA_PROMPT % {
-                "request": text.strip()[:4000], "facts": self._repo_facts()}, timeout=180)
-        finally:
-            self._close(session)
-        self._bill(res, choice)
+        res = self._direct("intake", choice, self.CRITERIA_PROMPT % {
+            "request": text.strip()[:4000], "facts": self._repo_facts()})
         out = (res.get("output") or "").strip()
         if "AC-1" not in out:
             self.log("intake: no criteria derived — the reviewer will have less to check")
@@ -210,13 +218,7 @@ admits only one sensible reading.
             return "complex", "no classifier model available (%s)" % e, "fallback"
         prompt = CLASSIFY_PROMPT % {"request": text.strip()[:4000],
                                     "facts": self._repo_facts()}
-        session = self.adapter.start_agent("classifier", choice.agent_kind,
-                                           self.repo, prompts.env_for(self.task))
-        try:
-            res = self.adapter.prompt(session, prompt, timeout=180)
-        finally:
-            self.adapter.teardown(session)
-        self._bill(res, choice)
+        res = self._direct("classifier", choice, prompt)
         out = (res.get("output") or "")
         m = re.search(r"VERDICT:\s*(SIMPLE|COMPLEX)\s*-*\s*(.*)", out, re.I)
         if not m:
@@ -852,18 +854,87 @@ a planner does that next, from your design.
         return "delegated change"
 
     # ---------------------------------------------------------------- infra
-    def _pick(self, role, boost=None):
+    def _channel_state(self):
+        """-> (now, cooled, utilization, entries). One clock read feeds routing,
+        so every gate in a single selection sees the same instant."""
+        now = self.clock()
+        cools, usage, warning = cooldown.read(now)
+        if warning and not self._warned_channels:
+            # Once per run: a corrupt breaker file would otherwise repeat this
+            # on every selection and bury the rest of the log.
+            self._warned_channels = True
+            self.log("channels: %s" % warning)
+        util = {}
+        for name, chan in (self.reg.get("channels") or {}).items():
+            util[name] = cooldown.utilization(usage.get(name), chan.get("quota"), now)
+        return now, set(cools), util, cools
+
+    def _pick(self, role, boost=None, exclude=()):
         """Best candidate this runtime can actually launch. The registry says
         what a deployment could use; only the adapter knows what is installed,
-        so an uninstalled CLI is skipped rather than crashing the run."""
-        candidates = self.router.candidates(role, ceiling=self.budget.ceiling(), boost=boost)
+        so an uninstalled CLI is skipped rather than crashing the run.
+
+        Channels in a quota cooldown are filtered exactly like `disabled`, and
+        when a cooldown is the *only* reason nothing is left, the caller gets an
+        error that knows when the seats come back."""
+        _, cooled, util, entries = self._channel_state()
+        blocked = cooled | set(exclude or ())
+        candidates = self.router.candidates(role, ceiling=self.budget.ceiling(),
+                                            boost=boost, cooldowns=blocked,
+                                            utilization=util)
         for c in candidates:
             if self.adapter.can_run(c.agent_kind):
+                if c.demoted:
+                    self.log("  reserve: %s on %s anyway — no alternative"
+                             % (role, c.channel))
                 return c
+        if blocked:
+            # Would this role have had somewhere to go with nothing filtered?
+            # If so this is a quota event with a known reopen time, not a
+            # registry mistake, and the two want different answers.
+            free = [c for c in self.router.candidates(
+                        role, ceiling=self.budget.ceiling(), boost=boost,
+                        utilization=util)
+                    if self.adapter.can_run(c.agent_kind)]
+            hit = sorted({c.channel for c in free} & blocked)
+            if hit:
+                reopen = cooldown.earliest_reopen(entries, hit)
+                raise routing.AllChannelsCooled(
+                    role, hit, reopen,
+                    "every channel enrolled for role %r is in a quota cooldown "
+                    "(%s); the first reopens at %s. `delegate channels` shows "
+                    "them, `delegate channels --clear <name>` overrides one."
+                    % (role, ", ".join(hit), _stamp(reopen)))
         raise routing.NoModelAvailable(
             "no runnable model for role %r: %s" % (
                 role, ", ".join("%s needs %s" % (c.model, c.agent_kind)
                                 for c in candidates) or "nothing enrolled"))
+
+    def _meter(self, choice):
+        """Count one invocation against the channel's window (§5.4). An
+        estimate by construction -- no provider exposes a meter -- kept so the
+        router drifts off a filling seat before it hits the wall."""
+        window = quota.parse_window((choice.chan_spec.get("quota") or {}).get("window"))
+        cooldown.record_use(choice.channel, window, self.clock())
+
+    def _reopen_at(self, choice, res):
+        """The provider's own reset time, else the channel's configured window
+        from now. A parse failure is logged, never silently swallowed."""
+        stated = res.get("reset_at")
+        if stated:
+            return float(stated)
+        spec = choice.chan_spec.get("quota") or {}
+        window = quota.parse_window(spec.get("window"))
+        self.log("  quota: %s stated no reset time — assuming its %s window"
+                 % (choice.channel, spec.get("window") or "default 5h"))
+        return self.clock() + window
+
+    def _cool(self, choice, res):
+        """Open the breaker for a channel that just said it is out."""
+        at = self._reopen_at(choice, res)
+        cooldown.open_breaker(choice.channel, "quota", at, self.clock(),
+                              detail=(res.get("output") or "")[-200:])
+        return at
 
     def _ensure_worktree(self):
         state = self.task.state
@@ -902,6 +973,27 @@ a planner does that next, from your design.
         session, report = self._invoke(role, choice, cwd, **kw)
         self._close(session)
         return report
+
+    def _direct(self, role, choice, text, timeout=180):
+        """One prompt, one answer, no report file -- the text-reply roles
+        (§4.6). Shares the metering, billing and quota failover that `_invoke`
+        gives every other role, which three hand-rolled copies of this dance
+        did not."""
+        session = self.adapter.start_agent(role, choice.agent_kind, self.repo,
+                                           prompts.env_for(self.task))
+        try:
+            res = self.adapter.prompt(session, text, timeout=timeout)
+        finally:
+            self._close(session)
+        if res.get("failure") == "quota_exhausted":
+            at = self._cool(choice, res)
+            nxt = self._pick(role, exclude=(choice.channel,))
+            self.log("failover: %s %s -> %s (quota, reopens %s)"
+                     % (role, choice.channel, nxt.channel, _stamp(at)))
+            return self._direct(role, nxt, text, timeout)
+        self._meter(choice)
+        self._bill(res, choice)
+        return res
 
     def _invoke(self, role, choice, cwd, subtask=None, extra=None,
                 session=None, failure=None):
@@ -1038,13 +1130,7 @@ Rules:
             choice = self._pick("reporter")
         except routing.NoModelAvailable:
             return text
-        session = self.adapter.start_agent("reporter", choice.agent_kind, self.repo,
-                                           prompts.env_for(self.task))
-        try:
-            res = self.adapter.prompt(session, self.REPORT_PROMPT % text, timeout=180)
-        finally:
-            self._close(session)
-        self._bill(res, choice)
+        res = self._direct("reporter", choice, self.REPORT_PROMPT % text)
         out = (res.get("output") or "").strip()
         if len(out) < 80 or brief.lint(out):
             return text
