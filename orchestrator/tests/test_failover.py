@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from adg import cooldown, quota, router, store                   # noqa: E402
+from adg import cooldown, quota, router, runtime, store          # noqa: E402
 from test_orchestrator import REGISTRY, TempRepo, _report, sh    # noqa: E402,F401
 
 T0 = 1754800000.0        # a fixed epoch; every test clock starts here
@@ -311,6 +311,55 @@ class TestReserve(unittest.TestCase):
             router.Router(reg).candidates("implementer",
                                           utilization={"claude-seat": 0.9})
         self.assertIn("reserve_fraction", str(cm.exception))
+
+
+class TestRuntimeClassification(unittest.TestCase):
+    """The runtime is where a failure shape becomes a fact the machine can act
+    on. Classification must reach every adapter, not just the local one."""
+
+    def test_local_result_classifies_from_stderr(self):
+        res = runtime._result("", "Error: Claude AI usage limit reached", 1,
+                              kind="claude", now=T0)
+        self.assertEqual(res["failure"], "quota_exhausted")
+
+    def test_local_result_leaves_a_clean_exit_alone(self):
+        res = runtime._result("all good", "", 0, kind="claude", now=T0)
+        self.assertIsNone(res["failure"])
+
+    def test_a_json_result_still_sees_the_raw_stderr(self):
+        # claude --output-format json parses stdout into `output`, which would
+        # drop the stderr the rate-limit message actually arrived on.
+        res = runtime._result('{"result": "partial"}', "HTTP 429 rate limit", 1,
+                              kind="claude", now=T0)
+        self.assertEqual(res["failure"], "quota_exhausted")
+
+    def test_local_timeout_is_other_not_quota(self):
+        a = runtime.LocalAdapter()
+        s = runtime.Session("implementer-local", ".")
+        s.handle = {"argv": ["python3", "-c", "import time; time.sleep(30)"],
+                    "env": dict(os.environ), "role": "implementer", "kind": "claude"}
+        res = a.prompt(s, "hi", timeout=0.2)
+        self.assertEqual(res["settled"], "timeout")
+        self.assertEqual(res["failure"], "other")
+
+    def test_mock_adapter_can_inject_a_quota_failure(self):
+        def implementer(env, cwd):
+            return blocked("Claude AI usage limit reached|resets at 5pm")
+
+        a = runtime.MockAdapter({"implementer": implementer}, now=lambda: T0)
+        s = a.start_agent("implementer", "claude", ".", {})
+        res = a.prompt(s, "go", timeout=1)
+        self.assertEqual(res["failure"], "quota_exhausted")
+
+    def test_mock_adapter_default_is_still_a_plain_success(self):
+        a = runtime.MockAdapter({"implementer": lambda e, c: None})
+        s = a.start_agent("implementer", "claude", ".", {})
+        self.assertIsNone(a.prompt(s, "go", timeout=1)["failure"])
+
+    def test_herdr_error_codes_classify_without_prose(self):
+        res = {"settled": "blocked", "output": "", "code": 1,
+               "error_code": "rate_limited"}
+        self.assertEqual(quota.classify("claude", res, T0)[0], "quota_exhausted")
 
 
 if __name__ == "__main__":
