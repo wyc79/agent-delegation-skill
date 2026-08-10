@@ -911,6 +911,49 @@ class TestRuntimeSurfaces(unittest.TestCase):
         self.assertTrue((s.handle or {}).get("herdr"))
         self.assertEqual(s.handle["pane"], "w1:p9")
 
+    def test_a_variadic_grant_flag_is_passed_once(self):
+        a = runtime.LocalAdapter()
+        argv = a._argv("claude", {"AGENT_DELEGATION_TASK_DIR": "/x/T-1",
+                                  "AGENT_DELEGATION_SKILL_DIR": "/s/ad"})
+        self.assertEqual(argv[-3:], ["--add-dir", "/x/T-1", "/s/ad"])
+
+    def test_a_non_variadic_grant_flag_is_repeated_per_path(self):
+        # `--add-dir A B` does not error on a CLI that declares `<path>`: B is
+        # silently absorbed as a positional prompt argument, so the skill dir
+        # becomes the instruction and the real prompt is the one that loses.
+        class A(runtime.LocalAdapter):
+            GRANTS = dict(runtime.LocalAdapter.GRANTS, cursor="--add-dir")
+        argv = A()._argv("cursor", {"AGENT_DELEGATION_TASK_DIR": "/x/T-1",
+                                    "AGENT_DELEGATION_SKILL_DIR": "/s/ad"})
+        self.assertEqual(argv[-4:], ["--add-dir", "/x/T-1", "--add-dir", "/s/ad"])
+
+    def test_cursor_retries_continue_its_own_session(self):
+        # Verified against a real seat: cursor-agent --continue resumes the
+        # previous conversation in this directory. Falling back to a fresh turn
+        # made every retry re-read the protocol, the task and the repo.
+        seen = {}
+
+        class A(runtime.LocalAdapter):
+            def prompt(self, session, text, timeout, argv=None):
+                seen["argv"] = argv
+                return {"settled": "ok"}
+        sess = runtime.Session("x", "/tmp", handle={
+            "kind": "cursor", "argv": list(runtime.LocalAdapter.LAUNCH["cursor"])})
+        A().follow_up(sess, "fix it", timeout=10)
+        self.assertEqual(seen["argv"][-1], "--continue")
+
+    def test_a_kind_that_cannot_continue_falls_back_to_a_new_turn(self):
+        seen = {}
+
+        class A(runtime.LocalAdapter):
+            def prompt(self, session, text, timeout, argv=None):
+                seen["argv"] = argv
+                return {"settled": "ok"}
+        sess = runtime.Session("x", "/tmp", handle={
+            "kind": "gemini", "argv": list(runtime.LocalAdapter.LAUNCH["gemini"])})
+        A().follow_up(sess, "fix it", timeout=10)
+        self.assertIsNone(seen["argv"], "a fresh turn must not carry a resume flag")
+
     def test_a_refused_prompt_is_reported_not_disguised_as_a_timeout(self):
         class H(runtime.HerdrAdapter):
             def _cli(self, args, check=True):

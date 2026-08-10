@@ -147,14 +147,34 @@ class LocalAdapter(Adapter):
         "gemini": ["gemini", "-y", "-p"],
     }
 
-    # Agent CLIs sandbox file access to the working directory. Both the task
-    # directory (DESIGN.md §4.0) and the skill directory live outside the repo,
-    # so they must be granted explicitly -- otherwise the agent cannot read the
-    # protocol it is being told to follow, and cannot write its report.
+    # Some agent CLIs confine file access to the working directory. Both the
+    # task directory (DESIGN.md §4.0) and the skill directory live outside the
+    # repo, so where that confinement exists it must be lifted explicitly --
+    # otherwise the agent cannot read the protocol it is being told to follow,
+    # and cannot write its report.
+    #
+    # Claude-only because it is the only kind measured to need it, not because
+    # the others were assumed safe. Under the `--force` this file already passes,
+    # cursor-agent reads and writes outside its cwd freely -- checked both
+    # directions against a real seat -- so an --add-dir for it would be a no-op
+    # today, and if that permissiveness ever narrowed it would take the shell
+    # and write access with it, which no grant flag restores. codex and gemini
+    # are UNVERIFIED: neither was installed here. Measure before adding one.
     GRANTS = {"claude": "--add-dir"}
 
+    # Grant flags whose one occurrence takes every path. The rest are repeated
+    # per path, and the difference is not cosmetic: claude declares
+    # `--add-dir <directories...>`, cursor declares `--add-dir <path>`. Handing
+    # cursor two paths after one flag does not error -- the second is silently
+    # absorbed as a positional prompt argument, because its usage line ends in
+    # `[prompt...]`. That is the same trap `prompt()` documents from the other
+    # side, and it is why this table exists rather than a bare string.
+    GRANT_VARIADIC = frozenset({"claude"})
+
     # Flag that resumes the CLI's own previous conversation in this directory.
-    CONTINUE = {"claude": "--continue"}
+    # Both are directory-scoped, which is what makes them safe here: every
+    # subtask runs in its own worktree, so one agent cannot resume another's.
+    CONTINUE = {"claude": "--continue", "cursor": "--continue"}
 
     def _argv(self, kind, env):
         argv = list(self.LAUNCH[kind])
@@ -162,7 +182,11 @@ class LocalAdapter(Adapter):
         dirs = [env.get("AGENT_DELEGATION_TASK_DIR"), env.get("AGENT_DELEGATION_SKILL_DIR")]
         dirs = [d for d in dirs if d]
         if flag and dirs:
-            argv += [flag] + dirs
+            if kind in self.GRANT_VARIADIC:
+                argv += [flag] + dirs
+            else:
+                for d in dirs:
+                    argv += [flag, d]
         return argv
 
     def can_run(self, kind):
