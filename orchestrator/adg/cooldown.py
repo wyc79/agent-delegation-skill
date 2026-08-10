@@ -5,9 +5,16 @@ State lives in `$XDG_STATE_HOME/agent-delegation/channels.json`, beside
 repository, so two projects driving the same subscription must see one breaker.
 
 Every write is read-modify-merge under a lock and then an atomic replace. Merge
-rather than overwrite is the whole point -- wave threads and a second `delegate`
-in another checkout write this file concurrently, and last-writer-wins would
-drop a live breaker on the floor.
+rather than overwrite is the point for the wave threads inside one process,
+where the lock makes it exact.
+
+Across *processes* the lock does nothing and there is deliberately no file lock:
+the re-read before each write narrows the lost-update window, it does not close
+it. That is a tolerated weakness rather than an overlooked one, because both
+outcomes are self-correcting -- a lost `open_breaker` is re-opened by the next
+call to that seat, from the provider's own answer, and a lost `clear` can simply
+be run again. A stale lock file on a network home directory would be a worse
+failure than either.
 
 Failure here is never fatal and never invented: an unreadable file reads as "no
 cooldowns" plus a warning for the caller to log. Fabricating a breaker would

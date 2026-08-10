@@ -884,7 +884,7 @@ a planner does that next, from your design.
             util[name] = cooldown.utilization(usage.get(name), chan.get("quota"), now)
         return now, set(cools), util, cools
 
-    def _pick(self, role, boost=None, exclude=()):
+    def _pick(self, role, boost=None, exclude=(), min_reasoning=None):
         """Best candidate this runtime can actually launch. The registry says
         what a deployment could use; only the adapter knows what is installed,
         so an uninstalled CLI is skipped rather than crashing the run.
@@ -906,7 +906,20 @@ a planner does that next, from your design.
         # CLI this runtime can actually launch -- which the router cannot know.
         # Deciding it there withheld a healthy seat and killed the run instead.
         candidates = ask(False)
-        for c in candidates + ask(True):
+        pool = candidates + ask(True)
+        if min_reasoning is not None:
+            # A floor, not a `boost`: boost only strengthens capabilities the
+            # role's profile already requires, and no profile requires
+            # `reasoning` of its implementer -- so passing it there does nothing.
+            strong = [c for c in pool
+                      if int(c.spec.get("reasoning", 0) or 0) >= min_reasoning
+                      and self.adapter.can_run(c.agent_kind)]
+            if strong:
+                return strong[0]
+            raise routing.NoModelAvailable(
+                "no runnable model for role %r at reasoning >= %s"
+                % (role, min_reasoning))
+        for c in pool:
             if self.adapter.can_run(c.agent_kind):
                 if c.demoted:
                     self.log("  reserve: %s on %s anyway — no alternative"
@@ -1063,7 +1076,7 @@ a planner does that next, from your design.
         if self.dry_run:
             self.log("  [dry-run] would run %s as %s" % (choice.model, role))
             return None, None, choice
-        cooled = []
+        cooled, base_extra = [], extra
         while True:
             # Reports are matched by mtime after this point: on a rework loop the
             # previous attempt's report is still on disk, and accepting it would
@@ -1099,13 +1112,16 @@ a planner does that next, from your design.
                 "reopens_at": at})
             # Excluded explicitly as well as through the breaker: if the state
             # file could not be written, the loop must still terminate.
-            nxt = self._pick(role, exclude=tuple(cooled))
+            nxt = self._replacement(role, choice, cooled)
             self.log("failover: %s %s -> %s (quota, reopens %s)"
                      % (role, choice.channel, nxt.channel, _stamp(at)))
             # A fresh session on the new seat, in the *same* worktree: every
             # checkpoint commit is still there, so the replacement continues
             # from the last one rather than restarting the subtask (§5.5).
-            extra = self._handover(extra, failure)
+            # From the caller's `extra`, never from the previous hop's: on a
+            # second hop, feeding the note back in appended it to a string that
+            # already ended with it, and the replacement read the paragraph twice.
+            extra = self._handover(base_extra, failure)
             choice, session, failure = nxt, None, None
         self._meter(choice)
         self._bill(res, choice)
@@ -1130,6 +1146,26 @@ a planner does that next, from your design.
         # a sibling overwriting the attribute is how an escalation gets read as
         # a success.
         return session, report, choice
+
+    def _replacement(self, role, choice, cooled):
+        """The same rung on another seat.
+
+        A quota hop must not walk back down the escalation ladder. If this
+        subtask had already escalated to a stronger model, re-selecting on plain
+        role requirements would quietly hand the work to a weaker one and log it
+        as an ordinary failover -- the run would look like it was still climbing
+        while it was descending. Ask for at least the current model's reasoning
+        first; only drop below it when no seat can hold the rung, and say so."""
+        floor = int(choice.spec.get("reasoning", 0) or 0)
+        try:
+            return self._pick(role, exclude=tuple(cooled), min_reasoning=floor)
+        except routing.AllChannelsCooled:
+            raise
+        except routing.NoModelAvailable:
+            nxt = self._pick(role, exclude=tuple(cooled))
+            self.log("  note: no seat left at %s's strength — continuing on %s, "
+                     "which is weaker" % (choice.model, nxt.model))
+            return nxt
 
     def _salvage(self, cwd, role, subtask):
         """Commit whatever the killed agent left, so the replacement inherits a

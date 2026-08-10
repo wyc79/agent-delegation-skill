@@ -252,12 +252,27 @@ class TestCooldownStore(unittest.TestCase):
         cools, usage, warn = cooldown.read(T0)
         self.assertEqual((cools, usage, warn), ({}, {}, None))
 
-    def test_a_concurrent_writer_is_merged_not_clobbered(self):
-        # Two projects sharing a seat write the same file. A last-writer-wins
-        # implementation loses one of these silently.
+    def test_a_second_writer_does_not_clobber_the_first(self):
+        # Renamed: this is sequential, and calling it a concurrency test claimed
+        # a guarantee the module does not make. There is no cross-process lock —
+        # `_mutate` re-reads before writing, which narrows the lost-update window
+        # rather than closing it. What this pins is the merge itself: writing one
+        # channel must not drop another's entry.
         cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
         cooldown.open_breaker("cursor-seat", "quota", T0 + 7200, T0)
         self.assertEqual(cooldown.active(T0 + 10), {"claude-seat", "cursor-seat"})
+
+    def test_a_lost_breaker_is_recoverable_rather_than_permanent(self):
+        # There is no cross-process lock, so a breaker CAN be lost to a racing
+        # writer. What makes that tolerable is not being tested for absence --
+        # it is that the next call to the seat re-opens it from the provider's
+        # own answer, so the system re-converges instead of forgetting.
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        with open(cooldown.path(), "w") as fh:          # a racing writer wins
+            fh.write('{"version": 1, "cooldowns": {}, "usage": {}}\n')
+        self.assertEqual(cooldown.active(T0), set())
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        self.assertEqual(cooldown.active(T0), {"claude-seat"})
 
     def test_extending_a_breaker_never_shortens_it(self):
         cooldown.open_breaker("claude-seat", "quota", T0 + 7200, T0)
@@ -572,6 +587,43 @@ class TestMachineSelection(unittest.TestCase):
             cooldown.record_use("claude-seat", 5 * 3600, T0 - i)
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
         self.assertEqual(orch._pick("implementer").channel, "cursor-seat")
+
+    def _escalated_choice(self, seats):
+        """A registry where a strong implementer is enrolled on `seats`, and the
+        Choice an escalation would have produced."""
+        self.reg["models"]["opus-class-strong"]["enrolled_roles"].append("implementer")
+        for name, chan in self.reg["channels"].items():
+            if name not in seats and "opus-class-strong" in (chan.get("exposes") or []):
+                chan["exposes"] = [m for m in chan["exposes"] if m != "opus-class-strong"]
+            if name in seats and "opus-class-strong" not in (chan.get("exposes") or []):
+                chan["exposes"] = list(chan["exposes"]) + ["opus-class-strong"]
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        strong = [c for c in orch.router.candidates("implementer")
+                  if c.model == "opus-class-strong"]
+        return orch, strong[0]
+
+    def test_a_hop_after_an_escalation_keeps_the_rung(self):
+        """Failover must not walk back down the ladder. Re-selecting on plain
+        role requirements would hand escalated work to a weaker model and log it
+        as an ordinary failover — the run reads as still climbing while it is
+        descending."""
+        orch, strong = self._escalated_choice(["claude-seat", "cursor-seat"])
+        nxt = orch._replacement("implementer", strong, [strong.channel])
+        self.assertNotEqual(nxt.channel, strong.channel)
+        self.assertGreaterEqual(int(nxt.spec.get("reasoning", 0)),
+                                int(strong.spec.get("reasoning", 0)),
+                                "the replacement is weaker than the seat it replaced")
+
+    def test_dropping_below_the_rung_is_allowed_but_never_silent(self):
+        # Continuing weaker beats parking, but the log must say it happened.
+        logs = []
+        orch, strong = self._escalated_choice(["claude-seat"])
+        orch.log = logs.append
+        nxt = orch._replacement("implementer", strong, [strong.channel])
+        self.assertEqual(nxt.channel, "cursor-seat")
+        self.assertLess(int(nxt.spec.get("reasoning", 0)),
+                        int(strong.spec.get("reasoning", 0)))
+        self.assertTrue(any("weaker" in x for x in logs), logs)
 
     def test_invocations_are_metered_against_the_window(self):
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
