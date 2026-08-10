@@ -4,6 +4,12 @@ The deterministic half of the system. The skill tells agents *how to behave*;
 this program decides *what runs next, on which model, and whether it is allowed
 to* — see [`../DESIGN.md`](../DESIGN.md) §15.
 
+**`adg`** is short for *agent delegation*. It is the Python package name, and the
+prefix on everything this tool creates so it is greppable and never mistaken for
+your own: branches `adg/<task-id>/<subtask>`, worktrees under
+`.adg-worktrees/<project-key>/`, project config `.adg.yaml`, and the
+`ADG_WINNOW_SCAN` override.
+
 Python 3.9+, standard library only. No install step, no dependencies (the YAML
 subset the project uses is parsed by `adg/yamlite.py`, because PyYAML is not in
 the stdlib and requiring an install would be a worse trade).
@@ -54,6 +60,7 @@ No config is legal — checks are then reported as *not run* rather than faked.
 | `adg/runtime.py` | The seven-operation adapter: `local`, `herdr`, `mock`. |
 | `adg/verify.py` | Deterministic checks and mechanical scope comparison. |
 | `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. |
+| `adg/companions.py` | Detects karpathy-guidelines and superpowers once, and declares them in `task.json`. |
 | `adg/brief.py` | Human-facing gate briefs, plus the jargon lint. |
 | `adg/schema.py` | Report/verdict validation against the skill's schemas. |
 | `adg/prompts.py` | Injects role, paths, scope, budget — and nothing else. |
