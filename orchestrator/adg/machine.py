@@ -68,6 +68,8 @@ class Orchestrator:
         self.dry_run = dry_run
         self.budget = lim.Budget(task)
         self._last_failure = None
+        self._last_report = None
+        self._last_report = None
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
 
@@ -302,7 +304,7 @@ class Orchestrator:
 
     def _one_subtask(self, sub, base):
         role_choice = self._pick("implementer")
-        attempts, session = 0, None
+        attempts, session, report = 0, None, None
         while True:
             self.budget.check_attempt(sub["id"])
             self.budget.check_cost(0.0)
@@ -312,9 +314,19 @@ class Orchestrator:
             session = self._invoke("implementer", role_choice, cwd=base, subtask=sub,
                                    session=session, failure=self._last_failure,
                                    extra=self._findings_brief(sub))
+            report = self._last_report
             self.budget.used_attempt(sub["id"])
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
+            claimed = (report or {}).get("status")
+            if claimed in ("blocked", "escalate"):
+                raise Halt("needs_human", "%s reported %s: %s" % (
+                    sub["id"], claimed, (report or {}).get("summary", "")[:200]))
+            if result.ok and not self._touched(base):
+                raise Halt("needs_human",
+                           "%s changed no files, and the checks were already green "
+                           "before it ran — passing tests are not evidence of work"
+                           % sub["id"])
             if result.ok:
                 self._last_failure = None
                 self._close(session)
@@ -367,7 +379,8 @@ class Orchestrator:
         state = self.task.state
         branch = "adg/%s/%s" % (state["id"], sub["id"])
         path = os.path.join(os.path.dirname(os.path.abspath(self.repo)),
-                            ".adg-worktrees", "%s-%s" % (state["id"], sub["id"]))
+                            ".adg-worktrees", state["project_key"],
+                            "%s-%s" % (state["id"], sub["id"]))
         self.adapter.create_worktree(self.repo, branch,
                                      state["repo"].get("base_commit", "HEAD"), path)
         return path
@@ -407,6 +420,12 @@ class Orchestrator:
                               cwd=cwd, capture_output=True, text=True).stdout.strip()
         if left:
             raise Halt("needs_human", "conflict still unresolved in: %s" % left)
+
+    def _touched(self, cwd):
+        """Did anything actually change in this worktree?"""
+        return bool(verify.changed_files(
+            self.repo, cwd, self.task.state["repo"].get("base_commit", "HEAD"),
+            ignore=self.vcfg.get("ignore")))
 
     def _checkpoint(self, cwd, message):
         """Commit the worktree state. Agents are told to checkpoint, but the
@@ -689,7 +708,7 @@ class Orchestrator:
         base = git(["rev-parse", "HEAD"], self.repo)
         branch = "adg/%s/work" % state["id"]
         path = os.path.join(os.path.dirname(os.path.abspath(self.repo)),
-                            ".adg-worktrees", "%s-work" % state["id"])
+                            ".adg-worktrees", state["project_key"], "%s-work" % state["id"])
         self.log("worktree: %s (%s)" % (path, self.adapter.name))
         self.adapter.create_worktree(self.repo, branch, base, path)
         repo_info = dict(state["repo"], base_commit=base)
@@ -723,6 +742,7 @@ class Orchestrator:
             self.budget.spend(res["cost_usd"])
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
         report, problems = self._collect_report(role, subtask, since=started)
+        self._last_report = report
         if report is None:
             outcome = "blocked"
         self.task.record_delegation({

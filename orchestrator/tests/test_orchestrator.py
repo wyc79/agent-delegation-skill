@@ -716,6 +716,90 @@ class TestRuntimeSurfaces(unittest.TestCase):
         self.assertFalse(verify.is_ignored("src/combat.gd"))
 
 
+class TestLiveRunRegressions(unittest.TestCase):
+    """Three bugs a live run found that no scripted test had reached."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        # checks that are green before anything is implemented
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _simple(self, script):
+        task = store.Task.create(self.t.repo, "T-R", "# t\n\nAdd a thing\n", self.pol)
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "classifier":
+                    return {"settled": "idle", "output": "VERDICT: SIMPLE -- tiny", "code": 0}
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        logs = []
+        status = Orchestrator(task, self.reg, A(script), lambda k, t: True,
+                              log=logs.append).run()
+        return status, task, logs
+
+    def test_an_agent_that_writes_nothing_is_not_a_success(self):
+        # The fast checks were green before the agent ran, so passing them
+        # proves nothing about whether it did the work.
+        def wrote_nothing(env, cwd):
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "status": "complete",
+                "summary": "all good", "evidence": {"tests": "green"}})
+        status, task, logs = self._simple({"implementer": wrote_nothing})
+        self.assertEqual(status, "needs_human", "\n".join(logs))
+        self.assertIn("changed no files", "\n".join(logs))
+
+    def test_an_agents_own_escalate_outranks_green_checks(self):
+        # The live failure: the agent said "no code written", the orchestrator
+        # saw green tests and marked the subtask complete.
+        def honest(env, cwd):
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "status": "escalate",
+                "summary": "No code written — wrong repository in the worktree.",
+                "evidence": {"tests": "green but irrelevant"}})
+        status, task, logs = self._simple({"implementer": honest})
+        self.assertEqual(status, "needs_human")
+        self.assertIn("reported escalate", "\n".join(logs))
+
+    def test_worktrees_of_different_projects_do_not_collide(self):
+        # Two repos sharing a parent produced the same .adg-worktrees/T-001-work.
+        other = os.path.join(self.t.dir, "other")
+        os.makedirs(other)
+        sh(["git", "init", "-q", "-b", "main"], other)
+        sh(["git", "config", "user.email", "t@e.com"], other)
+        sh(["git", "config", "user.name", "T"], other)
+        open(os.path.join(other, "f.txt"), "w").close()
+        sh(["git", "add", "-A"], other)
+        sh(["git", "commit", "-qm", "i"], other)
+        self.assertNotEqual(store.project_key(self.t.repo), store.project_key(other))
+
+    def test_reusing_a_foreign_worktree_is_refused(self):
+        other = os.path.join(self.t.dir, "other")
+        os.makedirs(other)
+        sh(["git", "init", "-q", "-b", "main"], other)
+        sh(["git", "config", "user.email", "t@e.com"], other)
+        sh(["git", "config", "user.name", "T"], other)
+        open(os.path.join(other, "f.txt"), "w").close()
+        sh(["git", "add", "-A"], other)
+        sh(["git", "commit", "-qm", "i"], other)
+        stolen = os.path.join(self.t.dir, "wt-of-other")
+        sh(["git", "worktree", "add", "-q", "-b", "x", stolen], other)
+        a = runtime.LocalAdapter()
+        with self.assertRaises(runtime.RuntimeError_) as cm:
+            a.create_worktree(self.t.repo, "adg/T/work", "HEAD", stolen)
+        self.assertIn("different repository", str(cm.exception))
+
+
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
     nothing looks exactly like a clean scan."""

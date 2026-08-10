@@ -134,7 +134,17 @@ class LocalAdapter(Adapter):
         normal -- resuming must reattach to it, not refuse to start."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.isdir(os.path.join(path, ".git")) or os.path.isfile(os.path.join(path, ".git")):
-            return path
+            # Reuse only if it really is this repository's worktree. Handing an
+            # agent someone else's checkout is silent and catastrophic.
+            here = git(["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                       path, check=False)
+            mine = git(["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                       repo, check=False)
+            if here and mine and os.path.realpath(here) == os.path.realpath(mine):
+                return path
+            raise RuntimeError_(
+                "%s is a worktree of a different repository (%s, not %s)"
+                % (path, here or "unknown", mine))
         if os.path.exists(path) and os.listdir(path):
             raise RuntimeError_("worktree path exists and is not a worktree: %s" % path)
         git(["worktree", "prune"], repo, check=False)
