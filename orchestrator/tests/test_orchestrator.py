@@ -2004,6 +2004,83 @@ class TestAgentRaisedSignals(unittest.TestCase):
                         % "\n".join(logs))
 
 
+class TestReportFreshness(unittest.TestCase):
+    """A report already on disk when the turn began is not this turn's report.
+
+    The freshness test was `mtime >= time.time() - 1`, a wall-clock window wide
+    enough to swallow the whole run under the mock adapter. Unique filenames
+    stopped siblings colliding, but a *retry of the same subtask* writes to the
+    same path, so an agent that produced nothing on attempt 2 could still hand
+    back attempt 1's success. Comparing the file against what was there before
+    the turn needs no clock and no tolerance."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.task = store.Task.create(self.t.repo, "T-FRESH", "# t\n",
+                                      dict(self.reg["policy"]["limits"]))
+        self.orch = Orchestrator(self.task, self.reg, runtime.MockAdapter({}),
+                                 lambda k, t: True, log=lambda *_: None)
+        self.sub = {"id": "st-1-alpha"}
+
+    def tearDown(self):
+        self.t.close()
+
+    def _write(self, summary):
+        _report(self.task.path, "implement-st-1-alpha.json", {
+            "stage": "implement", "role": "implementer", "subtask": "st-1-alpha",
+            "status": "complete", "summary": summary, "evidence": {"tests": "ok"}})
+
+    def test_a_report_unchanged_since_the_turn_began_is_not_read_as_fresh(self):
+        self._write("attempt 1 succeeded")
+        before = self.orch._report_state()          # the turn starts here
+        report, problems = self.orch._collect_report("implementer", self.sub,
+                                                     before=before)
+        self.assertIsNone(report, "attempt 1's report was read as attempt 2's")
+        self.assertTrue(problems)
+
+    def test_a_report_rewritten_during_the_turn_is_read(self):
+        self._write("attempt 1 succeeded")
+        before = self.orch._report_state()
+        self._write("attempt 2 did something else")
+        report, problems = self.orch._collect_report("implementer", self.sub,
+                                                     before=before)
+        self.assertIsNone(problems)
+        self.assertEqual(report["summary"], "attempt 2 did something else")
+
+    def test_a_report_written_for_the_first_time_is_read(self):
+        before = self.orch._report_state()          # nothing on disk yet
+        self._write("first attempt")
+        report, problems = self.orch._collect_report("implementer", self.sub,
+                                                     before=before)
+        self.assertIsNone(problems)
+        self.assertEqual(report["summary"], "first attempt")
+
+
+class TestResourceHygiene(unittest.TestCase):
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_reading_the_repo_for_facts_leaks_no_file_handles(self):
+        # `open(...).read()` per tracked file, never closed. Harmless on a small
+        # repo and not harmless at the 400-file cap it is written to tolerate,
+        # which is exactly where it would first matter.
+        import warnings
+        task = store.Task.create(self.t.repo, "T-FD", "# t\n",
+                                 dict(self.reg["policy"]["limits"]))
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter({}),
+                            lambda k, t: True, log=lambda *_: None)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            orch._repo_facts()
+        leaks = [w for w in caught if issubclass(w.category, ResourceWarning)]
+        self.assertEqual([str(w.message) for w in leaks], [])
+
+
 class TestEndToEnd(unittest.TestCase):
     """Milestone 1 (DESIGN.md §15.1)."""
 
