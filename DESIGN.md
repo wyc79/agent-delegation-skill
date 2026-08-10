@@ -1180,6 +1180,17 @@ understanding won't fix a mis-scoped task); `plan_conflict` at rung 3 directly
 (a stronger implementer cannot fix a wrong plan); `ambiguous_requirement` at
 rung 3 or 4 depending on whether the planner has authority over the ambiguity.
 
+**Who noticed changes the entry.** The rung-0 entries above are for signals the
+*verify runner* collects — a counter the agent may not know about, where a plain
+retry is the cheapest next move. A signal the **agent raises itself** has already
+spent that rung by definition: `test_stuck` from an agent means it failed three
+times and stopped, so re-running it once more is the thing it just told you does
+not work. Agent-raised `test_stuck`/`edit_churn`/`scope_overrun` therefore enter
+at rung 2, and `blocked_command`/`missing_dependency` at rung 4, since no model
+and no plan installs a package or lifts a sandbox refusal. `ENTRY_RUNG` in
+`adg/machine.py` is this paragraph in code; an `escalate` carrying nothing
+routable enters at 4, because the report is what says which rung was meant.
+
 ### 6.3 The escalation bundle
 
 Escalation without context just repeats the failure expensively. The bundle the

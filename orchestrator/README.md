@@ -132,7 +132,7 @@ provider gave.
 | `adg/quota.py` | Quota-exhaustion classification per agent kind; reset and window parsing. |
 | `adg/cooldown.py` | Per-channel breakers and the invocation meter, shared across projects. |
 | `adg/limits.py` | Hard limits, checked before the action, failing closed. |
-| `adg/runtime.py` | The seven-operation adapter: `local`, `herdr` (agents run in visible panes), `mock`. |
+| `adg/runtime.py` | The nine-operation adapter: `local`, `herdr` (agents run in visible panes), `mock`. |
 | `adg/verify.py` | Deterministic checks and mechanical scope comparison. |
 | `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. Its six *judgment passes* and their merge are a separate, unwired thing: see [`winnow-passes.md`](winnow-passes.md). |
 | `adg/companions.py` | Detects karpathy-guidelines and superpowers once, and declares them in `task.json`. |
@@ -188,8 +188,8 @@ Implemented: the full pipeline, parallel subtasks in separate worktrees (bounded
 by `max_parallel_agents`, serialized on scope or hotspot overlap), the Integrator
 on merge conflicts, an independent Test Author on complex tasks, real cost
 accounting from the CLI, autonomous mode ending at an opened PR, model-rendered
-briefs, and quota-aware failover with per-channel cooldowns and a utilization
-shadow price.
+briefs, quota-aware failover with per-channel cooldowns and a utilization shadow
+price, and signal-routed escalation from an agent's own report.
 
 Still absent: *live* quota metering (the draw above is estimated from invocation
 counts, not read from a provider), weekly-cap modelling, telemetry-driven

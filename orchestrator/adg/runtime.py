@@ -87,7 +87,7 @@ class Session:
 
 
 class Adapter:
-    """Seven operations. Everything else is orchestrator-side."""
+    """Nine operations. Everything else is orchestrator-side."""
 
     name = "base"
 

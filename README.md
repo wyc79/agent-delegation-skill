@@ -211,16 +211,21 @@ it launches the agents.** The one thing to get right is that the agent you are
 chatting with is not the agent doing the work: it types the command, and `adg`
 spawns fresh, single-role agents that read the task directory.
 
+It runs **from the repo you want changed**, not from this one, so give it an
+absolute path:
+
 ```bash
-cd /path/to/your/repo                            # the repo to be changed
-/path/to/agent-delegation-skill/orchestrator/delegate init
-/path/to/agent-delegation-skill/orchestrator/delegate run "fix the failing auth test"
+export ADG=/path/to/agent-delegation-skill/orchestrator/delegate
+cd /path/to/your/repo          # the repo to be changed
+$ADG init                      # what's detected, who gets which role
+$ADG run "fix the failing auth test"
 ```
 
 `init` prints what it detected — which agent CLIs are signed in, which model
 gets which role — and writes it only if you pass `--write`. `run` then drives
 the whole pipeline, stopping at each approval gate to ask you. Python 3.9+,
-stdlib only, no install step.
+stdlib only, no install step. (`--repo` overrides the default of the current
+directory, if you would rather not `cd`.)
 
 ### Driving it from a chat agent
 
@@ -229,8 +234,8 @@ the command. It stays the **operator**: it runs `delegate`, reads what comes
 back, and answers the gates with you. It is not the planner or the implementer —
 those are separate processes with separate context, which is the whole point.
 
-> Run `orchestrator/delegate run "fix the failing auth test"` in this repo and
-> show me the plan when it stops for approval.
+> Run `/path/to/agent-delegation-skill/orchestrator/delegate run "fix the
+> failing auth test"` here, and show me the plan when it stops for approval.
 
 Two modes, and the difference is who answers the gates:
 
@@ -245,28 +250,33 @@ machine with no agents and no cost, which is the cheapest way to see the shape
 of a run. Other flags — `--adapter`, `--no-panes`, `--max-cost`, `--review` — are
 in [`orchestrator/README.md`](orchestrator/README.md).
 
+Still from the repo being worked on:
+
 ```bash
-orchestrator/delegate status                     # tasks for this project
-orchestrator/delegate show --brief               # the human-readable summary
-orchestrator/delegate resume --id T-001          # continue a parked task
-orchestrator/delegate channels                   # quota cooldowns and draw
+$ADG status                    # tasks for this project
+$ADG show --brief              # the human-readable summary
+$ADG resume --id T-001         # continue a parked task
+$ADG channels                  # quota cooldowns and draw per seat
 ```
+
+And from a clone of *this* repo, the suites:
 
 ```bash
 python3 orchestrator/tests/test_orchestrator.py  # 149 tests, no tokens spent
 python3 orchestrator/tests/test_failover.py      #  95 more, same
 ```
 
-The tests drive the real state machine over a real git repository with a
-scripted adapter, so they need no agent CLI installed and spend nothing.
+They drive the real state machine over a real git repository with a scripted
+adapter, so they need no agent CLI installed and spend nothing.
 
 **Two limits to know before you rely on it.** Parallel subtasks still carry a
-shared-state race — roughly 1 full-suite run in 8 — so keep
-`max_parallel_agents: 1` until it is closed; the sequential path is unaffected.
-And live quota metering, telemetry-driven registry recalibration, and container
-isolation are absent. [`orchestrator/README.md`](orchestrator/README.md) has the
-configuration, the full scope boundary, and the defect write-up; `DESIGN.md` §15
-has the design it was built from.
+shared-state race — roughly 1 full-suite run in 8 — so `max_parallel_agents`
+ships as `1` and should stay there until it is closed; the sequential path is
+unaffected. And live quota metering, telemetry-driven registry recalibration,
+and container isolation are absent.
+[`orchestrator/README.md`](orchestrator/README.md) has the configuration, the
+full scope boundary, and the defect write-up; `DESIGN.md` §15 has the design it
+was built from.
 
 ## License
 

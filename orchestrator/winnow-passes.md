@@ -190,9 +190,11 @@ What the general version would replace, roughly in the order it should be built:
    its bands relatively; adg's vocabulary is the absolute one, so this is a
    consumer-side resolver. Small, and correct regardless of whether the rest
    ever happens.
-2. **The env-var split.** Gap 1 above. Independent of packaging — it is an adg
-   defect on its own terms, and it collides with *any* hosted skill. Also
-   small, also worth doing alone.
+2. ~~**The env-var split.**~~ **Done** — gap 1 above, and it landed exactly as
+   this entry argued it would: independent of packaging, worth doing alone,
+   because it was an adg defect on its own terms that collided with *any* hosted
+   skill. Left in the list because the ordering argument is the point, and a
+   list that silently drops what it completed reads as if it never planned it.
 3. **Fan-out/merge as a stage kind.** Gap 2. The largest piece and the only one
    needing new machinery rather than new config. Once it exists, every
    map-reduce package is covered.
