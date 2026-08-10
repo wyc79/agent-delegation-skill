@@ -399,8 +399,13 @@ class TestReserve(unittest.TestCase):
         # affordable, because only the caller knows which CLI is installed.
         held = self.r.candidates("implementer", utilization={"claude-seat": 0.8},
                                  cooldowns={"cursor-seat"}, ignore_reserve=True)
-        self.assertEqual([c.channel for c in held], ["claude-seat"])
-        self.assertTrue(held[0].demoted)
+        # By channel and flag, not by count: claude-seat exposes more than one
+        # model the implementer may use (balanced-coder to work with, opus as
+        # its escalation rung), and how many that is is not what this asserts.
+        self.assertTrue(held, "the withheld seat was not offered at all")
+        self.assertEqual({c.channel for c in held}, {"claude-seat"})
+        self.assertTrue(all(c.demoted for c in held),
+                        "a withheld seat was handed back unflagged")
         self.assertEqual(self.r.candidates("implementer",
                                            utilization={"claude-seat": 0.8},
                                            cooldowns={"cursor-seat"}), [])

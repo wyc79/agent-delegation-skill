@@ -239,6 +239,28 @@ class TestRouter(unittest.TestCase):
         with self.assertRaises(router.RoutingError):
             self.r.candidates("planner", ceiling={"max_tier": "unlimited"})
 
+    def test_the_strong_model_is_the_implementers_rung_not_its_default(self):
+        """The registry enrols opus for implementer so rung 2 has somewhere to
+        climb, and its note promises that does not make it the default. The
+        promise rests on the speed weight, which a later tuning pass could
+        erase without noticing what else it decided."""
+        self.assertIn("implementer",
+                      self.reg["models"]["opus-class-strong"]["enrolled_roles"])
+        first = self.r.select("implementer")
+        self.assertEqual(first.model, "balanced-coder",
+                         "the escalation target won a first attempt")
+        # And it is reachable, or enrolling it bought nothing.
+        self.assertEqual(self.r.escalate("implementer", first).model,
+                         "opus-class-strong")
+
+    def test_the_implementer_rung_survives_a_drawn_down_seat(self):
+        # The cheap model has a second seat and the strong one does not, so a
+        # filling window widens the gap rather than closing it.
+        for u in (0.5, 0.9):
+            self.assertEqual(
+                self.r.select("implementer", utilization={"claude-seat": u}).model,
+                "balanced-coder", "at %.0f%% draw" % (u * 100))
+
     def test_a_boost_raises_a_floor_the_profile_never_declared(self):
         # The implementer profile requires coding and tool, not reasoning, and
         # rung 2 of the ladder (DESIGN §6.2) is exactly a reasoning+1 re-route.
@@ -737,6 +759,14 @@ class TestRungThree(unittest.TestCase):
         sh(["git", "add", "-A"], self.t.repo)
         sh(["git", "commit", "-qm", "cfg"], self.t.repo)
         self.reg = router.load_registry(REGISTRY)
+        # Spend rung 2 up front. This class is about what happens when the
+        # ladder has no rung left, so it builds that condition rather than
+        # borrowing it from whatever the shipped registry happens to enrol --
+        # which is exactly the coupling that made the earlier version of this
+        # fixture break the moment implementer gained an escalation target.
+        self.reg["models"]["opus-class-strong"]["enrolled_roles"] = [
+            r for r in self.reg["models"]["opus-class-strong"]["enrolled_roles"]
+            if r != "implementer"]
         self.pol = dict(self.reg["policy"]["limits"],
                         escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
         self.plans = []
@@ -776,9 +806,6 @@ class TestRungThree(unittest.TestCase):
         return status, task, logs
 
     def test_the_ladder_reaches_the_planner_before_it_reaches_a_human(self):
-        self.assertNotIn("implementer",
-                         self.reg["models"]["opus-class-strong"]["enrolled_roles"],
-                         "fixture assumes rung 2 has nowhere to climb")
         status, task, logs = self._run()
         self.assertEqual(int(task.state["spent"]["replans"]), 1,
                          "rung 3 never fired\n%s" % "\n".join(logs))

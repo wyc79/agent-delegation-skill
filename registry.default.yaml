@@ -38,8 +38,15 @@ models:
     ctx: 200000
     cost_in: 15
     cost_out: 75
-    enrolled_roles: [planner, reviewer, integrator]
-    notes: Plan and review. Not the default implementer — see principle #1.
+    enrolled_roles: [planner, reviewer, integrator, implementer]
+    notes: >
+      Plan and review. Enrolled for implementer as the ESCALATION target, not as
+      a default: the implementer profile weights speed, so this scores 25 against
+      balanced-coder's 27 and never wins a first attempt. Rung 2 reaches it
+      anyway because escalation raises a reasoning floor, and a floor is a gate
+      rather than a score. Without this line rung 2 has nowhere to climb on the
+      shipped config, and every stuck subtask spends a replan on what a stronger
+      model might have fixed in one attempt.
 
   balanced-coder:
     tier: t2
