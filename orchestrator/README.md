@@ -60,13 +60,67 @@ key or the `ADG_WINNOW_SCAN` environment variable. Either one wins over
 autodetect, and a path that is set but wrong is reported as a misconfiguration
 rather than quietly reported as "not installed".
 
+## Quota failover
+
+Subscription seats run out. When an agent CLI fails with its provider's
+usage-limit shape — a 429, `usage limit reached`, `RESOURCE_EXHAUSTED` — the
+orchestrator treats it as a *routing event*, not a failure (DESIGN.md §5.4,
+§5.5): it opens a cooldown on that channel, re-selects the same role on another
+enrolled channel, and carries on in the same worktree, so every checkpoint
+commit the first agent made is still there.
+
+**A quota failure does not consume an attempt.** `max_attempts_per_subtask`
+bounds how many times an *approach* may be retried; an empty seat is not the
+approach's fault. Escalation and failover stay separate and compose: a failover
+target can still escalate later if the work itself is stuck.
+
+The breaker lives in `$XDG_STATE_HOME/agent-delegation/channels.json` — beside
+`projects/`, **not** inside one, because a quota belongs to a seat and two repos
+driving the same subscription must see one cooldown. Expired entries are ignored
+on read and pruned on write. A corrupt or unreadable file is reported and
+treated as *no cooldowns*; it never invents one and never crashes a run.
+
+```bash
+orchestrator/delegate channels                       # cooldowns and quota draw
+orchestrator/delegate channels --clear claude-seat   # override one
+orchestrator/delegate resume --when-open --id T-001  # wait for the window, then resume
+```
+
+With every channel for a role cooled, the task parks as `quota_all_exhausted`
+carrying the earliest reopen time, and `delegate resume` refuses until then
+rather than starting a run every seat will reject.
+
+### What is measured, and what is estimated
+
+The cooldown's reopen time is the provider's own when it states one, and the
+channel's configured `quota.window` otherwise — the fallback is logged, never
+silent.
+
+Utilization is **not** metered. Providers expose no counter, so the orchestrator
+counts one invocation as one unit against `quota.est_capacity` inside the
+window. That estimate drives the §5.4 shadow price — a subscription with
+headroom costs ~0, and the same seat at 90% drawn prices itself above a metered
+key — so cost-sensitive roles drift to the emptier seat before anything hits a
+wall. `reserve_for` / `reserve_fraction` keep the declared share of a seat free
+for the roles named there: a reserved role is never filtered out, a non-reserved
+one is once the seat passes `1 − reserve_fraction`, *unless* that would leave it
+with nowhere to go — then it gets the seat anyway and the demotion is logged. A
+reservation that parks work it could have done is not worth having.
+
+`weekly_cap: true` is **not** modelled on the utilization path: estimating a
+weekly capacity from a five-hour `est_capacity` would be inventing a number. A
+provider-stated weekly exhaustion still parks correctly, with the reset time the
+provider gave.
+
 ## Layout
 
 | File | Role |
 |---|---|
 | `adg/machine.py` | The state machine. Every transition lives here. |
 | `adg/store.py` | Task state outside the repo; project key from the git common dir. |
-| `adg/router.py` | Capability scoring, enrollment, escalation ceiling. |
+| `adg/router.py` | Capability scoring, enrollment, escalation ceiling, quota shadow price. |
+| `adg/quota.py` | Quota-exhaustion classification per agent kind; reset and window parsing. |
+| `adg/cooldown.py` | Per-channel breakers and the invocation meter, shared across projects. |
 | `adg/limits.py` | Hard limits, checked before the action, failing closed. |
 | `adg/runtime.py` | The seven-operation adapter: `local`, `herdr` (agents run in visible panes), `mock`. |
 | `adg/verify.py` | Deterministic checks and mechanical scope comparison. |
@@ -91,6 +145,9 @@ rather than quietly reported as "not installed".
 - **The top model tier needs two switches**: enrollment *and* the ceiling.
 - **Liveness is not success.** An agent settling `idle` proves nothing; a
   schema-valid report plus real verify output does.
+- **A quota wall is a routing event, not an attempt.** Failing over to another
+  seat never spends `max_attempts_per_subtask`, and never substitutes for
+  escalation.
 - **The skill names no model and no runtime.** If either leaks into
   `agent-delegation/`, the boundary has broken.
 
@@ -98,6 +155,7 @@ rather than quietly reported as "not installed".
 
 ```bash
 python3 orchestrator/tests/test_orchestrator.py
+python3 orchestrator/tests/test_failover.py
 ```
 
 The end-to-end tests drive the real state machine over a real git repository
@@ -113,10 +171,12 @@ usable, rather than depending on a vendor binary being on PATH.
 Implemented: the full pipeline, parallel subtasks in separate worktrees (bounded
 by `max_parallel_agents`, serialized on scope or hotspot overlap), the Integrator
 on merge conflicts, an independent Test Author on complex tasks, real cost
-accounting from the CLI, autonomous mode ending at an opened PR, and
-model-rendered briefs.
+accounting from the CLI, autonomous mode ending at an opened PR, model-rendered
+briefs, and quota-aware failover with per-channel cooldowns and a utilization
+shadow price.
 
-Still absent: live quota metering per subscription window, telemetry-driven
+Still absent: *live* quota metering (the draw above is estimated from invocation
+counts, not read from a provider), weekly-cap modelling, telemetry-driven
 registry recalibration, and container isolation. Escalation is two signals
 (`test_stuck`, `scope_overrun`) and a two-rung ladder.
 
