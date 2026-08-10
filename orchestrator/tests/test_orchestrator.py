@@ -893,6 +893,9 @@ class TestRuntimeSurfaces(unittest.TestCase):
         class H(runtime.HerdrAdapter):
             def _cli(self, args, check=True):
                 raise AssertionError("classifier must not open a pane")
+
+            def can_run(self, kind):
+                return True        # routing is the subject; no vendor CLI needed
         h = H(workspace="w1")
         s = h.start_agent("classifier", "claude", "/tmp", {})
         self.assertFalse((s.handle or {}).get("herdr"))
@@ -924,12 +927,30 @@ class TestRuntimeSurfaces(unittest.TestCase):
         class H(runtime.HerdrAdapter):
             def _cli(self, args, check=True):
                 raise AssertionError("panes are off; nothing should be split")
+
+            def can_run(self, kind):
+                return True        # routing is the subject; no vendor CLI needed
         h = H(workspace="w1", panes=False)
         s = h.start_agent("implementer", "claude", "/tmp",
                           {"AGENT_DELEGATION_TASK_DIR": "/x/T-1"})
         self.assertFalse((s.handle or {}).get("herdr"))
         self.assertIn("--output-format", " ".join(s.handle["argv"]),
                       "the subprocess path is what reports total_cost_usd")
+
+    def test_a_missing_cli_is_refused_before_a_session_exists(self):
+        # The PATH guard runs through can_run so tests can stub it. Stubbing the
+        # seam must not be able to disarm the guard for a real run.
+        class Nothing(runtime.LocalAdapter):
+            def can_run(self, kind):
+                return False
+
+        with self.assertRaises(runtime.RuntimeError_) as cm:
+            Nothing().start_agent("implementer", "claude", "/tmp", {})
+        self.assertIn("not found on PATH", str(cm.exception))
+
+        with self.assertRaises(runtime.RuntimeError_) as cm:
+            runtime.LocalAdapter().start_agent("implementer", "nope", "/tmp", {})
+        self.assertIn("unknown agent kind", str(cm.exception))
 
     def test_herdr_availability_needs_both_env_and_binary(self):
         prev = os.environ.get("HERDR_ENV")
@@ -1393,6 +1414,21 @@ class TestWinnow(unittest.TestCase):
         finally:
             del os.environ[winnow.ENV_OVERRIDE]
         shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_configured_path_that_is_wrong_says_so(self):
+        # Otherwise a typo in winnow_scan is indistinguishable from a machine
+        # that never installed code-winnow.
+        why = winnow.misconfigured("/nope/scan.py")
+        self.assertIn("winnow_scan", why)
+        self.assertIn("/nope/scan.py", why)
+
+        os.environ[winnow.ENV_OVERRIDE] = "/also/nope.py"
+        try:
+            self.assertIn(winnow.ENV_OVERRIDE, winnow.misconfigured())
+        finally:
+            del os.environ[winnow.ENV_OVERRIDE]
+
+        self.assertIsNone(winnow.misconfigured(), "unset is not misconfigured")
 
     def test_summary_keeps_only_significant_findings(self):
         s = winnow.summarize({"findings": [

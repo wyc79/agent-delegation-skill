@@ -48,6 +48,22 @@ def find(repo, configured=None):
     return None
 
 
+def misconfigured(configured=None):
+    """Why an *explicit* path failed to resolve, or None.
+
+    SEARCH covers the runtimes we know; anywhere else is reached by setting
+    `winnow_scan` or ADG_WINNOW_SCAN. A typo there would otherwise fall through
+    to autodetect and report the same "not installed" as an untouched machine --
+    the one case where the honest degradation this module promises reads as a
+    lie, because the user did configure it.
+    """
+    for cand, src in ((configured, "winnow_scan"),
+                      (os.environ.get(ENV_OVERRIDE), ENV_OVERRIDE)):
+        if cand and not os.path.isfile(os.path.expanduser(cand)):
+            return "%s points at %s, which is not a file" % (src, cand)
+    return None
+
+
 def run(task, scan_py, cwd, base_ref, run_id):
     """Scan the change and persist the raw output. Returns a summary dict, or
     None when the scan could not run -- never a fabricated clean result."""

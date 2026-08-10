@@ -640,9 +640,11 @@ a planner does that next, from your design.
         evidence is worth most."""
         if (self.vcfg.get("winnow") or "auto") == "never":
             return None
-        scan_py = winnow.find(self.repo, self.vcfg.get("winnow_scan"))
+        configured = self.vcfg.get("winnow_scan")
+        scan_py = winnow.find(self.repo, configured)
         if not scan_py:
-            return {"ran": False, "why": "code-winnow not installed"}
+            return {"ran": False,
+                    "why": winnow.misconfigured(configured) or "code-winnow not installed"}
         summary = winnow.run(self.task, scan_py, base,
                              self.task.state["repo"].get("base_commit", "HEAD"),
                              result.run_id)

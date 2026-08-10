@@ -52,6 +52,14 @@ winnow_scan: ~/.claude/skills/code-winnow/scripts/scan.py   # only if autodetect
 
 No config is legal — checks are then reported as *not run* rather than faked.
 
+`winnow_scan` is only needed when autodetect misses. It looks in
+`.claude/skills/` and `.agents/skills/` under the repo, then `~/.claude`,
+`~/.cursor` and `~/.agents` — so a code-winnow installed anywhere else (another
+runtime's skill directory, a bare clone) has to be pointed at, either with this
+key or the `ADG_WINNOW_SCAN` environment variable. Either one wins over
+autodetect, and a path that is set but wrong is reported as a misconfiguration
+rather than quietly reported as "not installed".
+
 ## Layout
 
 | File | Role |
@@ -95,6 +103,10 @@ python3 orchestrator/tests/test_orchestrator.py
 The end-to-end tests drive the real state machine over a real git repository
 with a scripted adapter, so the whole pipeline — plan, isolated implementation,
 verify, review, integrate — is exercised without spending a token.
+
+No agent CLI has to be installed for the suite to pass. Tests that exercise
+launch routing stub `can_run`, the single seam that decides whether a kind is
+usable, rather than depending on a vendor binary being on PATH.
 
 ## Scope
 
