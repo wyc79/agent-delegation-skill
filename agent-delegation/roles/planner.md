@@ -28,6 +28,15 @@ spends the one expensive call in the system on a question already answered.
 
 No `spec.md` means the design work is yours, in Step 3.
 
+**If `$TASK_DIR/escalation.md` exists, this is a replan.** An implementation
+came back: a subtask failed repeatedly under the strongest model available, so
+the decomposition is the suspect and reissuing its shape will fail the same
+way. Change something structural — split it, re-scope it, resequence it — or
+say plainly in `plan.md` why it is still right and what should be done
+differently. Every completed subtask it lists must be dispositioned as **keep,
+adapt or discard**: finished work is reset to pending when your plan lands, so
+anything you leave out gets built again.
+
 ## Step 2 — Explore before deciding
 
 Read the actual code. Identify, and write down as you go:

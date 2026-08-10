@@ -69,6 +69,26 @@ class Halt(Exception):
         self.status = status
 
 
+class Replan(Exception):
+    """Rung 3 (§6.2): the model ladder is spent, so the plan is the suspect.
+
+    Deliberately not a Halt. Rung 2 is documented as "skipped entirely if
+    nothing enrolled sits above the current model", and the rung after it is
+    the planner, not the human -- but the code went straight to needs_human,
+    so a deployment with one strong seat had a two-rung ladder that ended in a
+    shrug. Repeated failure by the best model available is evidence about the
+    plan; handing that to a human without letting the planner see it wastes the
+    one reader who can act on it cheaply.
+
+    Becomes a halt on its own when `max_replans` is spent -- that is rung 4,
+    reached by exhausting rung 3 rather than by skipping it.
+    """
+
+    def __init__(self, subtask, message):
+        super().__init__(message)
+        self.subtask = subtask
+
+
 class Orchestrator:
     def __init__(self, task, registry, adapter, gate, log=print, dry_run=False,
                  clock=time.time):
@@ -98,7 +118,13 @@ class Orchestrator:
                 handler = getattr(self, "_stage_" + status, None)
                 if handler is None:
                     raise Halt("needs_human", "no handler for stage %r" % status)
-                handler()
+                try:
+                    handler()
+                except Replan as r:
+                    # Caught inside the loop, not beside it: rung 3 continues the
+                    # run at the plan stage, and catching it out there would end
+                    # the run instead -- the very thing this rung exists to stop.
+                    self._rung3(r)
         except routing.AllChannelsCooled as q:
             # Ahead of the generic handler: this is not a crash and not a
             # registry mistake, and reporting it as either sends the reader to
@@ -333,6 +359,21 @@ a planner does that next, from your design.
                       "the approach, so decompose and scope rather than redesigning. "
                       "Departing from it is a decision to record in decisions.md."
                       % self.task.file("spec.md"))
+        if self.task.read_text("escalation.md", "").strip():
+            # Rung 3 arrived here. Replanning the same decomposition would spend
+            # the replan budget reproducing the failure it was granted to escape.
+            extra += (
+                "\n\nThis is a REPLAN. An implementation escalated to you: read %s "
+                "first. The previous decomposition is the suspect — a subtask "
+                "failed repeatedly under the strongest model available, so "
+                "reissuing the same shape will fail the same way. Change "
+                "something structural: split it, re-scope it, resequence it, or "
+                "state plainly in plan.md why it is still right and what the "
+                "implementer should do differently.\n"
+                "Every completed subtask listed there must be dispositioned in "
+                "plan.md as keep, adapt or discard. Work that is already green is "
+                "reset to pending when your plan lands, so anything you leave out "
+                "will be built again." % self.task.file("escalation.md"))
         self._run_once("planner", choice, cwd=self.repo, extra=extra)
         subtasks = self._read_plan_subtasks()
         if not subtasks:
@@ -499,9 +540,16 @@ a planner does that next, from your design.
                                                 ceiling=self.budget.ceiling(),
                                                 cooldowns=cooled, utilization=util)
                 if stronger is None:
-                    raise Halt("needs_human",
-                               "%s still failing after %d attempts and nothing stronger is "
-                               "enrolled within the ceiling" % (sub["id"], attempts))
+                    # Rung 2 is spent, so the next rung is 3 -- the planner --
+                    # not 4. Write the bundle here, while the failing verify
+                    # output and this agent's report are still in hand; the
+                    # planner runs in a later stage and a different process.
+                    self._write_escalation_bundle(sub, attempts, result, report)
+                    self._close(session)
+                    raise Replan(sub["id"],
+                                 "%s still failing after %d attempts and nothing "
+                                 "stronger is enrolled within the ceiling"
+                                 % (sub["id"], attempts))
                 # Naming the new slot alone overstated this. Registry model
                 # names are capability slots, and the runtime launches a CLI by
                 # agent kind without pinning a model (runtime.LAUNCH), so
@@ -523,6 +571,76 @@ a planner does that next, from your design.
                 self._close(session)
                 role_choice, attempts, session = stronger, 0, None
         self._finish_subtask(sub, base)
+
+    def _write_escalation_bundle(self, sub, attempts, result, report):
+        """§6.3. Escalation without context just repeats the failure expensively.
+
+        Append-only, like `deviations.md`: `max_replans` can exceed one, and the
+        second replan needs to see that the first already tried something.
+
+        The completed-work inventory is the part that is easy to leave out and
+        expensive to omit. `_stage_plan` resets every subtask to pending from
+        the new plan, so a planner that does not know what is already green will
+        cheerfully re-plan work that is finished (§12).
+        """
+        state = self.task.state
+        done = [s for s in (state.get("subtasks") or [])
+                if s.get("status") == "complete"]
+        lines = [
+            "## %s — rung 3 after %d attempt(s)" % (sub["id"], attempts),
+            "",
+            "**Signal:** `test_stuck`. The same checks failed %d consecutive "
+            "attempts, and no stronger model is enrolled within the ceiling, so "
+            "the ladder has no rung left below you. Treat this as evidence about "
+            "the plan, not about the agent." % attempts,
+            "",
+            "**Goal as planned:** %s" % (sub.get("goal") or "(none recorded)"),
+            "**Planned scope:** %s" % (", ".join(sub.get("planned_scope") or []) or "(none)"),
+            "",
+            "### Failing checks",
+            "```",
+            (result.summary() or "").strip() or "(no summary)",
+        ]
+        for f in result.failures()[:3]:
+            lines += ["", "$ %s" % f["cmd"], (f["output"] or "")[-1200:]]
+        lines += ["```", ""]
+
+        summary = ((report or {}).get("summary") or "").strip()
+        lines += ["### The implementer's last word",
+                  summary[:1000] or "(it wrote no report)", ""]
+
+        # Disposition is the planner's job, but the list has to come from here:
+        # it is the only place that still knows what was green before the reset.
+        lines.append("### Completed work — disposition each one (keep / adapt / discard)")
+        if done:
+            lines += ["- `%s` — %s%s" % (
+                s["id"], s.get("goal") or "(no goal)",
+                " [files: %s]" % ", ".join(s.get("actual_files") or [])
+                if s.get("actual_files") else "") for s in done]
+        else:
+            lines.append("- (nothing is complete yet — the whole plan is open)")
+        lines.append("")
+
+        dev = self.task.read_text("deviations.md", "").strip()
+        if dev:
+            lines += ["### Deviations logged so far", dev[-2000:], ""]
+
+        prev = self.task.read_text("escalation.md", "")
+        self.task.write_text("escalation.md",
+                             (prev + "\n" if prev.strip() else "") + "\n".join(lines) + "\n")
+
+    def _rung3(self, exc):
+        """Send it back to the planner, or to the human when replans are spent.
+
+        `check_replan` raises LimitBreach, which the run loop already turns into
+        needs_human -- that is rung 4, and it is reached by exhausting rung 3
+        rather than by skipping it.
+        """
+        self.budget.check_replan()
+        self.budget.used_replan()
+        self.log("  rung 3: %s — replanning (%s)"
+                 % (exc, self.budget.summary()))
+        self.task.update(status="plan", replan_reason=str(exc))
 
     def _run_wave(self, wave):
         """Each subtask in its own worktree, concurrently, then merged in
@@ -546,6 +664,11 @@ a planner does that next, from your design.
             t.join()
         for sub in wave:
             outcome = results.get(sub["id"])
+            if isinstance(outcome, Replan):
+                # Same reasoning as the quota park below: flattening this into a
+                # Halt would give the wave path a different ladder from the
+                # sequential one for the identical event.
+                raise outcome
             if isinstance(outcome, routing.AllChannelsCooled):
                 # Re-raised, not flattened into a Halt: a quota park carries a
                 # reopen time and drives `resume --when-open`. Downgrading it
@@ -1053,7 +1176,7 @@ a planner does that next, from your design.
         did not. `pick_as` is the capability profile to re-route on, for roles
         whose name is not a profile (see `_optional`)."""
         session = self.adapter.start_agent(role, choice.agent_kind, self.repo,
-                                           prompts.env_for(self.task))
+                                           prompts.env_for(self.task, role))
         try:
             res = self.adapter.prompt(session, text, timeout=timeout)
         finally:
@@ -1101,7 +1224,7 @@ a planner does that next, from your design.
                 text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
                                        verify_cfg=self.vcfg)
                 session = self.adapter.start_agent(role, choice.agent_kind, cwd,
-                                                   prompts.env_for(self.task))
+                                                   prompts.env_for(self.task, role))
                 res = self.adapter.prompt(session, text, timeout=3600)
             else:
                 text = prompts.retry(failure)

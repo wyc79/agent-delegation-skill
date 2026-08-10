@@ -30,7 +30,8 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
         "",
         "Task directory (already exists; all task artifacts go here, never in the repo):",
         "  %s" % task.path,
-        "It is also in your environment as AGENT_DELEGATION_TASK_DIR.",
+        "It is also in your environment as AGENT_DELEGATION_TASK_DIR, and your "
+        "role as AGENT_DELEGATION_ROLE.",
         "",
         "Task id: %s" % task.state["id"],
     ]
@@ -75,9 +76,25 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
     return "\n".join(lines)
 
 
-def env_for(task):
+def env_for(task, role):
+    """Location and activation, split.
+
+    `AGENT_DELEGATION_TASK_DIR` used to be both: it said where the artifacts
+    are, and SKILL.md's description named it as a trigger, so *setting the
+    variable* is what enlisted an agent into this protocol. That conflates a
+    path with a mandate, and it collides with any other skill hosted on this
+    runtime -- dispatch a foreign judgement pass through it and the agent loads
+    agent-delegation anyway, then holds two protocols telling it to write
+    different files in different places.
+
+    `AGENT_DELEGATION_ROLE` is the mandate, and it is the honest carrier for
+    one: an agent outside this protocol has no role in it. A task directory can
+    now be handed to a foreign agent as a plain scratch location without
+    conscripting it.
+    """
     return {"AGENT_DELEGATION_TASK_DIR": task.path,
-            "AGENT_DELEGATION_SKILL_DIR": skill_path()}
+            "AGENT_DELEGATION_SKILL_DIR": skill_path(),
+            "AGENT_DELEGATION_ROLE": role}
 
 
 def retry(failure):
