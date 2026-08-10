@@ -39,6 +39,7 @@ finds everything else on disk:
 ```text
 User request
     ↓  classify           simple work skips straight to implementation
+    ↓  design             complex attended work only — a spec you approve first
     ↓  plan               strong model writes a durable plan, not chat
     ↓  implement          cheaper models, one subtask each, isolated worktrees
     ↓  verify             build/test/lint — deterministic, before any LLM review
@@ -93,9 +94,16 @@ DESIGN.md                 the full architecture and the reasoning behind it
 ```
 
 **Progressive disclosure is a hard constraint, not a style.** `SKILL.md` stays
-under 100 lines; role cards near 100; references load only on a stated
+at 100 lines or under; role cards under 130; references load only on a stated
 condition ("tests failed 3 times → read `references/escalation.md`"). Context
 spent on protocol is context not spent on the code.
+
+The budget that matters is **per role, not per repo**. `SKILL.md` is read by all
+five roles, so a line there costs five times a line in a card — which is why
+triggers that belong to one role live on that role's card. A reviewer never
+loads the engine notes, the parallelism rules, or the companion table, because
+it never writes code or shares a worktree. Moving those three rows out of the
+shared entry point lengthened four cards and made every individual role cheaper.
 
 ## Design choices worth knowing before you adopt it
 
@@ -107,8 +115,11 @@ spent on protocol is context not spent on the code.
 - **Review is an evidence chain**, not a vibe check: every acceptance criterion
   gets a row and a verdict, and every blocking finding must cite a requirement,
   a plan line, or real output.
-- **Escalation triggers on objective signals** — three failed attempts, scope
-  overruns, edit churn — not on a model's self-reported confidence.
+- **Escalation triggers on objective signals** — three consecutive failed
+  checks, or a signal the agent raised with an artifact citation and real output
+  attached — not on a model's self-reported confidence, which is a tiebreaker
+  and cannot move anything on its own. Out-of-scope edits are measured
+  mechanically and force a review rather than escalating.
 - **Parallelism is pessimistic.** Disjoint declared write scopes in separate
   worktrees, with unmergeable files (engine scenes, prefabs, `.uasset`) locked
   to one agent. A merge conflict in a binary scene has no good resolution.
@@ -123,8 +134,9 @@ are reported as missing rather than silently skipped.
 
 - **[code-winnow](https://github.com/wyc79/code-winnow-skill)** — its
   deterministic scanner runs as part of verification (stdlib, sub-second, no
-  model call) and flags generated-code chaff. Evaluated on this repo's own
-  orchestrator, it found two real defects in 0.4 seconds.
+  model call) and flags generated-code chaff. Pointed at this repo's own last
+  five commits it read 25 files in 0.6s and returned five P2s — two dead locals
+  and three near-duplicate tests — all of them real.
 - **[`andrej-karpathy-skills:karpathy-guidelines`](https://github.com/multica-ai/andrej-karpathy-skills)** — 67 lines on the mistakes
   that make generated code fail review (overcomplication, unrequested scope,
   unstated assumptions). Read by agents *before* they write code.
@@ -174,7 +186,7 @@ which is exactly what code is good at and prompts are not:
 |---|---|
 | Artifact discipline, handoffs, authority ordering | Different models per role (principle #1 is unrealized on one model) |
 | Review as an evidence chain; independent test authoring | Escalating to a stronger model on failure |
-| Deviation logging, honest `blocked` reporting | Mechanically reverting out-of-scope edits |
+| Deviation logging, honest `blocked` reporting | Mechanically detecting out-of-scope edits and forcing a review |
 | Escalation *thresholds* as self-discipline | Counting iterations and enforcing budget caps |
 | Sequential subtasks in one worktree | Parallel worktrees with lock/hotspot enforcement |
 | Asking the human at obvious moments | Schema validation, cost tracking, jargon-free briefs |
@@ -190,15 +202,61 @@ better than prompts:
   threshold (§9)
 - retrying and escalating failures up a ladder (§6)
 
+## Running it
+
+`delegate` is a command line program. **You do not talk to it — you run it, and
+it launches the agents.** The one thing to get right is that the agent you are
+chatting with is not the agent doing the work: it types the command, and `adg`
+spawns fresh, single-role agents that read the task directory.
+
 ```bash
-orchestrator/delegate init                       # what's detected, who gets which role
-orchestrator/delegate run "fix the failing auth test"
-python3 orchestrator/tests/test_orchestrator.py  # 119 tests, no tokens spent
+cd /path/to/your/repo                            # the repo to be changed
+/path/to/agent-delegation-skill/orchestrator/delegate init
+/path/to/agent-delegation-skill/orchestrator/delegate run "fix the failing auth test"
 ```
 
-Python 3.9+, stdlib only, no install step. The tests drive the real state
-machine over a real git repository with a scripted adapter, so they need no
-agent CLI installed and spend nothing.
+`init` prints what it detected — which agent CLIs are signed in, which model
+gets which role — and writes it only if you pass `--write`. `run` then drives
+the whole pipeline, stopping at each approval gate to ask you. Python 3.9+,
+stdlib only, no install step.
+
+### Driving it from a chat agent
+
+Ask the agent you are already talking to (Claude Code, Cursor, whatever) to run
+the command. It stays the **operator**: it runs `delegate`, reads what comes
+back, and answers the gates with you. It is not the planner or the implementer —
+those are separate processes with separate context, which is the whole point.
+
+> Run `orchestrator/delegate run "fix the failing auth test"` in this repo and
+> show me the plan when it stops for approval.
+
+Two modes, and the difference is who answers the gates:
+
+| Mode | Flag | Gates | Ends at |
+|---|---|---|---|
+| **Attended** (default) | — | It stops and asks you | A patch file you apply yourself |
+| **Autonomous** | `--mode autonomous --yes` | Auto-approved | An opened PR — **merge is never automatic in either mode** |
+
+Attended is the right default the first few times: you see the plan before it is
+executed and the diff before anything lands. Add `--dry-run` to walk the state
+machine with no agents and no cost, which is the cheapest way to see the shape
+of a run. Other flags — `--adapter`, `--no-panes`, `--max-cost`, `--review` — are
+in [`orchestrator/README.md`](orchestrator/README.md).
+
+```bash
+orchestrator/delegate status                     # tasks for this project
+orchestrator/delegate show --brief               # the human-readable summary
+orchestrator/delegate resume --id T-001          # continue a parked task
+orchestrator/delegate channels                   # quota cooldowns and draw
+```
+
+```bash
+python3 orchestrator/tests/test_orchestrator.py  # 149 tests, no tokens spent
+python3 orchestrator/tests/test_failover.py      #  95 more, same
+```
+
+The tests drive the real state machine over a real git repository with a
+scripted adapter, so they need no agent CLI installed and spend nothing.
 
 **Two limits to know before you rely on it.** Parallel subtasks still carry a
 shared-state race — roughly 1 full-suite run in 8 — so keep

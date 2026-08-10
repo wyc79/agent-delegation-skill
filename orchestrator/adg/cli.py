@@ -242,6 +242,15 @@ def cmd_resume(args):
     # override on "parked" silently dropped the flag exactly when it was most
     # needed -- and re-ran a stage the user was trying to skip past.
     if args.stage:
+        # Checked here rather than as argparse `choices`, because cmd_resume is
+        # also called directly with hand-built args. Writing first and finding
+        # out at the run loop cost the user a persisted bad status and a
+        # "no handler for stage" park for what is only ever a typo.
+        from .machine import STAGES
+        if args.stage not in STAGES:
+            sys.stderr.write("unknown stage %r — expected one of: %s\n"
+                             % (args.stage, ", ".join(STAGES)))
+            sys.exit(2)
         task.update(status=args.stage)
     elif was in ("needs_human", "abandoned"):
         task.update(status="implement")
@@ -321,7 +330,7 @@ def main(argv=None):
 
     rs = sub.add_parser("resume", help="continue a parked task")
     rs.add_argument("--id")
-    rs.add_argument("--stage", help="stage to resume at")
+    rs.add_argument("--stage", help="stage to resume at (see machine.STAGES)")
     rs.add_argument("--adapter", choices=["herdr", "local", "mock"])
     rs.add_argument("--no-panes", action="store_true")
     rs.add_argument("--dry-run", action="store_true")

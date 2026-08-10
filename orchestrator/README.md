@@ -134,7 +134,7 @@ provider gave.
 | `adg/limits.py` | Hard limits, checked before the action, failing closed. |
 | `adg/runtime.py` | The seven-operation adapter: `local`, `herdr` (agents run in visible panes), `mock`. |
 | `adg/verify.py` | Deterministic checks and mechanical scope comparison. |
-| `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. Its five *judgment passes* are a separate, unwired thing: see [`winnow-passes.md`](winnow-passes.md). |
+| `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. Its six *judgment passes* and their merge are a separate, unwired thing: see [`winnow-passes.md`](winnow-passes.md). |
 | `adg/companions.py` | Detects karpathy-guidelines and superpowers once, and declares them in `task.json`. |
 | `adg/brief.py` | Human-facing gate briefs, plus the jargon lint. |
 | `adg/schema.py` | Report/verdict validation against the skill's schemas. |
@@ -158,6 +158,10 @@ provider gave.
 - **A quota wall is a routing event, not an attempt.** Failing over to another
   seat never spends `max_attempts_per_subtask`, and never substitutes for
   escalation.
+- **An honest `escalate` is routed, never punished.** An agent that stops at the
+  threshold and attaches a signal must not end up worse off than one that fails
+  in silence. If following `references/escalation.md` ever routes to a higher
+  rung than saying nothing, the incentive has inverted and agents will learn it.
 - **The skill names no model and no runtime.** If either leaks into
   `agent-delegation/`, the boundary has broken.
 
@@ -187,8 +191,26 @@ shadow price.
 
 Still absent: *live* quota metering (the draw above is estimated from invocation
 counts, not read from a provider), weekly-cap modelling, telemetry-driven
-registry recalibration, and container isolation. Escalation is two signals
-(`test_stuck`, `scope_overrun`) and a two-rung ladder.
+registry recalibration, and container isolation. Rung 1 of the §6.2 ladder — "a
+different model at the same tier" — is not built either: the router escalates by
+raising a capability floor, which has no same-tier expression.
+
+### What escalates, and what only reports
+
+One counter drives the ladder on its own: `test_stuck`, from consecutive failed
+checks. `scope_overrun` is measured mechanically but does **not** escalate — it
+records the out-of-scope files and forces an LLM review that a simple task would
+otherwise have skipped. `edit_churn` has a configured threshold and no collector.
+
+Everything else reaches the ladder through the agent, in `report.signals`, and
+`ENTRY_RUNG` in `adg/machine.py` maps each to where it enters: `test_stuck` /
+`edit_churn` / `scope_overrun` climb to a stronger model, `plan_conflict` and
+`ambiguous_requirement` go straight back to the planner, `blocked_command` and
+`missing_dependency` stop for a human because nothing below can help. An
+`escalate` carrying no routable signal also stops for a human — `escalate` means
+"a stronger model, a re-plan, or a human", the signal is what says which, and
+guessing on the agent's behalf spends real money on a guess. `low_confidence` is
+not routable on its own, which is D4 enforced rather than restated.
 
 ## Known defect
 
@@ -203,5 +225,7 @@ have parked.
 Serializing `task.json` mutations and making verify/transcript ids unique per
 invocation reduced it from 2/8 to 1/8 without removing it, so at least one
 shared-state race remains in the wave path. **Treat parallel mode as
-unfinished**: run sequentially (one subtask per plan, or `max_parallel_agents:
-1`) until this is closed. The sequential path is not affected.
+unfinished.** `registry.default.yaml` therefore ships `max_parallel_agents: 1`;
+the two tests above set their own concurrency, because a parallel test that
+inherits the safe default is a sequential test that still passes. The sequential
+path is not affected.

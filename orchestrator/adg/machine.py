@@ -4,9 +4,10 @@ Deterministic control flow. LLMs choose among edges the graph already offers,
 through validated outputs -- they never invent a transition. Every run is
 replayable from task.json.
 
-MVP scope: sequential subtasks in one worktree, two escalation signals, a
-two-rung ladder. Parallelism, the Integrator role, and an independent Test
-Author are deliberately deferred (§15).
+Scope: the full pipeline, including parallel subtasks in separate worktrees, the
+Integrator, and an independent Test Author. The ladder walks rungs 0, 2, 3 and 4
+(§6.2) -- rung 1, "a different model at the same tier", is not built: the router
+escalates by raising a capability floor, which has no same-tier expression.
 """
 
 import os
@@ -18,8 +19,29 @@ from . import (brief, companions, cooldown, limits as lim, prompts, quota,
                router as routing, schema, verify, winnow, yamlite)
 from .store import git
 
-STAGES = ["intake", "classify", "plan", "implement", "verify", "review", "integrate", "done"]
+STAGES = ["intake", "classify", "brainstorm", "plan", "implement", "verify",
+          "review", "integrate", "done"]
 TERMINAL = {"done", "abandoned", "needs_human"}
+
+# DESIGN.md §6.2, signal -> the rung the ladder enters at. Only agent-raised
+# signals reach this table; the counter-driven ones are read off verify.
+#
+# `low_confidence` is deliberately absent rather than mapped high. D4 makes it a
+# tiebreaker, so on its own it carries no routing information -- and an absent
+# key falls through to "nothing to route on", which is the honest answer.
+# `merge_conflict_cross` is the Integrator's signal; arriving from an
+# implementer it means something the implementer cannot fix either.
+ENTRY_RUNG = {
+    "test_stuck": 2,            # more capability on the same understanding
+    "edit_churn": 2,
+    "scope_overrun": 2,
+    "plan_conflict": 3,         # a stronger implementer cannot fix a wrong plan
+    "ambiguous_requirement": 3, # the planner owns it; rung 4 is reached by
+                                # exhausting rung 3, never by skipping it
+    "blocked_command": 4,       # no model and no plan lifts a sandbox refusal
+    "missing_dependency": 4,    # ... or installs a package
+    "merge_conflict_cross": 4,
+}
 
 # Keyword matching on natural language does not work: "API" in "calculator API"
 # forced a 12-line change down the full planning pipeline, and no keyword list
@@ -516,9 +538,24 @@ a planner does that next, from your design.
             claimed = (report or {}).get("status")
             if claimed and claimed != "complete":
                 self.log("  %s: agent reported %s" % (sub["id"], claimed))
-            if claimed in ("blocked", "escalate"):
-                raise Halt("needs_human", "%s reported %s: %s" % (
-                    sub["id"], claimed, (report or {}).get("summary", "")[:200]))
+            if claimed == "blocked":
+                # The agent's own account is that nothing further is possible.
+                # That is rung 4 by definition, not a routing decision.
+                raise Halt("needs_human", "%s reported blocked: %s" % (
+                    sub["id"], (report or {}).get("summary", "")[:200]))
+            if claimed == "escalate":
+                rung, signals = self._entry_rung(report)
+                named = ", ".join(s.get("type", "?") for s in signals)
+                if rung >= 4:
+                    raise Halt("needs_human", "%s reported escalate (%s): %s" % (
+                        sub["id"], named or "no signal to route on",
+                        (report or {}).get("summary", "")[:200]))
+                self.log("  %s: escalate on %s — entering the ladder at rung %d"
+                         % (sub["id"], named, rung))
+                role_choice, attempts, session = self._climb(
+                    sub, rung, role_choice, attempts, result, report, session, signals)
+                failure = self._signal_context(signals)
+                continue
             if result.ok and not self._touched(base):
                 raise Halt("needs_human",
                            "%s changed no files, and the checks were already green "
@@ -535,21 +572,45 @@ a planner does that next, from your design.
             threshold = int((self.reg["policy"].get("escalation_thresholds") or {})
                             .get("test_stuck_attempts", 3))
             if attempts >= threshold:
-                _, cooled, util, _ = self._channel_state()
-                stronger = self.router.escalate("implementer", role_choice,
-                                                ceiling=self.budget.ceiling(),
-                                                cooldowns=cooled, utilization=util)
-                if stronger is None:
-                    # Rung 2 is spent, so the next rung is 3 -- the planner --
-                    # not 4. Write the bundle here, while the failing verify
-                    # output and this agent's report are still in hand; the
-                    # planner runs in a later stage and a different process.
-                    self._write_escalation_bundle(sub, attempts, result, report)
-                    self._close(session)
-                    raise Replan(sub["id"],
-                                 "%s still failing after %d attempts and nothing "
-                                 "stronger is enrolled within the ceiling"
-                                 % (sub["id"], attempts))
+                role_choice, attempts, session = self._climb(
+                    sub, 2, role_choice, attempts, result, report, session)
+        self._finish_subtask(sub, base)
+
+    def _entry_rung(self, report):
+        """Which rung an agent's own `escalate` enters at, and the signals that
+        decided it (§6.2).
+
+        **Highest rung wins.** An agent reporting `test_stuck` *and*
+        `missing_dependency` needs the human; climbing to a stronger model first
+        spends a seat on a package that is still not installed.
+
+        **No routable signal is rung 4, deliberately.** `escalate` means "a
+        stronger model, a re-plan, or a human" and the signals are what say
+        which. With nothing to read, the orchestrator cannot pick on the agent's
+        behalf, and guessing spends real money on a guess. This is also what
+        keeps D4 honest: `low_confidence` is not in ENTRY_RUNG, so a report
+        carrying only that lands here rather than escalating on a feeling."""
+        signals = [s for s in ((report or {}).get("signals") or [])
+                   if isinstance(s, dict)]
+        routable = [s for s in signals if s.get("type") in ENTRY_RUNG]
+        if not routable:
+            return 4, signals
+        return max(ENTRY_RUNG[s["type"]] for s in routable), routable
+
+    def _climb(self, sub, rung, role_choice, attempts, result, report, session,
+               signals=None):
+        """One ladder for both entrances: the counter that fires `test_stuck`
+        off verify, and an agent that reports the same thing itself. They differ
+        in what noticed, never in where the ladder goes.
+
+        Returns the next (choice, attempts, session), or raises Replan when the
+        rung above is the planner."""
+        if rung <= 2:
+            _, cooled, util, _ = self._channel_state()
+            stronger = self.router.escalate("implementer", role_choice,
+                                            ceiling=self.budget.ceiling(),
+                                            cooldowns=cooled, utilization=util)
+            if stronger is not None:
                 # Naming the new slot alone overstated this. Registry model
                 # names are capability slots, and the runtime launches a CLI by
                 # agent kind without pinning a model (runtime.LAUNCH), so
@@ -569,10 +630,41 @@ a planner does that next, from your design.
                 # happens either way, and is what makes the rung worth taking
                 # when the model cannot change.
                 self._close(session)
-                role_choice, attempts, session = stronger, 0, None
-        self._finish_subtask(sub, base)
+                return stronger, 0, None
+            # Rung 2 is spent, so the next rung is 3 -- the planner -- not 4.
+            why = ("%s still failing after %d attempts and nothing stronger is "
+                   "enrolled within the ceiling" % (sub["id"], attempts))
+        else:
+            why = ("%s raised %s, which no stronger implementer can fix"
+                   % (sub["id"], ", ".join(s.get("type", "?")
+                                           for s in (signals or []))))
+        # Write the bundle here, while the verify output and this agent's report
+        # are still in hand; the planner runs in a later stage and a different
+        # process.
+        self._write_escalation_bundle(sub, attempts, result, report, signals)
+        self._close(session)
+        raise Replan(sub["id"], why)
 
-    def _write_escalation_bundle(self, sub, attempts, result, report):
+    @staticmethod
+    def _signal_context(signals):
+        """What the replacement agent is told, so `attempted` stops being
+        decoration: the next model is stronger, not clairvoyant
+        (references/escalation.md)."""
+        out = []
+        for s in signals or []:
+            out.append("The previous agent raised %s: %s"
+                       % (s.get("type", "?"), (s.get("detail") or "").strip()))
+            ev = (s.get("evidence") or "").strip()
+            if ev:
+                out.append(ev[:800])
+            for a in (s.get("attempted") or [])[:6]:
+                out.append("Already tried, and it failed: %s" % str(a)[:200])
+            sug = (s.get("suggestion") or "").strip()
+            if sug:
+                out.append("Its suggestion, which is not binding on you: %s" % sug[:400])
+        return "\n".join(out) or None
+
+    def _write_escalation_bundle(self, sub, attempts, result, report, signals=None):
         """§6.3. Escalation without context just repeats the failure expensively.
 
         Append-only, like `deviations.md`: `max_replans` can exceed one, and the
@@ -582,22 +674,40 @@ a planner does that next, from your design.
         expensive to omit. `_stage_plan` resets every subtask to pending from
         the new plan, so a planner that does not know what is already green will
         cheerfully re-plan work that is finished (§12).
+
+        `signals` is present when the agent raised the escalation itself. The
+        headline has to follow it: reporting an agent's `plan_conflict` under a
+        hardcoded `test_stuck` sends the planner hunting a flaky test that was
+        never the complaint.
         """
         state = self.task.state
         done = [s for s in (state.get("subtasks") or [])
                 if s.get("status") == "complete"]
+        if signals:
+            headline = (
+                "**Signal:** `%s`, raised by the implementer itself. It stopped at "
+                "the threshold rather than pushing through, so this is evidence "
+                "about the plan and not a failed attempt."
+                % ", ".join(s.get("type", "?") for s in signals))
+        else:
+            headline = (
+                "**Signal:** `test_stuck`. The same checks failed %d consecutive "
+                "attempts, and no stronger model is enrolled within the ceiling, so "
+                "the ladder has no rung left below you. Treat this as evidence about "
+                "the plan, not about the agent." % attempts)
         lines = [
             "## %s — rung 3 after %d attempt(s)" % (sub["id"], attempts),
             "",
-            "**Signal:** `test_stuck`. The same checks failed %d consecutive "
-            "attempts, and no stronger model is enrolled within the ceiling, so "
-            "the ladder has no rung left below you. Treat this as evidence about "
-            "the plan, not about the agent." % attempts,
+            headline,
             "",
             "**Goal as planned:** %s" % (sub.get("goal") or "(none recorded)"),
             "**Planned scope:** %s" % (", ".join(sub.get("planned_scope") or []) or "(none)"),
             "",
-            "### Failing checks",
+            # An agent can escalate over a plan conflict while every check is
+            # green. Titling that "Failing checks" tells the planner to go
+            # looking for a failure nobody reported.
+            "### Failing checks" if not result.ok else
+            "### Checks when it stopped — they were green",
             "```",
             (result.summary() or "").strip() or "(no summary)",
         ]
@@ -608,6 +718,24 @@ a planner does that next, from your design.
         summary = ((report or {}).get("summary") or "").strip()
         lines += ["### The implementer's last word",
                   summary[:1000] or "(it wrote no report)", ""]
+
+        if signals:
+            # `attempted` is the field that stops the next reader repeating
+            # ruled-out work, and it is worthless if it never leaves the report.
+            lines.append("### What it raised, and what it already ruled out")
+            for s in signals:
+                lines.append("- **`%s`** — %s" % (s.get("type", "?"),
+                                                  (s.get("detail") or "").strip()[:400]
+                                                  or "(no detail given)"))
+                ev = (s.get("evidence") or "").strip()
+                if ev:
+                    lines += ["", "  ```", "  " + ev[:800].replace("\n", "\n  "), "  ```"]
+                for a in (s.get("attempted") or [])[:6]:
+                    lines.append("  - tried, and it failed: %s" % str(a)[:200])
+                sug = (s.get("suggestion") or "").strip()
+                if sug:
+                    lines.append("  - its suggestion, non-binding: %s" % sug[:300])
+            lines.append("")
 
         # Disposition is the planner's job, but the list has to come from here:
         # it is the only place that still knows what was green before the reset.

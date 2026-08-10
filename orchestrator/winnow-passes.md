@@ -8,11 +8,12 @@ wired today:
 | | What it is | Status |
 |---|---|---|
 | `scripts/scan.py` | Deterministic scanner, stdlib, sub-second | **Wired** — runs as a check in `_stage_review`, see `adg/winnow.py` |
-| Steps 1–3.5 | Five judgment passes plus a supervisor merge, each an LLM call | **Not wired** — this document is what it would take |
+| Steps 1–3.5 | Six judgment passes plus a supervisor merge, each an LLM call | **Not wired** — this document is what it would take |
 
-The scanner is a check. The passes are a review pipeline that costs six model
-calls, so it is a deliberate purchase, not a default. Nothing here happens
-until an operator enrolls the roles.
+The scanner is a check. The passes are a review pipeline costing up to seven
+model calls — `S` only when a feature was named, `C` and `D` only when the diff
+warrants them, so the floor is four — which makes it a deliberate purchase, not
+a default. Nothing here happens until an operator enrolls the roles.
 
 ## The passes
 
@@ -115,7 +116,24 @@ cost curve moves them there on its own.
 
 ## What is missing on this side
 
-Enrollment alone does not make this run. Three gaps, in the order they bite:
+Enrollment alone does not make this run. Four gaps, in the order they bite:
+
+**0. The passes write into the working repository, and the scanner does not.**
+This is the one that changes an invariant rather than adding machinery.
+code-winnow's Step 0 creates `.code-winnow/` in the repo under review and
+git-excludes it through `.git/info/exclude`; Steps 2 through 6 write rounds,
+reports, fix plans and pre-fix backups there. `scan.py --json` writes nothing —
+verified, which is why the wired path costs this nothing today.
+
+An excluded path satisfies `references/scratch-files.md` rule 2, since
+`git check-ignore` honours `info/exclude`. It does **not** satisfy the stronger
+promise both READMEs make, that nothing about a run is ever written into the
+repository. Three honest ways out, and the choice belongs to whoever wires this:
+run the passes in the throwaway worktree and let the directory die with it;
+teach code-winnow a root outside the repo; or narrow the README claim to
+*orchestration state* and say plainly that an enrolled review package writes an
+excluded directory. Deciding it silently is the one option that is not
+available — the invariant is load-bearing enough that it is tested.
 
 **1. ~~`AGENT_DELEGATION_TASK_DIR` activates this skill.~~ Fixed.** It used to
 be both the location of the artifacts and the trigger in `SKILL.md`'s

@@ -79,3 +79,12 @@ the failing-run output in `evidence`.
 - Covering a criterion would require test infrastructure the project does not
   have (a harness, fixtures, an engine test runner). Report the gap; building
   infrastructure is a planned subtask, not a side quest.
+
+## Your triggers
+
+Beyond the shared ones in `SKILL.md`, and only when the condition applies:
+
+| Condition | Read |
+|---|---|
+| Before you write tests | `references/companions.md` |
+| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |

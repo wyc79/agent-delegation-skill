@@ -67,4 +67,13 @@ verification evidence for the combined result.
   failure; resolving it by fiat hides it.
 - Reconciliation would require substantial new code rather than a merge.
 - An unmergeable binary conflict has no clearly correct side.
+
+## Your triggers
+
+Beyond the shared ones in `SKILL.md`, and only when the condition applies:
+
+| Condition | Read |
+|---|---|
+| Before you write code | `references/companions.md` |
+| You are reconciling work from concurrent worktrees | `references/parallelism.md` |
 - One side's work must be discarded wholesale.

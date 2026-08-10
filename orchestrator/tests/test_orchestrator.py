@@ -691,8 +691,12 @@ class TestParallelEndToEnd(unittest.TestCase):
 
         script = {"planner": planner, "implementer": implementer,
                   "test-author": lambda e, c: None, "reviewer": reviewer}
+        # A parallel test has to build its own concurrency. The shipped registry
+        # ships max_parallel_agents: 1 until the wave race is closed, so inheriting
+        # it silently turned every one of these into a sequential run that still passed.
         pol = dict(self.reg["policy"]["limits"],
-                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
+                   max_parallel_agents=2)
         task = store.Task.create(self.t.repo, "T-PAR", "# t\n\nAdd alpha and beta\n", pol)
         logs = []
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
@@ -724,8 +728,12 @@ class TestParallelEndToEnd(unittest.TestCase):
 
         script = {"planner": planner, "implementer": implementer,
                   "test-author": lambda e, c: None}
+        # A parallel test has to build its own concurrency. The shipped registry
+        # ships max_parallel_agents: 1 until the wave race is closed, so
+        # inheriting it turns this into a sequential run that still passes.
         pol = dict(self.reg["policy"]["limits"],
-                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
+                   max_parallel_agents=2)
         task = store.Task.create(self.t.repo, "T-PF", "# t\n\nAdd alpha and beta\n", pol)
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=lambda *_: None).run()
@@ -875,8 +883,12 @@ class TestWaveRaces(unittest.TestCase):
         sh(["git", "add", "-A"], self.t.repo)
         sh(["git", "commit", "-qm", "cfg"], self.t.repo)
         self.reg = router.load_registry(REGISTRY)
+        # A parallel test has to build its own concurrency. The shipped registry
+        # ships max_parallel_agents: 1 until the wave race is closed, so
+        # inheriting it turns every race test into a sequential run that passes.
         self.pol = dict(self.reg["policy"]["limits"],
-                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
+                        max_parallel_agents=2)
 
     def tearDown(self):
         subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
@@ -1442,6 +1454,26 @@ class TestResume(unittest.TestCase):
             pass
         self.assertNotEqual(store.Task.open(self.t.repo, "T-RS").state["status"], "plan")
 
+    def test_a_misspelled_stage_is_refused_before_it_is_written(self):
+        # --stage was written to status verbatim, and an unknown status has no
+        # handler -- so a typo persisted first and parked the task with "no
+        # handler for stage", which reads as a corrupted task rather than a
+        # typo the user can retype.
+        from adg import cli
+        task = store.Task.create(self.t.repo, "T-RT", "# t\n",
+                                 dict(self.reg["policy"]["limits"]))
+        task.update(status="plan")
+
+        class Args:
+            repo, registry, id, stage = self.t.repo, REGISTRY, "T-RT", "implememt"
+            adapter, dry_run, yes = "mock", True, True
+
+        with self.assertRaises(SystemExit) as cm:
+            cli.cmd_resume(Args())
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(store.Task.open(self.t.repo, "T-RT").state["status"], "plan",
+                         "the bad stage was written before it was checked")
+
 
 class TestCostBreakdown(unittest.TestCase):
     """The brief should say which model on which provider did what, and never
@@ -1768,6 +1800,152 @@ class TestWinnow(unittest.TestCase):
         s = winnow.run(_Task(), fake, d, "HEAD", "run-1")
         self.assertFalse(s["ran"])
         self.assertIn("boom", s["why"])
+
+
+class TestAgentRaisedSignals(unittest.TestCase):
+    """An agent that follows references/escalation.md -- stops at the threshold
+    and attaches a signal -- has to reach the ladder, not the human.
+
+    `status: escalate` was read as rung 4 whatever it carried, so an agent that
+    obeyed the protocol was routed strictly worse than one that failed in
+    silence: the silent one got rungs 2 and 3, the honest one got a parked run.
+    `report.signals` had no reader anywhere in the orchestrator, which is what
+    made the two defects one defect -- there was nothing to route on."""
+
+    PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\ntest_author: never\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        self.planner_calls = 0
+        self.planner_bundle = ""
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _run(self, signals, escalate_forever=False):
+        """One implementer that escalates with `signals`, then does the job.
+
+        Escalating once and succeeding afterwards is what separates the rungs:
+        a run that recovers proves the ladder moved, where a run that parks
+        cannot tell rung 4 from a rung that was never walked."""
+        calls = {"impl": 0}
+
+        def planner(env, cwd):
+            self.planner_calls += 1
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            if os.path.exists(os.path.join(td, "escalation.md")):
+                with open(os.path.join(td, "escalation.md")) as fh:
+                    self.planner_bundle = fh.read()
+            with open(os.path.join(td, "plan.md"), "w") as fh:
+                fh.write(self.PLAN)
+
+        def implementer(env, cwd):
+            calls["impl"] += 1
+            with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                fh.write("A = %d\n" % calls["impl"])
+            first = calls["impl"] == 1 or escalate_forever
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-alpha.json", {
+                "stage": "implement", "role": "implementer", "subtask": "st-1-alpha",
+                "status": "escalate" if first else "complete",
+                "summary": "stopping at the threshold, signal attached",
+                "signals": signals, "evidence": {"tests": "captured"}})
+
+        def reviewer(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
+                                   "reports", "review-reviewer.json"), "w") as fh:
+                json.dump({"verdict": "APPROVE",
+                           "ac_table": [{"ac": "AC-1", "status": "met",
+                                         "evidence": "checks pass"}],
+                           "findings": []}, fh)
+
+        task = store.Task.create(self.t.repo, "T-SIG", "# t\n\nAdd alpha\n", self.pol)
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(
+            {"planner": planner, "implementer": implementer, "reviewer": reviewer}),
+            lambda k, t: True, log=logs.append).run()
+        return status, task, logs
+
+    def test_a_test_stuck_signal_climbs_to_a_stronger_model(self):
+        # §6.2 rung 2. The shipped registry enrols opus-class-strong for
+        # implementer precisely so this rung has somewhere to go.
+        status, task, logs = self._run([{
+            "type": "test_stuck", "detail": "test_alpha fails on the third fix",
+            "evidence": "$ pytest -q\nE   assert 1 == 2",
+            "attempted": ["widened the guard", "reordered the calls"]}])
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertEqual(int(task.state["spent"]["replans"]), 0,
+                         "rung 2 was available and it skipped to rung 3")
+        self.assertTrue(any("escalating to" in l for l in logs),
+                        "no rung was climbed\n%s" % "\n".join(logs))
+
+    def test_a_plan_conflict_reaches_the_planner_not_the_human(self):
+        # §6.2: plan_conflict enters at rung 3 directly -- a stronger
+        # implementer cannot fix a plan that is wrong about reality.
+        status, task, logs = self._run([{
+            "type": "plan_conflict",
+            "detail": "plan.md:L4 scopes alpha.py, but alpha.py is generated",
+            "evidence": "$ git check-ignore -q alpha.py && echo ignored\nignored"}])
+        self.assertEqual(int(task.state["spent"]["replans"]), 1,
+                         "rung 3 never fired\n%s" % "\n".join(logs))
+        self.assertGreaterEqual(self.planner_calls, 2, "the planner was never re-run")
+        self.assertEqual(status, "done", "\n".join(logs))
+
+    def test_the_planner_is_handed_the_signal_the_agent_wrote(self):
+        # The whole point of `attempted`: the next reader skips what is already
+        # ruled out. Dropping it makes the field decoration.
+        self._run([{
+            "type": "plan_conflict", "detail": "plan.md:L4 contradicts the tree",
+            "evidence": "$ git check-ignore -q alpha.py\n(exit 0)",
+            "attempted": ["renaming the module", "widening the scope glob"]}])
+        bundle = self.planner_bundle
+        self.assertIn("plan_conflict", bundle)
+        self.assertIn("plan.md:L4 contradicts the tree", bundle)
+        self.assertIn("renaming the module", bundle,
+                      "the agent's ruled-out attempts never reached the planner")
+
+    def test_a_missing_dependency_still_stops_for_a_human(self):
+        # Rung 4 is right here and nothing below it helps: no model and no plan
+        # can install a package.
+        status, _, logs = self._run([{
+            "type": "missing_dependency", "detail": "needs libfoo>=2",
+            "evidence": "ModuleNotFoundError: No module named 'libfoo'"}],
+            escalate_forever=True)
+        self.assertEqual(status, "needs_human", "\n".join(logs))
+        self.assertTrue(any("libfoo" in l or "missing_dependency" in l for l in logs),
+                        "it parked without saying which signal parked it")
+
+    def test_low_confidence_alone_routes_nowhere(self):
+        # D4. Self-reported confidence is a tiebreaker; on its own it carries no
+        # routing information, so this is an escalate with nothing to act on.
+        status, task, logs = self._run([{
+            "type": "low_confidence", "detail": "unsure about the approach",
+            "evidence": "(none)"}], escalate_forever=True)
+        self.assertEqual(status, "needs_human", "\n".join(logs))
+        self.assertEqual(int(task.state["spent"]["replans"]), 0,
+                         "a confidence report alone spent a replan")
+        # Parking is the right answer, but it has to be the *reasoned* one.
+        # Asserting only the status cannot tell "nothing to route on" from the
+        # old behaviour, where every escalate parked whatever it carried.
+        self.assertTrue(any("low_confidence" in l for l in logs),
+                        "it parked without saying what it could not route\n%s"
+                        % "\n".join(logs))
 
 
 class TestEndToEnd(unittest.TestCase):

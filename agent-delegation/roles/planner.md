@@ -116,3 +116,13 @@ inventory of completed work. Two obligations:
   behavior, data loss, cost, external dependencies).
 - The work is far larger than the request implies — say so with your estimate
   rather than producing a plan nobody has budgeted for.
+
+## Your triggers
+
+Beyond the shared ones in `SKILL.md`, and only when the condition applies:
+
+| Condition | Read |
+|---|---|
+| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |
+| You are deciding whether subtasks may run concurrently | `references/parallelism.md` |
+| Nobody ran a design stage and you are producing `spec.md` yourself | `references/companions.md` |
