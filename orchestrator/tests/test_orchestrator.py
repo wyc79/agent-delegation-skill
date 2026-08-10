@@ -711,6 +711,111 @@ class TestParallelEndToEnd(unittest.TestCase):
         self.assertFalse(os.path.exists(task.file("integrate.patch")))
 
 
+class TestRungThree(unittest.TestCase):
+    """DESIGN §6.2 rung 3. Rung 2 is "skipped entirely if nothing enrolled sits
+    above the current model", and the rung after it is the planner. The code
+    went straight to needs_human, so a deployment whose implementer has nothing
+    stronger enrolled -- which is the shipped registry -- had a ladder that
+    stopped one rung early and threw the evidence at a human."""
+
+    PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'raise SystemExit(1)\'"\n'
+                     'test_author: never\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        self.plans = []
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _run(self):
+        def planner(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            bundle = os.path.join(td, "escalation.md")
+            if os.path.exists(bundle):
+                with open(bundle) as fh:
+                    self.plans.append(fh.read())
+            else:
+                self.plans.append("")
+            with open(os.path.join(td, "plan.md"), "w") as fh:
+                fh.write(self.PLAN)
+
+        def implementer(env, cwd):
+            # Writes a file, so this is a real attempt -- the checks are what
+            # fail, which is the test_stuck signal rather than an empty diff.
+            with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                fh.write("A = 1\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-alpha.json", {
+                "stage": "implement", "role": "implementer", "subtask": "st-1-alpha",
+                "status": "complete", "summary": "I believe this is right",
+                "evidence": {"tests": "ran"}})
+
+        task = store.Task.create(self.t.repo, "T-R3", "# t\n\nAdd alpha\n", self.pol)
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(
+            {"planner": planner, "implementer": implementer,
+             "test-author": lambda e, c: None}),
+            lambda k, t: True, log=logs.append).run()
+        return status, task, logs
+
+    def test_the_ladder_reaches_the_planner_before_it_reaches_a_human(self):
+        self.assertNotIn("implementer",
+                         self.reg["models"]["opus-class-strong"]["enrolled_roles"],
+                         "fixture assumes rung 2 has nowhere to climb")
+        status, task, logs = self._run()
+        self.assertEqual(int(task.state["spent"]["replans"]), 1,
+                         "rung 3 never fired\n%s" % "\n".join(logs))
+        self.assertGreaterEqual(len(self.plans), 2, "the planner was never re-run")
+
+    def test_the_planner_is_handed_the_bundle_not_just_a_status(self):
+        self._run()
+        bundle = self.plans[-1]
+        self.assertIn("test_stuck", bundle)
+        self.assertIn("st-1-alpha", bundle)
+        self.assertIn("Failing checks", bundle)
+        self.assertIn("I believe this is right", bundle,
+                      "the implementer's own account was dropped")
+        self.assertIn("disposition", bundle.lower(),
+                      "§12: a replan that cannot see finished work re-plans it")
+
+    def test_rung_four_is_reached_by_exhausting_rung_three_not_skipping_it(self):
+        status, task, logs = self._run()
+        self.assertEqual(status, "needs_human")
+        self.assertEqual(int(task.state["spent"]["replans"]),
+                         int(self.pol["max_replans"]),
+                         "it should stop only once the replan budget is spent")
+        self.assertTrue(any("LIMIT" in l or "max_replans" in l for l in logs),
+                        "stopping looked like a crash, not a spent budget\n%s"
+                        % "\n".join(logs))
+
+    def test_the_bundle_accumulates_rather_than_overwriting(self):
+        # max_replans can exceed 1, and the second replan has to see that the
+        # first already tried something. Read the file, not what the planner
+        # saw: the last rung-3 writes a bundle and then spends the budget, so
+        # nobody is dispatched to read it -- it is still the record of why the
+        # run stopped.
+        _, task, _ = self._run()
+        self.assertEqual(task.read_text("escalation.md", "").count("rung 3 after"), 2,
+                         "the second bundle overwrote the first")
+
+
 class TestWaveRaces(unittest.TestCase):
     """Parallel waves shared the state that encodes safety. Each of these is a
     concurrent restatement of an invariant the sequential path already keeps."""
@@ -944,6 +1049,13 @@ class TestRuntimeSurfaces(unittest.TestCase):
                                           {"AGENT_DELEGATION_TASK_DIR": "/x/T-1"})
         self.assertTrue((s.handle or {}).get("herdr"))
         self.assertEqual(s.handle["pane"], "w1:p9")
+
+    def test_the_agent_is_given_its_role_as_the_activation_signal(self):
+        class T:
+            path = "/x/T-1"
+        env = prompts.env_for(T(), "reviewer")
+        self.assertEqual(env["AGENT_DELEGATION_ROLE"], "reviewer")
+        self.assertEqual(env["AGENT_DELEGATION_TASK_DIR"], "/x/T-1")
 
     def test_a_variadic_grant_flag_is_passed_once(self):
         a = runtime.LocalAdapter()
@@ -1437,6 +1549,16 @@ class TestSkillContract(unittest.TestCase):
         self.assertNotIn("amended only by humans", skill)
         self.assertIn("planner may add criteria", skill)
         self.assertIn("missing entirely", self._card("planner"))
+
+    def test_the_skill_activates_on_a_role_not_on_a_path(self):
+        """A path says where files are. Triggering on it means any agent handed
+        a scratch directory loads this protocol -- including a foreign skill's
+        pass dispatched through the same runtime, which then holds two sets of
+        instructions naming different output files."""
+        desc = open(os.path.join(self.SKILL, "SKILL.md")).read().split("---")[1]
+        self.assertIn("$AGENT_DELEGATION_ROLE", desc)
+        self.assertNotIn("$AGENT_DELEGATION_TASK_DIR", desc,
+                         "the task directory is a location, not an assignment")
 
 
 class TestRoundVersioning(unittest.TestCase):

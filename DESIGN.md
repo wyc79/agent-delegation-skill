@@ -351,7 +351,11 @@ Conventions carried over from the reference repo:
 - **`SKILL.md` frontmatter** = `name` + a long, trigger-rich `description` that
   tells a host agent *when* to load the skill ("you have been assigned a role in
   a delegated development workflow", "you are the planner/implementer/reviewer for
-  task …", "`$AGENT_DELEGATION_TASK_DIR` is set in the environment").
+  task …", "`$AGENT_DELEGATION_ROLE` is set in the environment"). The trigger is
+  the **role**, not the task directory: a path says where files are, and using
+  it as the activation signal conscripts any agent the orchestrator hands a
+  scratch location — including a foreign skill's pass, which then holds two
+  protocols pointing at different files.
 - **Numbered, imperative workflow steps** inside each role card (the reference
   skill's Step 0…N style), each ending with the artifact the step must write —
   so "produce the report" is a step, not an afterthought.

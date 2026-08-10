@@ -117,14 +117,15 @@ cost curve moves them there on its own.
 
 Enrollment alone does not make this run. Three gaps, in the order they bite:
 
-**1. `AGENT_DELEGATION_TASK_DIR` activates this skill.** `prompts.env_for` sets
-it, and `SKILL.md`'s description names that variable as a trigger. An agent
-launched through `runtime.py` with a code-winnow prompt would load
-agent-delegation anyway and be told to read a role card and write
-`$TASK_DIR/reports/…`, while its actual prompt says write `round-NN/<pass>.md`.
-Two protocols, one agent, and it fires from the environment, so sending
-code-winnow's prompt verbatim does not avoid it. **Split location from
-activation before dispatching any foreign prompt.**
+**1. ~~`AGENT_DELEGATION_TASK_DIR` activates this skill.~~ Fixed.** It used to
+be both the location of the artifacts and the trigger in `SKILL.md`'s
+description, so launching a code-winnow prompt through `runtime.py` conscripted
+the agent into agent-delegation — two protocols pointing at different files,
+fired by the environment, so sending the foreign prompt verbatim did not avoid
+it. Activation now rides on `AGENT_DELEGATION_ROLE`, which a foreign pass has
+no reason to be given. `TASK_DIR` is a location again and can be handed over as
+a plain scratch path. **A dispatcher must not set `AGENT_DELEGATION_ROLE` for a
+pass that is not playing one of this protocol's roles.**
 
 **2. There is no fan-out/merge stage.** The state machine is stage-sequential
 with subtask parallelism inside `implement`. "N readers over one artifact, then

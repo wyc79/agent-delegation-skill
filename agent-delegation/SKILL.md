@@ -1,6 +1,6 @@
 ---
 name: agent-delegation
-description: Use when taking part in a delegated multi-agent development workflow — when a prompt assigns you a role (planner, implementer, test author, reviewer, integrator) for a task id, when `$AGENT_DELEGATION_TASK_DIR` is set in the environment, or when asked to plan work that other agents will implement, implement one subtask of an existing plan, write tests from requirements for someone else's implementation, review an implementation against its plan, or hand results to a downstream agent. Defines the shared protocol — which artifacts to read and write, what constraints to respect, and when to stop and escalate instead of pushing through.
+description: Use when taking part in a delegated multi-agent development workflow — when a prompt assigns you a role (planner, implementer, test author, reviewer, integrator) for a task id, when `$AGENT_DELEGATION_ROLE` is set in the environment, or when asked to plan work that other agents will implement, implement one subtask of an existing plan, write tests from requirements for someone else's implementation, review an implementation against its plan, or hand results to a downstream agent. Defines the shared protocol — which artifacts to read and write, what constraints to respect, and when to stop and escalate instead of pushing through.
 ---
 
 # Agent Delegation
@@ -10,6 +10,12 @@ this work, or will review it. You reach those agents only through files in the
 task directory — they never see your reasoning, only what you write down.
 
 ## Step 1 — Locate the task directory
+
+`$AGENT_DELEGATION_ROLE` names the role you are playing, and its presence is
+what says this protocol applies to you. `$AGENT_DELEGATION_TASK_DIR` only says
+*where the files are* — it is a location, not an assignment. An agent handed
+that path by some other tool, without a role, is not in this workflow and
+should not follow this skill.
 
 Task state lives **outside the repository** — shared by every worktree, never in
 git history. `$AGENT_DELEGATION_TASK_DIR` holds its absolute path; that value is
@@ -50,6 +56,7 @@ Everything below is relative to `$TASK_DIR` from Step 1:
 | `task.md` | The request and its numbered acceptance criteria (`AC-n`) | Intake or a human. The planner may add criteria if there are none; nobody else edits it |
 | `spec.md` | The approved design, when one was written: purpose, the approach chosen over the alternatives, risks | Brainstorm stage, then approved by a human. Present on complex attended tasks only |
 | `plan.md` | Approach plus one YAML block per subtask | Planner |
+| `escalation.md` | Append-only. Why a subtask was handed back to the planner, with the failing checks, the implementer's account, and the completed work to disposition | Orchestrator, at rung 3 |
 | `deviations.md` | Append-only log of departures from the plan | Anyone who departs |
 | `decisions.md` | Append-only design decisions and their reasons | Anyone deciding |
 | `reports/` | One JSON handoff per agent, per stage (`verify/` holds check output) | Every agent, at exit |
