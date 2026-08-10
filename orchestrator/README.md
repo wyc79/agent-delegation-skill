@@ -36,6 +36,7 @@ hotspots:                   # force COMPLEX classification when mentioned
   - "src/combat/combat_system.gd"
 ignore:                     # extra generated paths to exclude from scope accounting
   - "Build/*"
+test_author: auto           # auto (default) | never — independent tests on complex tasks
 winnow: auto                # auto (default) | never — deterministic chaff scan
 winnow_scan: ~/.claude/skills/code-winnow/scripts/scan.py   # only if autodetect misses
 ```
@@ -85,9 +86,14 @@ The end-to-end tests drive the real state machine over a real git repository
 with a scripted adapter, so the whole pipeline — plan, isolated implementation,
 verify, review, integrate — is exercised without spending a token.
 
-## MVP scope
+## Scope
 
-Deliberately absent, per DESIGN.md §15: parallel subtasks (one worktree per
-task, sequential), the Integrator role, an independent Test Author, live quota
-metering, telemetry recalibration, and containers. Escalation is two signals
+Implemented: the full pipeline, parallel subtasks in separate worktrees (bounded
+by `max_parallel_agents`, serialized on scope or hotspot overlap), the Integrator
+on merge conflicts, an independent Test Author on complex tasks, real cost
+accounting from the CLI, autonomous mode ending at an opened PR, and
+model-rendered briefs.
+
+Still absent: live quota metering per subscription window, telemetry-driven
+registry recalibration, and container isolation. Escalation is two signals
 (`test_stuck`, `scope_overrun`) and a two-rung ladder.

@@ -1704,10 +1704,11 @@ config files:
     Containers deferred — acceptable for a trusted-repo, single-user MVP; **not**
     acceptable the day untrusted repos or unattended operation arrive.
 
-Deliberately deferred: parallelism/worktree-per-subtask, Integrator role,
-independent Test Author, circuit breakers (manual registry edit suffices),
-telemetry-driven recalibration, async approval transports, engine adapters beyond
-"run this shell command."
+Deferred at first, since built (see `orchestrator/`): parallelism with a worktree
+per subtask, the Integrator on merge conflicts, and the independent Test Author.
+Still deferred: circuit breakers (a manual registry edit suffices),
+telemetry-driven recalibration, async approval transports, and engine adapters
+beyond "run this shell command."
 
 ### 15.1 Milestone 1 — prove one complete workflow
 

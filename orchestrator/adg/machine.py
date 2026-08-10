@@ -251,6 +251,30 @@ class Orchestrator:
                 return out
         return []
 
+    def _ready(self, subtasks):
+        """Subtasks whose dependencies are done. Ordering only -- safety is the
+        scope check below."""
+        done = {t["id"] for t in subtasks if t.get("status") == "complete"}
+        return [t for t in subtasks if t.get("status") != "complete"
+                and all(d in done for d in (t.get("depends_on") or []))]
+
+    def _wave(self, subtasks):
+        """The largest set of ready subtasks that may run at once. Two rules,
+        both pessimistic on purpose: no two may write the same scope, and no two
+        may touch the same hotspot. A wrong parallel decision costs a conflict
+        nobody can merge; a wrong serial one costs wall clock."""
+        cap = int(self.budget.limits["max_parallel_agents"])
+        wave, claimed = [], []
+        for t in self._ready(subtasks):
+            scope = list(t.get("planned_scope") or ["**"]) + list(t.get("hotspots") or [])
+            if any(verify.scopes_overlap(scope, other) for other in claimed):
+                continue
+            wave.append(t)
+            claimed.append(scope)
+            if len(wave) >= cap:
+                break
+        return wave or self._ready(subtasks)[:1]
+
     def _stage_implement(self):
         state = self.task.state
         if not state.get("subtasks"):
@@ -267,8 +291,16 @@ class Orchestrator:
         if not pending:
             self.task.update(status="review")
             return
-        sub = pending[0]
-        base = self._ensure_worktree()
+        wave = self._wave(state["subtasks"])
+        if len(wave) > 1:
+            self.log("implement: %d subtasks in parallel (%s)"
+                     % (len(wave), ", ".join(t["id"] for t in wave)))
+            self._run_wave(wave)
+            return
+        sub = wave[0]
+        self._one_subtask(sub, self._ensure_worktree())
+
+    def _one_subtask(self, sub, base):
         role_choice = self._pick("implementer")
         attempts, session = 0, None
         while True:
@@ -307,6 +339,74 @@ class Orchestrator:
                 self._close(session)
                 role_choice, attempts, session = stronger, 0, None
         self._finish_subtask(sub, base)
+
+    def _run_wave(self, wave):
+        """Each subtask in its own worktree, concurrently, then merged in
+        dependency order. Threads are fine here: every agent is a subprocess."""
+        import threading
+        results = {}
+
+        def work(sub):
+            try:
+                results[sub["id"]] = self._one_subtask(sub, self._subtask_worktree(sub))
+            except Exception as e:  # a failed branch must not kill its siblings
+                results[sub["id"]] = e
+
+        threads = [threading.Thread(target=work, args=(t,)) for t in wave]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for sub in wave:
+            outcome = results.get(sub["id"])
+            if isinstance(outcome, Exception):
+                raise Halt("needs_human", "%s failed: %s" % (sub["id"], outcome))
+        self._integrate_wave(wave)
+
+    def _subtask_worktree(self, sub):
+        state = self.task.state
+        branch = "adg/%s/%s" % (state["id"], sub["id"])
+        path = os.path.join(os.path.dirname(os.path.abspath(self.repo)),
+                            ".adg-worktrees", "%s-%s" % (state["id"], sub["id"]))
+        self.adapter.create_worktree(self.repo, branch,
+                                     state["repo"].get("base_commit", "HEAD"), path)
+        return path
+
+    def _integrate_wave(self, wave):
+        """Merge each green branch into the task branch, verifying after each --
+        so the integration branch is always green and every merge is tested
+        against everything already landed."""
+        integration = self._ensure_worktree()
+        for sub in wave:
+            branch = "adg/%s/%s" % (self.task.state["id"], sub["id"])
+            merge = subprocess.run(["git", "merge", "--no-edit", branch],
+                                   cwd=integration, capture_output=True, text=True)
+            if merge.returncode != 0:
+                self.log("  conflict merging %s" % sub["id"])
+                self._reconcile(sub, integration, merge.stdout + merge.stderr)
+            result = verify.run(self.task, self.repo, integration, "fast")
+            if not result.ok:
+                raise Halt("needs_human",
+                           "%s broke the integration branch once merged" % sub["id"])
+
+    def _reconcile(self, sub, cwd, conflict_text):
+        """A conflict two agents produced is judgement, not mechanism: which
+        side matches the plan, and what did the other one mean."""
+        try:
+            choice = self._pick("integrator")
+        except routing.NoModelAvailable as e:
+            raise Halt("needs_human", "merge conflict in %s and no integrator: %s"
+                       % (sub["id"], e))
+        self.log("  integrator: %s" % choice.model)
+        self._close(self._invoke(
+            "integrator", choice, cwd=cwd, subtask=sub,
+            extra="A merge conflict is in the working tree. Resolve it, then "
+                  "`git add -A && git commit`. Conflict output:\n\n%s"
+                  % conflict_text[-2000:]))
+        left = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U"],
+                              cwd=cwd, capture_output=True, text=True).stdout.strip()
+        if left:
+            raise Halt("needs_human", "conflict still unresolved in: %s" % left)
 
     def _checkpoint(self, cwd, message):
         """Commit the worktree state. Agents are told to checkpoint, but the

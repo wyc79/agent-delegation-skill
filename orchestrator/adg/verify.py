@@ -133,3 +133,26 @@ def scope_violations(files, allowed_globs, case_insensitive=None):
                    for g in globs):
             out.append(f)
     return out
+
+
+def scopes_overlap(a, b):
+    """Do two write scopes touch the same files? Glob-vs-glob, so it is
+    approximate -- deliberately erring toward "yes", because a false overlap
+    costs wall clock and a missed one costs an unmergeable conflict."""
+    import fnmatch
+    import sys
+    ci = sys.platform.startswith(("win", "darwin"))
+    def norm(g):
+        g = g.lower() if ci else g
+        return g.rstrip("/*")
+    for x in a or []:
+        for y in b or []:
+            nx, ny = norm(x), norm(y)
+            if not nx or not ny:
+                return True
+            if nx == ny or nx.startswith(ny + "/") or ny.startswith(nx + "/"):
+                return True
+            if fnmatch.fnmatch(nx, y.lower() if ci else y) or \
+               fnmatch.fnmatch(ny, x.lower() if ci else x):
+                return True
+    return False

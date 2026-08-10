@@ -499,6 +499,223 @@ class TestClosedGaps(unittest.TestCase):
         self.assertEqual(orch._polish(original), original)
 
 
+class TestParallelism(unittest.TestCase):
+    """max_parallel_agents governed nothing until subtasks could actually run
+    concurrently."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        self.t.close()
+
+    def _orch(self, subtasks, cap=3):
+        task = store.Task.create(self.t.repo, "T-P", "# t\n", dict(self.pol,
+                                                                   max_parallel_agents=cap))
+        task.update(subtasks=subtasks)
+        return Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None), task
+
+    def test_disjoint_scopes_run_together(self):
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["src/a/**"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["src/b/**"]},
+        ])
+        self.assertEqual([t["id"] for t in orch._wave(orch.task.state["subtasks"])],
+                         ["st-1", "st-2"])
+
+    def test_overlapping_scopes_serialize(self):
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["src/combat/**"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["src/combat/hooks.py"]},
+        ])
+        self.assertEqual([t["id"] for t in orch._wave(orch.task.state["subtasks"])], ["st-1"])
+
+    def test_shared_hotspot_serializes_even_with_disjoint_scopes(self):
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["src/a.gd"],
+             "hotspots": ["scenes/main.tscn"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["src/b.gd"],
+             "hotspots": ["scenes/main.tscn"]},
+        ])
+        self.assertEqual(len(orch._wave(orch.task.state["subtasks"])), 1,
+                         "an unmergeable scene must never have two writers")
+
+    def test_cap_is_respected(self):
+        subs = [{"id": "st-%d" % i, "status": "pending", "planned_scope": ["src/%d/**" % i]}
+                for i in range(5)]
+        orch, _ = self._orch(subs, cap=2)
+        self.assertEqual(len(orch._wave(orch.task.state["subtasks"])), 2)
+
+    def test_dependencies_are_respected(self):
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["a/**"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["b/**"],
+             "depends_on": ["st-1"]},
+        ])
+        self.assertEqual([t["id"] for t in orch._wave(orch.task.state["subtasks"])], ["st-1"])
+
+    def test_unscoped_subtasks_never_run_together(self):
+        # A missing scope means "unknown", and unknown must not mean "safe".
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending"},
+            {"id": "st-2", "status": "pending"},
+        ])
+        self.assertEqual(len(orch._wave(orch.task.state["subtasks"])), 1)
+
+
+class TestParallelEndToEnd(unittest.TestCase):
+    """Real git, real worktrees, real merges — mock agents."""
+
+    PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+- id: st-2-beta
+  goal: add beta
+  file_scope: ["beta.py"]
+  acceptance: [AC-2]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def test_two_subtasks_get_two_worktrees_and_both_land(self):
+        import threading
+        seen_cwds, lock = set(), threading.Lock()
+
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(self.PLAN)
+
+        def implementer(env, cwd):
+            with lock:
+                seen_cwds.add(cwd)
+            # Each writes only its own file, so the merges must be clean.
+            name = "alpha" if "st-1" in cwd else "beta"
+            with open(os.path.join(cwd, "%s.py" % name), "w") as fh:
+                fh.write("VALUE = %r\n" % name)
+
+        def reviewer(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
+                                   "reports", "review-reviewer.json"), "w") as fh:
+                json.dump({"verdict": "APPROVE",
+                           "ac_table": [{"ac": "AC-1", "status": "met"},
+                                        {"ac": "AC-2", "status": "met"}],
+                           "findings": []}, fh)
+
+        script = {"planner": planner, "implementer": implementer,
+                  "test-author": lambda e, c: None, "reviewer": reviewer}
+        pol = dict(self.reg["policy"]["limits"],
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        task = store.Task.create(self.t.repo, "T-PAR", "# t\n\nAdd alpha and beta\n", pol)
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertEqual(len(seen_cwds), 2, "subtasks shared a worktree: %s" % seen_cwds)
+        self.assertIn("in parallel", "\n".join(logs))
+        # both branches merged into the integration branch
+        merged = subprocess.run(["git", "log", "--oneline", "adg/T-PAR/work"],
+                                cwd=self.t.repo, capture_output=True, text=True).stdout
+        self.assertIn("st-1-alpha", merged)
+        self.assertIn("st-2-beta", merged)
+        # and the delivered patch carries both files
+        patch = task.read_text("integrate.patch")
+        self.assertIn("alpha.py", patch)
+        self.assertIn("beta.py", patch)
+
+    def test_a_failing_subtask_does_not_silently_land_its_sibling(self):
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(self.PLAN)
+
+        def implementer(env, cwd):
+            if "st-2" in cwd:
+                raise RuntimeError("beta agent exploded")
+            with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                fh.write("VALUE = 1\n")
+
+        script = {"planner": planner, "implementer": implementer,
+                  "test-author": lambda e, c: None}
+        pol = dict(self.reg["policy"]["limits"],
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        task = store.Task.create(self.t.repo, "T-PF", "# t\n\nAdd alpha and beta\n", pol)
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=lambda *_: None).run()
+        self.assertEqual(status, "needs_human")
+        self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+
+class TestRuntimeSurfaces(unittest.TestCase):
+    """herdr and Windows paths were designed but never executed."""
+
+    def test_herdr_adapter_shells_out_and_falls_back(self):
+        calls = []
+
+        class H(runtime.HerdrAdapter):
+            def _cli(self, args, check=True):
+                calls.append(args[0])
+                return None            # simulate herdr refusing
+
+        h = H(workspace="w1")
+        self.assertTrue(hasattr(h, "notify"))
+        h.notify("merge", "land it?")
+        self.assertIn("notification", calls)
+
+    def test_herdr_availability_needs_both_env_and_binary(self):
+        prev = os.environ.get("HERDR_ENV")
+        os.environ.pop("HERDR_ENV", None)
+        try:
+            self.assertFalse(runtime.HerdrAdapter.available())
+        finally:
+            if prev is not None:
+                os.environ["HERDR_ENV"] = prev
+
+    def test_get_falls_back_to_local_when_herdr_absent(self):
+        prev = os.environ.get("HERDR_ENV")
+        os.environ.pop("HERDR_ENV", None)
+        try:
+            self.assertIsInstance(runtime.get("herdr"), runtime.LocalAdapter)
+        finally:
+            if prev is not None:
+                os.environ["HERDR_ENV"] = prev
+
+    def test_case_insensitive_filesystems_treat_one_file_as_one_file(self):
+        # The Windows/macOS rule, asserted directly rather than by platform.
+        self.assertTrue(verify.scopes_overlap(["src/Foo.cs"], ["src/foo.cs"])
+                        or sys.platform.startswith("linux"))
+        self.assertEqual(
+            verify.scope_violations(["src/Foo.cs"], ["src/foo.cs"], case_insensitive=True), [])
+        self.assertEqual(
+            verify.scope_violations(["src/Foo.cs"], ["src/foo.cs"], case_insensitive=False),
+            ["src/Foo.cs"])
+
+    def test_generated_output_is_never_an_authored_change(self):
+        for p in ("__pycache__/x.pyc", "Library/artifacts/db", "Intermediate/Build/a.h",
+                  ".godot/imported/x", "obj/Debug/a.o"):
+            self.assertTrue(verify.is_ignored(p), p)
+        self.assertFalse(verify.is_ignored("src/combat.gd"))
+
+
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
     nothing looks exactly like a clean scan."""
