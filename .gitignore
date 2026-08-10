@@ -34,3 +34,6 @@ npm-debug.log*
 # Orchestration state lives outside the repository entirely, in
 # $XDG_STATE_HOME/agent-delegation/ — see DESIGN.md §4.0. Nothing about a run
 # is written into the working tree, so there is nothing to ignore.
+
+# Orchestrator worktrees (created as siblings of the repo, but just in case)
+.adg-worktrees/

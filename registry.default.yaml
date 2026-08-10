@@ -192,3 +192,8 @@ policy:
     edit_churn_rewrites: 4
     scope_overrun_extra_files: 5
   mode: attended                      # attended | autonomous  (DESIGN.md §9.2)
+  # auto: independent LLM review for complex work; deterministic checks alone
+  # for simple work. A simple task still gets reviewed if a check fails or a
+  # file was touched outside its declared scope -- both mean something happened
+  # that no automated check can judge. always | never force it.
+  review: auto

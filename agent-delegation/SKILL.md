@@ -86,6 +86,7 @@ Read these **only when the condition applies** — not preemptively:
 | You share files with another running agent, or hit a merge conflict | `references/parallelism.md` |
 | The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |
 | A tool or engine forces you to write a file inside the repo | `references/scratch-files.md` |
+| You are about to write code, or `task.json` lists `companions` | `references/companions.md` |
 | You are about to write an artifact and want the exact fields | `schemas/`, `templates/` |
 
 ## Step 4 — Report before you exit
