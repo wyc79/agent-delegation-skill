@@ -886,9 +886,14 @@ class TestWaveRaces(unittest.TestCase):
         # A parallel test has to build its own concurrency. The shipped registry
         # ships max_parallel_agents: 1 until the wave race is closed, so
         # inheriting it turns every race test into a sequential run that passes.
+        #
+        # 3, not 2, and it matters: this class plans three independent subtasks,
+        # so a cap of 2 runs them two-then-one and never opens the three-way
+        # window the Known defect was measured in. The number here is the width
+        # of the race this class exists to hunt.
         self.pol = dict(self.reg["policy"]["limits"],
                         escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
-                        max_parallel_agents=2)
+                        max_parallel_agents=3)
 
     def tearDown(self):
         subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
