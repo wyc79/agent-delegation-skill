@@ -388,6 +388,418 @@ class TestChannelAvailability(unittest.TestCase):
         self.assertIn("needs", str(cm.exception), "error should name the missing CLI")
 
 
+class TestClosedGaps(unittest.TestCase):
+    """Each of these covers a limit or role that was declared but inert."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        self.t.close()
+
+    # --- cost ------------------------------------------------------------
+    def test_cli_cost_is_recorded_so_the_cap_can_bind(self):
+        from adg import runtime as rt
+        res = rt._result(json.dumps({"result": "done", "total_cost_usd": 0.42}), "", 0)
+        self.assertEqual(res["cost_usd"], 0.42)
+        self.assertEqual(res["output"], "done")
+
+    def test_missing_cost_is_unknown_not_zero(self):
+        from adg import runtime as rt
+        self.assertIsNone(rt._result("plain text", "", 0)["cost_usd"])
+
+    def test_spend_accumulates_and_then_parks_the_run(self):
+        task = store.Task.create(self.t.repo, "T-C1", "# t\n", dict(self.pol, max_cost_usd=0.5))
+
+        class Pricey(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                r = runtime.MockAdapter.prompt(self, session, text, timeout)
+                r["cost_usd"] = 0.6
+                if session.handle["role"] == "classifier":
+                    r["output"] = "VERDICT: SIMPLE -- tiny"
+                return r
+
+        script = {"implementer": lambda env, cwd: None}
+        status = Orchestrator(task, self.reg, Pricey(script), lambda k, t: True,
+                              log=lambda *_: None).run()
+        self.assertEqual(status, "needs_human", "an exhausted budget kept running")
+        self.assertGreater(task.state["spent"]["usd"], 0.0, "cost was never recorded")
+
+    # --- autonomous mode --------------------------------------------------
+    def test_autonomous_mode_pushes_and_never_merges(self):
+        src = os.path.join(self.t.dir, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", src], check=True)
+        sh(["git", "remote", "add", "origin", src], self.t.repo)
+        script, _ = TestEndToEnd._script(self)[0], None
+        task = store.Task.create(self.t.repo, "T-C2", "# t\n\nAdd subtract\n",
+                                 self.pol, mode="autonomous")
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                            lambda k, t: True, log=lambda *_: None)
+        orch.run()
+        branches = subprocess.run(["git", "branch", "-a"], cwd=src,
+                                  capture_output=True, text=True).stdout
+        self.assertIn("adg/T-C2/work", branches, "autonomous mode did not push")
+        head = subprocess.run(["git", "log", "--oneline", "main"], cwd=self.t.repo,
+                              capture_output=True, text=True).stdout
+        self.assertEqual(len(head.strip().splitlines()), 1, "it merged to main")
+
+    # --- test author ------------------------------------------------------
+    def test_simple_tasks_do_not_pay_for_a_test_author(self):
+        task = store.Task.create(self.t.repo, "T-C3", "# t\n\nAdd subtract\n", self.pol)
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "classifier":
+                    return {"settled": "idle", "output": "VERDICT: SIMPLE -- tiny", "code": 0}
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        a = A({"implementer": lambda env, cwd: None})
+        Orchestrator(task, self.reg, a, lambda k, t: True, log=lambda *_: None).run()
+        self.assertNotIn("test-author", [h["role"] for h in task.state["delegation_history"]])
+
+    def test_test_author_is_told_not_to_read_the_implementation(self):
+        seen = {}
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "test-author":
+                    seen["prompt"] = text
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        script, _ = self._e2e_script()
+        task = store.Task.create(self.t.repo, "T-C4", "# t\n\nAdd subtract API\n", self.pol)
+        Orchestrator(task, self.reg, A(script), lambda k, t: True, log=lambda *_: None).run()
+        self.assertIn("do not read any implementation", seen.get("prompt", "").lower())
+
+    def _e2e_script(self):
+        return TestEndToEnd._script(self)
+
+    # --- reporter ---------------------------------------------------------
+    def test_polished_brief_replaces_the_template(self):
+        task = store.Task.create(self.t.repo, "T-C5", "# t\n", self.pol)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        orch._polish = lambda t: "# Plain\n\n" + ("A readable sentence. " * 8)
+        text, problems = brief.write(task, "merge", "Land it?", polish=orch._polish)
+        self.assertIn("A readable sentence", text)
+        self.assertEqual(problems, [])
+
+    def test_jargon_or_empty_rewrite_falls_back_to_the_template(self):
+        task = store.Task.create(self.t.repo, "T-C6", "# t\n", self.pol)
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                return {"settled": "idle", "output": "AC-2 failed at rung 2", "code": 0}
+
+        orch = Orchestrator(task, self.reg, A(), lambda k, t: True, log=lambda *_: None)
+        original = "# Brief\n\nsomething the human can act on, at length. " * 3
+        self.assertEqual(orch._polish(original), original)
+
+
+class TestParallelism(unittest.TestCase):
+    """max_parallel_agents governed nothing until subtasks could actually run
+    concurrently."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        self.t.close()
+
+    def _orch(self, subtasks, cap=3):
+        task = store.Task.create(self.t.repo, "T-P", "# t\n", dict(self.pol,
+                                                                   max_parallel_agents=cap))
+        task.update(subtasks=subtasks)
+        return Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None), task
+
+    def test_disjoint_scopes_run_together(self):
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["src/a/**"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["src/b/**"]},
+        ])
+        self.assertEqual([t["id"] for t in orch._wave(orch.task.state["subtasks"])],
+                         ["st-1", "st-2"])
+
+    def test_overlapping_scopes_serialize(self):
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["src/combat/**"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["src/combat/hooks.py"]},
+        ])
+        self.assertEqual([t["id"] for t in orch._wave(orch.task.state["subtasks"])], ["st-1"])
+
+    def test_shared_hotspot_serializes_even_with_disjoint_scopes(self):
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["src/a.gd"],
+             "hotspots": ["scenes/main.tscn"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["src/b.gd"],
+             "hotspots": ["scenes/main.tscn"]},
+        ])
+        self.assertEqual(len(orch._wave(orch.task.state["subtasks"])), 1,
+                         "an unmergeable scene must never have two writers")
+
+    def test_cap_is_respected(self):
+        subs = [{"id": "st-%d" % i, "status": "pending", "planned_scope": ["src/%d/**" % i]}
+                for i in range(5)]
+        orch, _ = self._orch(subs, cap=2)
+        self.assertEqual(len(orch._wave(orch.task.state["subtasks"])), 2)
+
+    def test_dependencies_are_respected(self):
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["a/**"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["b/**"],
+             "depends_on": ["st-1"]},
+        ])
+        self.assertEqual([t["id"] for t in orch._wave(orch.task.state["subtasks"])], ["st-1"])
+
+    def test_unscoped_subtasks_never_run_together(self):
+        # A missing scope means "unknown", and unknown must not mean "safe".
+        orch, _ = self._orch([
+            {"id": "st-1", "status": "pending"},
+            {"id": "st-2", "status": "pending"},
+        ])
+        self.assertEqual(len(orch._wave(orch.task.state["subtasks"])), 1)
+
+
+class TestParallelEndToEnd(unittest.TestCase):
+    """Real git, real worktrees, real merges — mock agents."""
+
+    PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+- id: st-2-beta
+  goal: add beta
+  file_scope: ["beta.py"]
+  acceptance: [AC-2]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def test_two_subtasks_get_two_worktrees_and_both_land(self):
+        import threading
+        seen_cwds, lock = set(), threading.Lock()
+
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(self.PLAN)
+
+        def implementer(env, cwd):
+            with lock:
+                seen_cwds.add(cwd)
+            # Each writes only its own file, so the merges must be clean.
+            name = "alpha" if "st-1" in cwd else "beta"
+            with open(os.path.join(cwd, "%s.py" % name), "w") as fh:
+                fh.write("VALUE = %r\n" % name)
+
+        def reviewer(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
+                                   "reports", "review-reviewer.json"), "w") as fh:
+                json.dump({"verdict": "APPROVE",
+                           "ac_table": [{"ac": "AC-1", "status": "met"},
+                                        {"ac": "AC-2", "status": "met"}],
+                           "findings": []}, fh)
+
+        script = {"planner": planner, "implementer": implementer,
+                  "test-author": lambda e, c: None, "reviewer": reviewer}
+        pol = dict(self.reg["policy"]["limits"],
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        task = store.Task.create(self.t.repo, "T-PAR", "# t\n\nAdd alpha and beta\n", pol)
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertEqual(len(seen_cwds), 2, "subtasks shared a worktree: %s" % seen_cwds)
+        self.assertIn("in parallel", "\n".join(logs))
+        # both branches merged into the integration branch
+        merged = subprocess.run(["git", "log", "--oneline", "adg/T-PAR/work"],
+                                cwd=self.t.repo, capture_output=True, text=True).stdout
+        self.assertIn("st-1-alpha", merged)
+        self.assertIn("st-2-beta", merged)
+        # and the delivered patch carries both files
+        patch = task.read_text("integrate.patch")
+        self.assertIn("alpha.py", patch)
+        self.assertIn("beta.py", patch)
+
+    def test_a_failing_subtask_does_not_silently_land_its_sibling(self):
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(self.PLAN)
+
+        def implementer(env, cwd):
+            if "st-2" in cwd:
+                raise RuntimeError("beta agent exploded")
+            with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                fh.write("VALUE = 1\n")
+
+        script = {"planner": planner, "implementer": implementer,
+                  "test-author": lambda e, c: None}
+        pol = dict(self.reg["policy"]["limits"],
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        task = store.Task.create(self.t.repo, "T-PF", "# t\n\nAdd alpha and beta\n", pol)
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=lambda *_: None).run()
+        self.assertEqual(status, "needs_human")
+        self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+
+class TestRuntimeSurfaces(unittest.TestCase):
+    """herdr and Windows paths were designed but never executed."""
+
+    def test_herdr_adapter_shells_out_and_falls_back(self):
+        calls = []
+
+        class H(runtime.HerdrAdapter):
+            def _cli(self, args, check=True):
+                calls.append(args[0])
+                return None            # simulate herdr refusing
+
+        h = H(workspace="w1")
+        self.assertTrue(hasattr(h, "notify"))
+        h.notify("merge", "land it?")
+        self.assertIn("notification", calls)
+
+    def test_herdr_availability_needs_both_env_and_binary(self):
+        prev = os.environ.get("HERDR_ENV")
+        os.environ.pop("HERDR_ENV", None)
+        try:
+            self.assertFalse(runtime.HerdrAdapter.available())
+        finally:
+            if prev is not None:
+                os.environ["HERDR_ENV"] = prev
+
+    def test_get_falls_back_to_local_when_herdr_absent(self):
+        prev = os.environ.get("HERDR_ENV")
+        os.environ.pop("HERDR_ENV", None)
+        try:
+            self.assertIsInstance(runtime.get("herdr"), runtime.LocalAdapter)
+        finally:
+            if prev is not None:
+                os.environ["HERDR_ENV"] = prev
+
+    def test_case_insensitive_filesystems_treat_one_file_as_one_file(self):
+        # The Windows/macOS rule, asserted directly rather than by platform.
+        self.assertTrue(verify.scopes_overlap(["src/Foo.cs"], ["src/foo.cs"])
+                        or sys.platform.startswith("linux"))
+        self.assertEqual(
+            verify.scope_violations(["src/Foo.cs"], ["src/foo.cs"], case_insensitive=True), [])
+        self.assertEqual(
+            verify.scope_violations(["src/Foo.cs"], ["src/foo.cs"], case_insensitive=False),
+            ["src/Foo.cs"])
+
+    def test_generated_output_is_never_an_authored_change(self):
+        for p in ("__pycache__/x.pyc", "Library/artifacts/db", "Intermediate/Build/a.h",
+                  ".godot/imported/x", "obj/Debug/a.o"):
+            self.assertTrue(verify.is_ignored(p), p)
+        self.assertFalse(verify.is_ignored("src/combat.gd"))
+
+
+class TestLiveRunRegressions(unittest.TestCase):
+    """Three bugs a live run found that no scripted test had reached."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        # checks that are green before anything is implemented
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _simple(self, script):
+        task = store.Task.create(self.t.repo, "T-R", "# t\n\nAdd a thing\n", self.pol)
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "classifier":
+                    return {"settled": "idle", "output": "VERDICT: SIMPLE -- tiny", "code": 0}
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        logs = []
+        status = Orchestrator(task, self.reg, A(script), lambda k, t: True,
+                              log=logs.append).run()
+        return status, task, logs
+
+    def test_an_agent_that_writes_nothing_is_not_a_success(self):
+        # The fast checks were green before the agent ran, so passing them
+        # proves nothing about whether it did the work.
+        def wrote_nothing(env, cwd):
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "status": "complete",
+                "summary": "all good", "evidence": {"tests": "green"}})
+        status, task, logs = self._simple({"implementer": wrote_nothing})
+        self.assertEqual(status, "needs_human", "\n".join(logs))
+        self.assertIn("changed no files", "\n".join(logs))
+
+    def test_an_agents_own_escalate_outranks_green_checks(self):
+        # The live failure: the agent said "no code written", the orchestrator
+        # saw green tests and marked the subtask complete.
+        def honest(env, cwd):
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "status": "escalate",
+                "summary": "No code written — wrong repository in the worktree.",
+                "evidence": {"tests": "green but irrelevant"}})
+        status, task, logs = self._simple({"implementer": honest})
+        self.assertEqual(status, "needs_human")
+        self.assertIn("reported escalate", "\n".join(logs))
+
+    def test_worktrees_of_different_projects_do_not_collide(self):
+        # Two repos sharing a parent produced the same .adg-worktrees/T-001-work.
+        other = os.path.join(self.t.dir, "other")
+        os.makedirs(other)
+        sh(["git", "init", "-q", "-b", "main"], other)
+        sh(["git", "config", "user.email", "t@e.com"], other)
+        sh(["git", "config", "user.name", "T"], other)
+        open(os.path.join(other, "f.txt"), "w").close()
+        sh(["git", "add", "-A"], other)
+        sh(["git", "commit", "-qm", "i"], other)
+        self.assertNotEqual(store.project_key(self.t.repo), store.project_key(other))
+
+    def test_reusing_a_foreign_worktree_is_refused(self):
+        other = os.path.join(self.t.dir, "other")
+        os.makedirs(other)
+        sh(["git", "init", "-q", "-b", "main"], other)
+        sh(["git", "config", "user.email", "t@e.com"], other)
+        sh(["git", "config", "user.name", "T"], other)
+        open(os.path.join(other, "f.txt"), "w").close()
+        sh(["git", "add", "-A"], other)
+        sh(["git", "commit", "-qm", "i"], other)
+        stolen = os.path.join(self.t.dir, "wt-of-other")
+        sh(["git", "worktree", "add", "-q", "-b", "x", stolen], other)
+        a = runtime.LocalAdapter()
+        with self.assertRaises(runtime.RuntimeError_) as cm:
+            a.create_worktree(self.t.repo, "adg/T/work", "HEAD", stolen)
+        self.assertIn("different repository", str(cm.exception))
+
+
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
     nothing looks exactly like a clean scan."""
@@ -509,7 +921,7 @@ class TestEndToEnd(unittest.TestCase):
         state = task.state
         # every role actually ran, in order
         roles = [h["role"] for h in state["delegation_history"]]
-        self.assertEqual(roles, ["planner", "implementer", "reviewer"])
+        self.assertEqual(roles, ["planner", "test-author", "implementer", "reviewer"])
         # the plan produced a real subtask, completed, with files from git
         self.assertEqual(state["subtasks"][0]["status"], "complete")
         self.assertEqual(state["subtasks"][0]["actual_files"], ["app.py"])

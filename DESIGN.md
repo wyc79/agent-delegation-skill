@@ -216,7 +216,7 @@ stateDiagram-v2
 | DECOMPOSE | Complex only | strong (same session as PLAN) | Declares subtasks, file scopes, dependencies, parallel groups. |
 | TEST AUTHOR | Complex only, skippable when tests exist | cheap–medium | Writes/extends tests from `task.md` + `plan.md`, deliberately blind to implementation diffs. |
 | IMPLEMENT | Always | cheap–medium coding model | One agent per subtask. TDD locally; verify runner after each iteration. |
-| VERIFY (deterministic) | Always, every iteration | none | Build, tests, lint, engine headless checks. Free-ish and non-negotiable. |
+| VERIFY (deterministic) | Always, every iteration | none | Build, tests, lint, engine headless checks. Free-ish and non-negotiable. code-winnow's scanner joins these when installed (§4.7) — stdlib, sub-second, no model call. |
 | REVIEW | Complex: always. Simple: lightweight tier | **strong reasoning** | Compares requirements → plan → diff → test evidence. See §8. |
 | INTEGRATE | Always | none; Integrator agent only on conflict | Topological merge of worktrees, verify after each merge. |
 
@@ -744,6 +744,27 @@ filesystem access when the repo lives on the Windows side (keep it inside the
 WSL filesystem if you go that route).
 
 Agent-facing version of the path rules: `references/task-dir.md`.
+
+### 4.7 Companion skills
+
+Three optional tools, each attached at the one place it belongs. All degrade to
+"not installed", reported rather than omitted (D11).
+
+| Companion | Attaches at | Called by | Why there |
+|---|---|---|---|
+| [code-winnow](https://github.com/wyc79/code-winnow-skill) `scripts/scan.py` | Verify | **Orchestrator**, as a subprocess | Stdlib, ~0.2s, no model call — a deterministic check in the sense of D5, not an exception to it. Its five-judge review pipeline is a different and far costlier thing, and is not called. |
+| `andrej-karpathy-skills:karpathy-guidelines` | Before writing code | Implementer, Integrator | Its "surgical changes" section is the `file_scope` rule from the other direction; "simplicity first" is what the reviewer measures the diff against. |
+| `superpowers:systematic-debugging` | Second failed attempt | Implementer | By the third attempt the ladder is already escalating. It does not buy a fourth. |
+
+Two rules hold for all of them. **Findings are advisory**: authority is
+`task.md`, the plan, and the deterministic checks, in that order — a style
+judgement that could block a merge would reintroduce the taste loop the reviewer
+rules exist to prevent. And **they are referenced, never vendored**: a stale copy
+that reports nothing looks exactly like a clean result.
+
+Availability is detected once by the orchestrator and written to `task.json`, so
+agents never hunt the filesystem. The agent-facing version is
+`agent-delegation/references/companions.md`.
 
 ### 4.5 The in-repo escape hatch
 
@@ -1704,10 +1725,11 @@ config files:
     Containers deferred — acceptable for a trusted-repo, single-user MVP; **not**
     acceptable the day untrusted repos or unattended operation arrive.
 
-Deliberately deferred: parallelism/worktree-per-subtask, Integrator role,
-independent Test Author, circuit breakers (manual registry edit suffices),
-telemetry-driven recalibration, async approval transports, engine adapters beyond
-"run this shell command."
+Deferred at first, since built (see `orchestrator/`): parallelism with a worktree
+per subtask, the Integrator on merge conflicts, and the independent Test Author.
+Still deferred: circuit breakers (a manual registry edit suffices),
+telemetry-driven recalibration, async approval transports, and engine adapters
+beyond "run this shell command."
 
 ### 15.1 Milestone 1 — prove one complete workflow
 

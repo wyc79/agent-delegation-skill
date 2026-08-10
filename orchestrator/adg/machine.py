@@ -11,6 +11,7 @@ Author are deliberately deferred (§15).
 
 import os
 import re
+import subprocess
 import time
 
 from . import brief, companions, limits as lim, prompts, router as routing, schema, verify, winnow, yamlite
@@ -67,6 +68,8 @@ class Orchestrator:
         self.dry_run = dry_run
         self.budget = lim.Budget(task)
         self._last_failure = None
+        self._last_report = None
+        self._last_report = None
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
 
@@ -155,6 +158,8 @@ class Orchestrator:
             res = self.adapter.prompt(session, prompt, timeout=180)
         finally:
             self.adapter.teardown(session)
+        if res.get("cost_usd"):
+            self.budget.spend(res["cost_usd"])
         out = (res.get("output") or "")
         m = re.search(r"VERDICT:\s*(SIMPLE|COMPLEX)\s*-*\s*(.*)", out, re.I)
         if not m:
@@ -192,10 +197,37 @@ class Orchestrator:
             raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
         self.task.update(subtasks=[dict(s, status="pending", actual_files=[]) for s in subtasks])
         self.log("plan: %d subtask(s)" % len(subtasks))
+        self._author_tests(subtasks)
         if self.budget.requires_approval("plan"):
             self._gate("plan", "Approve this plan? It splits the work into %d step(s)."
                        % len(subtasks))
         self.task.update(status="implement")
+
+    def _author_tests(self, subtasks):
+        """Write tests from the requirements, before any implementation exists.
+        An implementer's own tests confirm what it built; these confirm what was
+        asked, which is the only way a missing requirement shows up (D7)."""
+        if (self.vcfg.get("test_author") or "auto") == "never":
+            return
+        try:
+            choice = self._pick("test-author")
+        except routing.NoModelAvailable as e:
+            self.log("tests: skipped — %s" % e)
+            return
+        base = self._ensure_worktree()
+        self.log("tests: %s via %s" % (choice.model, choice.channel))
+        self._close(self._invoke(
+            "test-author", choice, cwd=base,
+            extra="Write failing tests for the acceptance criteria in task.md now. "
+                  "Do not implement the feature and do not read any implementation. "
+                  "Run them and capture the failure output as evidence."))
+        # Red is the expected state here, so a failing run is not a problem --
+        # but a *passing* one means the tests do not test the new requirement.
+        result = verify.run(self.task, self.repo, base, "fast")
+        if result.ok and result.steps:
+            self.log("  warning: new tests pass before implementation — "
+                     "they may not test the requirement")
+        self._checkpoint(base, "adg %s: tests from requirements" % self.task.state["id"])
 
     def _read_plan_subtasks(self):
         """Parse the fenced YAML block the planner wrote. A plan we cannot
@@ -221,6 +253,30 @@ class Orchestrator:
                 return out
         return []
 
+    def _ready(self, subtasks):
+        """Subtasks whose dependencies are done. Ordering only -- safety is the
+        scope check below."""
+        done = {t["id"] for t in subtasks if t.get("status") == "complete"}
+        return [t for t in subtasks if t.get("status") != "complete"
+                and all(d in done for d in (t.get("depends_on") or []))]
+
+    def _wave(self, subtasks):
+        """The largest set of ready subtasks that may run at once. Two rules,
+        both pessimistic on purpose: no two may write the same scope, and no two
+        may touch the same hotspot. A wrong parallel decision costs a conflict
+        nobody can merge; a wrong serial one costs wall clock."""
+        cap = int(self.budget.limits["max_parallel_agents"])
+        wave, claimed = [], []
+        for t in self._ready(subtasks):
+            scope = list(t.get("planned_scope") or ["**"]) + list(t.get("hotspots") or [])
+            if any(verify.scopes_overlap(scope, other) for other in claimed):
+                continue
+            wave.append(t)
+            claimed.append(scope)
+            if len(wave) >= cap:
+                break
+        return wave or self._ready(subtasks)[:1]
+
     def _stage_implement(self):
         state = self.task.state
         if not state.get("subtasks"):
@@ -237,10 +293,18 @@ class Orchestrator:
         if not pending:
             self.task.update(status="review")
             return
-        sub = pending[0]
-        base = self._ensure_worktree()
+        wave = self._wave(state["subtasks"])
+        if len(wave) > 1:
+            self.log("implement: %d subtasks in parallel (%s)"
+                     % (len(wave), ", ".join(t["id"] for t in wave)))
+            self._run_wave(wave)
+            return
+        sub = wave[0]
+        self._one_subtask(sub, self._ensure_worktree())
+
+    def _one_subtask(self, sub, base):
         role_choice = self._pick("implementer")
-        attempts, session = 0, None
+        attempts, session, report = 0, None, None
         while True:
             self.budget.check_attempt(sub["id"])
             self.budget.check_cost(0.0)
@@ -250,9 +314,19 @@ class Orchestrator:
             session = self._invoke("implementer", role_choice, cwd=base, subtask=sub,
                                    session=session, failure=self._last_failure,
                                    extra=self._findings_brief(sub))
+            report = self._last_report
             self.budget.used_attempt(sub["id"])
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
+            claimed = (report or {}).get("status")
+            if claimed in ("blocked", "escalate"):
+                raise Halt("needs_human", "%s reported %s: %s" % (
+                    sub["id"], claimed, (report or {}).get("summary", "")[:200]))
+            if result.ok and not self._touched(base):
+                raise Halt("needs_human",
+                           "%s changed no files, and the checks were already green "
+                           "before it ran — passing tests are not evidence of work"
+                           % sub["id"])
             if result.ok:
                 self._last_failure = None
                 self._close(session)
@@ -277,6 +351,81 @@ class Orchestrator:
                 self._close(session)
                 role_choice, attempts, session = stronger, 0, None
         self._finish_subtask(sub, base)
+
+    def _run_wave(self, wave):
+        """Each subtask in its own worktree, concurrently, then merged in
+        dependency order. Threads are fine here: every agent is a subprocess."""
+        import threading
+        results = {}
+
+        def work(sub):
+            try:
+                results[sub["id"]] = self._one_subtask(sub, self._subtask_worktree(sub))
+            except Exception as e:  # a failed branch must not kill its siblings
+                results[sub["id"]] = e
+
+        threads = [threading.Thread(target=work, args=(t,)) for t in wave]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for sub in wave:
+            outcome = results.get(sub["id"])
+            if isinstance(outcome, Exception):
+                raise Halt("needs_human", "%s failed: %s" % (sub["id"], outcome))
+        self._integrate_wave(wave)
+
+    def _subtask_worktree(self, sub):
+        state = self.task.state
+        branch = "adg/%s/%s" % (state["id"], sub["id"])
+        path = os.path.join(os.path.dirname(os.path.abspath(self.repo)),
+                            ".adg-worktrees", state["project_key"],
+                            "%s-%s" % (state["id"], sub["id"]))
+        self.adapter.create_worktree(self.repo, branch,
+                                     state["repo"].get("base_commit", "HEAD"), path)
+        return path
+
+    def _integrate_wave(self, wave):
+        """Merge each green branch into the task branch, verifying after each --
+        so the integration branch is always green and every merge is tested
+        against everything already landed."""
+        integration = self._ensure_worktree()
+        for sub in wave:
+            branch = "adg/%s/%s" % (self.task.state["id"], sub["id"])
+            merge = subprocess.run(["git", "merge", "--no-edit", branch],
+                                   cwd=integration, capture_output=True, text=True)
+            if merge.returncode != 0:
+                self.log("  conflict merging %s" % sub["id"])
+                self._reconcile(sub, integration, merge.stdout + merge.stderr)
+            result = verify.run(self.task, self.repo, integration, "fast")
+            if not result.ok:
+                raise Halt("needs_human",
+                           "%s broke the integration branch once merged" % sub["id"])
+
+    def _reconcile(self, sub, cwd, conflict_text):
+        """A conflict two agents produced is judgement, not mechanism: which
+        side matches the plan, and what did the other one mean."""
+        try:
+            choice = self._pick("integrator")
+        except routing.NoModelAvailable as e:
+            raise Halt("needs_human", "merge conflict in %s and no integrator: %s"
+                       % (sub["id"], e))
+        self.log("  integrator: %s" % choice.model)
+        self._close(self._invoke(
+            "integrator", choice, cwd=cwd, subtask=sub,
+            extra="A merge conflict is in the working tree. Resolve it, then "
+                  "`git add -A && git commit`. Conflict output:\n\n%s"
+                  % conflict_text[-2000:]))
+        left = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U"],
+                              cwd=cwd, capture_output=True, text=True).stdout.strip()
+        if left:
+            raise Halt("needs_human", "conflict still unresolved in: %s" % left)
+
+    def _touched(self, cwd):
+        """Did anything actually change in this worktree?"""
+        return bool(verify.changed_files(
+            self.repo, cwd, self.task.state["repo"].get("base_commit", "HEAD"),
+            ignore=self.vcfg.get("ignore")))
 
     def _checkpoint(self, cwd, message):
         """Commit the worktree state. Agents are told to checkpoint, but the
@@ -473,7 +622,8 @@ class Orchestrator:
             self.task, "merge",
             "Land this change? It is complete and its checks pass. In attended mode "
             "the diff is applied to your working tree, uncommitted, for you to commit.",
-            files=files, verify=result, extra="## Review\n\n" + note)
+            files=files, verify=result, extra="## Review\n\n" + note,
+            polish=self._polish)
         for p in problems:
             self.log("  brief lint: %s" % p)
         if self.budget.requires_approval("merge"):
@@ -503,7 +653,39 @@ class Orchestrator:
             self.log("integrate: patch ready at %s" % patch)
             self.log("           apply with: git apply %s" % patch)
         else:
-            self.log("integrate: branch %s is ready to push and open a PR" % branch)
+            self._push_and_open_pr(branch)
+
+    def _push_and_open_pr(self, branch):
+        """Autonomous mode ends at an opened PR. There is deliberately no merge
+        path here (§9.2) -- the credential may even be branch-restricted."""
+        import shutil as _shutil
+        push = subprocess.run(["git", "push", "-u", "origin", branch],
+                              cwd=self.repo, capture_output=True, text=True)
+        if push.returncode != 0:
+            raise Halt("needs_human", "could not push %s: %s"
+                       % (branch, push.stderr.strip()[:200]))
+        self.log("integrate: pushed %s" % branch)
+        if _shutil.which("gh") is None:
+            self.log("           gh not installed — open the PR yourself")
+            return
+        body = self.task.read_text("brief.md", "")
+        pr = subprocess.run(
+            ["gh", "pr", "create", "--head", branch, "--title",
+             "%s: %s" % (self.task.state["id"], self._title()), "--body", body],
+            cwd=self.repo, capture_output=True, text=True)
+        if pr.returncode != 0:
+            self.log("           gh pr create failed: %s" % pr.stderr.strip()[:200])
+            return
+        url = (pr.stdout or "").strip().splitlines()[-1:] or [""]
+        self.log("integrate: opened %s" % url[0])
+        self.task.update(pull_request=url[0])
+
+    def _title(self):
+        for line in self.task.read_text("task.md", "").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and not line.startswith(">"):
+                return line[:70]
+        return "delegated change"
 
     # ---------------------------------------------------------------- infra
     def _pick(self, role, boost=None):
@@ -526,7 +708,7 @@ class Orchestrator:
         base = git(["rev-parse", "HEAD"], self.repo)
         branch = "adg/%s/work" % state["id"]
         path = os.path.join(os.path.dirname(os.path.abspath(self.repo)),
-                            ".adg-worktrees", "%s-work" % state["id"])
+                            ".adg-worktrees", state["project_key"], "%s-work" % state["id"])
         self.log("worktree: %s (%s)" % (path, self.adapter.name))
         self.adapter.create_worktree(self.repo, branch, base, path)
         repo_info = dict(state["repo"], base_commit=base)
@@ -556,8 +738,11 @@ class Orchestrator:
             text = prompts.retry(failure)
             res = self.adapter.follow_up(session, text, timeout=3600)
         self._log_transcript(role, text, res)
+        if res.get("cost_usd"):
+            self.budget.spend(res["cost_usd"])
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
         report, problems = self._collect_report(role, subtask, since=started)
+        self._last_report = report
         if report is None:
             outcome = "blocked"
         self.task.record_delegation({
@@ -565,6 +750,7 @@ class Orchestrator:
             "subtask": subtask.get("id") if subtask else None,
             "model": choice.model, "channel": choice.channel,
             "adapter": self.adapter.name, "outcome": outcome,
+            "usd": res.get("cost_usd"),
             "report_problems": problems or None,
         })
         if outcome == "blocked" and res.get("settled") == "timeout":
@@ -612,9 +798,49 @@ class Orchestrator:
             return data, None
         return None, ["no fresh report written by %s" % role]
 
+    REPORT_PROMPT = """Rewrite the notes below as a short update for a competent
+programmer who has never seen this repository. Keep the markdown headings.
+
+Rules:
+- Lead with the decision they must make. Do not bury it.
+- Expand every internal id the first time you use it: write "the requirement
+  that old saves still load (AC-2)", never a bare "AC-2". Never use the words
+  rung, REPLAN, REQUEST_CHANGES, test_stuck or scope_overrun.
+- Say what each changed file is for. They do not know this codebase.
+- State plainly anything that was NOT verified.
+- No praise, no filler, no restating the task twice.
+
+--- NOTES ---
+%s
+"""
+
+    def _polish(self, text):
+        """Render the mechanical brief into plain language. Cheap, and the only
+        part of the run a human actually reads -- but a failed or jargon-laden
+        rewrite falls back to the template rather than replacing it."""
+        if self.dry_run:
+            return text
+        try:
+            choice = self._pick("reporter")
+        except routing.NoModelAvailable:
+            return text
+        session = self.adapter.start_agent("reporter", choice.agent_kind, self.repo,
+                                           prompts.env_for(self.task))
+        try:
+            res = self.adapter.prompt(session, self.REPORT_PROMPT % text, timeout=180)
+        finally:
+            self._close(session)
+        if res.get("cost_usd"):
+            self.budget.spend(res["cost_usd"])
+        out = (res.get("output") or "").strip()
+        if len(out) < 80 or brief.lint(out):
+            return text
+        return out
+
     def _gate(self, kind, question):
         files = sorted({f for s in self.task.state["subtasks"] for f in s.get("actual_files", [])})
-        text, problems = brief.write(self.task, kind, question, files=files)
+        text, problems = brief.write(self.task, kind, question, files=files,
+                                     polish=self._polish)
         for p in problems:
             self.log("  brief lint: %s" % p)
         if not self.gate(kind, text):

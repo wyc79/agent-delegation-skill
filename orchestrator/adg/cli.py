@@ -5,7 +5,9 @@ import os
 import sys
 import time
 
-from . import limits as lim, router as routing, runtime, store, verify
+import json
+
+from . import companions, limits as lim, router as routing, runtime, store, verify, winnow
 
 
 def _repo(path):
@@ -63,6 +65,25 @@ def cmd_init(args):
     unused = [m for m, s in reg["models"].items() if not s.get("enrolled_roles")]
     if unused:
         print("\npresent but deliberately not enrolled: %s" % ", ".join(unused))
+
+    installed = companions.detect()
+    print("\ncompanion skills: %s" % (", ".join(k for k, v in installed.items() if v)
+                                       or "none detected"))
+    print("chaff scanner  : %s" % (winnow.find(repo) or "not installed"))
+
+    dest = os.path.join(store.project_dir(repo), "config.json")
+    if os.path.exists(dest) and not args.force:
+        print("\nconfig already at %s (pass --force to rewrite)" % dest)
+        return
+    if not args.write:
+        print("\nnothing written. Re-run with --write to save this to\n  %s" % dest)
+        return
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as fh:
+        json.dump({"registry": os.path.abspath(args.registry) if args.registry else None,
+                   "companions": installed,
+                   "winnow_scan": winnow.find(repo)}, fh, indent=2)
+    print("\nwrote %s" % dest)
 
 
 def cmd_run(args):
@@ -153,6 +174,8 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     i = sub.add_parser("init", help="show detected setup and role assignments")
+    i.add_argument("--write", action="store_true", help="save the detected setup")
+    i.add_argument("--force", action="store_true", help="overwrite an existing config")
     i.set_defaults(func=cmd_init)
 
     r = sub.add_parser("run", help="run a new task")

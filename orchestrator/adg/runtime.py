@@ -22,6 +22,25 @@ class RuntimeError_(RuntimeError):
     pass
 
 
+def _result(stdout, stderr, code):
+    """Normalise a CLI run. Structured output carries the cost; plain text does
+    not, and a missing cost is reported as unknown rather than as zero."""
+    raw = (stdout or "") + (stderr or "")
+    text, cost = raw, None
+    try:
+        data = json.loads(stdout or "")
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        text = data.get("result") or data.get("output") or raw
+        for key in ("total_cost_usd", "cost_usd"):
+            if isinstance(data.get(key), (int, float)):
+                cost = float(data[key])
+                break
+    return {"settled": "idle" if code == 0 else "blocked",
+            "output": text, "code": code, "cost_usd": cost}
+
+
 class Session:
     def __init__(self, name, cwd, handle=None):
         self.name, self.cwd, self.handle = name, cwd, handle
@@ -77,8 +96,12 @@ class LocalAdapter(Adapter):
     # git credentials, so the isolation boundary is the worktree, not the
     # prompt (DESIGN.md §11). A mode that blocks running tests would make TDD
     # and self-verification impossible, which is worse than useless.
+    # --output-format json so the run reports what it cost. Without it
+    # max_cost_usd is a limit that can never bind, which is worse than no limit
+    # at all: it reads as protection.
     LAUNCH = {
-        "claude": ["claude", "-p", "--permission-mode", "bypassPermissions"],
+        "claude": ["claude", "-p", "--permission-mode", "bypassPermissions",
+                   "--output-format", "json"],
         "codex": ["codex", "exec", "--full-auto"],
         "cursor": ["cursor-agent", "-p", "--force"],
         "gemini": ["gemini", "-y", "-p"],
@@ -111,7 +134,17 @@ class LocalAdapter(Adapter):
         normal -- resuming must reattach to it, not refuse to start."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.isdir(os.path.join(path, ".git")) or os.path.isfile(os.path.join(path, ".git")):
-            return path
+            # Reuse only if it really is this repository's worktree. Handing an
+            # agent someone else's checkout is silent and catastrophic.
+            here = git(["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                       path, check=False)
+            mine = git(["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                       repo, check=False)
+            if here and mine and os.path.realpath(here) == os.path.realpath(mine):
+                return path
+            raise RuntimeError_(
+                "%s is a worktree of a different repository (%s, not %s)"
+                % (path, here or "unknown", mine))
         if os.path.exists(path) and os.listdir(path):
             raise RuntimeError_("worktree path exists and is not a worktree: %s" % path)
         git(["worktree", "prune"], repo, check=False)
@@ -155,8 +188,7 @@ class LocalAdapter(Adapter):
                                capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"settled": "timeout", "output": "", "code": None}
-        return {"settled": "idle" if p.returncode == 0 else "blocked",
-                "output": (p.stdout or "") + (p.stderr or ""), "code": p.returncode}
+        return _result(p.stdout, p.stderr, p.returncode)
 
     def follow_up(self, session, text, timeout):
         flag = self.CONTINUE.get(session.handle.get("kind"))
