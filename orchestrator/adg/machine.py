@@ -502,9 +502,24 @@ a planner does that next, from your design.
                     raise Halt("needs_human",
                                "%s still failing after %d attempts and nothing stronger is "
                                "enrolled within the ceiling" % (sub["id"], attempts))
-                self.log("  escalating to %s" % stronger.model)
+                # Naming the new slot alone overstated this. Registry model
+                # names are capability slots, and the runtime launches a CLI by
+                # agent kind without pinning a model (runtime.LAUNCH), so
+                # escalating within one agent kind changes the bookkeeping and
+                # the session -- not the model that actually runs. Say which
+                # happened: on a single-seat deployment it is always the latter,
+                # and "escalating to <stronger model>" promised a heavier read
+                # that nothing delivered.
+                self.log("  escalating to %s via %s — %s"
+                         % (stronger.model, stronger.channel,
+                            "a different agent"
+                            if stronger.agent_kind != role_choice.agent_kind else
+                            "same agent kind, so this is a fresh session rather "
+                            "than a heavier model"))
                 # A stronger model starts clean: the point of escalating is a
-                # different approach, not more of the same context.
+                # different approach, not more of the same context. This half
+                # happens either way, and is what makes the rung worth taking
+                # when the model cannot change.
                 self._close(session)
                 role_choice, attempts, session = stronger, 0, None
         self._finish_subtask(sub, base)

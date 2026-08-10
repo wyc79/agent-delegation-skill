@@ -175,9 +175,17 @@ channels:
 # ---------------------------------------------------------------------------
 
 policy:
+  # A SELECTION bound, not a runtime guard. Both entries below filter which
+  # (model, channel) slots the router will choose; neither reaches the process.
+  # The adapter launches an agent CLI by kind and does not pin a model
+  # (adg/runtime.py LAUNCH), so what actually executes is whatever that CLI is
+  # configured to use. Lowering max_tier cannot stop a heavy model your CLI
+  # already defaults to, and raising it cannot summon one it does not have.
+  # The bound that does hold at runtime is `limits.max_cost_usd`, which is
+  # checked against the cost the CLI reports back per call.
   escalation_ceiling:
     max_tier: t2                      # ultra tier is out of the ladder's reach
-    max_marginal_cost_per_call: 2.50  # hard stop in USD, whatever the model
+    max_marginal_cost_per_call: 2.50  # on the slot's list price, before the call
   # Deployment defaults for task.json `limits` (DESIGN.md §4.2).
   # A task may lower any of these; never raise. Missing/invalid -> fail closed.
   limits:

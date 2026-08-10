@@ -134,7 +134,7 @@ provider gave.
 | `adg/limits.py` | Hard limits, checked before the action, failing closed. |
 | `adg/runtime.py` | The seven-operation adapter: `local`, `herdr` (agents run in visible panes), `mock`. |
 | `adg/verify.py` | Deterministic checks and mechanical scope comparison. |
-| `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. |
+| `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. Its five *judgment passes* are a separate, unwired thing: see [`winnow-passes.md`](winnow-passes.md). |
 | `adg/companions.py` | Detects karpathy-guidelines and superpowers once, and declares them in `task.json`. |
 | `adg/brief.py` | Human-facing gate briefs, plus the jargon lint. |
 | `adg/schema.py` | Report/verdict validation against the skill's schemas. |

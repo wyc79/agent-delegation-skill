@@ -125,11 +125,16 @@ are reported as missing rather than silently skipped.
   deterministic scanner runs as part of verification (stdlib, sub-second, no
   model call) and flags generated-code chaff. Evaluated on this repo's own
   orchestrator, it found two real defects in 0.4 seconds.
-- **`andrej-karpathy-skills:karpathy-guidelines`** — 67 lines on the mistakes
+- **[`andrej-karpathy-skills:karpathy-guidelines`](https://github.com/multica-ai/andrej-karpathy-skills)** — 67 lines on the mistakes
   that make generated code fail review (overcomplication, unrequested scope,
   unstated assumptions). Read by agents *before* they write code.
-- **[superpowers](https://github.com/obra/superpowers)** —
-  `systematic-debugging` at the second failed attempt.
+- **[superpowers](https://github.com/obra/superpowers)** — `brainstorming`
+  drives the optional design stage on complex attended tasks: it explores the
+  code, weighs two or three approaches, and writes `spec.md`, which is gated to
+  you and then handed to the planner as a settled approach. Also
+  `systematic-debugging` at the second failed attempt. Its `writing-plans` is
+  deliberately *not* used — a plan here is a machine-enforced contract, not
+  prose ([`companions.md`](agent-delegation/references/companions.md)).
 
 Their findings are advisory. Authority stays with the acceptance criteria, the
 plan, and the deterministic checks. See

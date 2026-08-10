@@ -48,14 +48,21 @@ Everything below is relative to `$TASK_DIR` from Step 1:
 |---|---|---|
 | `task.json` | Status, budgets, assignments, delegation history | Orchestrator only — **never edit** |
 | `task.md` | The request and its numbered acceptance criteria (`AC-n`) | Intake or a human. The planner may add criteria if there are none; nobody else edits it |
+| `spec.md` | The approved design, when one was written: purpose, the approach chosen over the alternatives, risks | Brainstorm stage, then approved by a human. Present on complex attended tasks only |
 | `plan.md` | Approach plus one YAML block per subtask | Planner |
 | `deviations.md` | Append-only log of departures from the plan | Anyone who departs |
 | `decisions.md` | Append-only design decisions and their reasons | Anyone deciding |
 | `reports/` | One JSON handoff per agent, per stage (`verify/` holds check output) | Every agent, at exit |
 
-**Authority when they disagree:** `task.md` (what was asked) outranks
-`plan.md` + `deviations.md` (how it is being done) outranks the code. Never
-"fix" a conflict silently in the direction of the code.
+**Authority when they disagree:** `task.md` (what was asked) outranks `spec.md`
+(the approach a human approved) outranks `plan.md` + `deviations.md` (how it is
+being done) outranks the code. Never "fix" a conflict silently in the direction
+of the code.
+
+`spec.md` sits where it does because a human approved it: it settles the
+approach, so re-opening that choice is a decision to record in `decisions.md`,
+not a judgement call to make quietly. It does not settle scope or sequencing —
+that is `plan.md`'s job — and it never outranks an acceptance criterion.
 
 ## Hard rules
 

@@ -239,6 +239,40 @@ class TestRouter(unittest.TestCase):
         with self.assertRaises(router.RoutingError):
             self.r.candidates("planner", ceiling={"max_tier": "unlimited"})
 
+    def test_a_boost_raises_a_floor_the_profile_never_declared(self):
+        # The implementer profile requires coding and tool, not reasoning, and
+        # rung 2 of the ladder (DESIGN §6.2) is exactly a reasoning+1 re-route.
+        # Applying the boost only to declared requirements made that rung a
+        # no-op for the one role that climbs it most.
+        self.assertNotIn("reasoning", self.reg["profiles"]["implementer"]["require"])
+        picked = [c.model for c in
+                  self.r.candidates("implementer", boost={"reasoning": 5})]
+        self.assertNotIn("balanced-coder", picked,
+                         "reasoning 4 cleared a boosted floor of 5")
+
+    def test_the_implementer_ladder_climbs_once_a_stronger_model_is_enrolled(self):
+        # The failure this fixes: an operator enrolls the strong model to make
+        # escalation work, and is still told nothing stronger is enrolled.
+        self.reg["models"]["opus-class-strong"]["enrolled_roles"].append("implementer")
+        r = router.Router(self.reg)
+        cur = r.select("implementer")
+        self.assertEqual(cur.model, "balanced-coder")
+        stronger = r.escalate("implementer", cur)
+        self.assertIsNotNone(stronger, "rung 2 refused a legal, enrolled rung")
+        self.assertEqual(stronger.model, "opus-class-strong")
+
+    def test_an_unscored_capability_cannot_clear_a_boosted_floor(self):
+        self.reg["models"]["balanced-coder"].pop("reasoning")
+        r = router.Router(self.reg)
+        picked = [c.model for c in r.candidates("implementer", boost={"reasoning": 3})]
+        self.assertNotIn("balanced-coder", picked,
+                         "an unscored dimension is unverifiable, not a pass")
+
+    def test_boosting_a_declared_requirement_still_takes_the_higher_floor(self):
+        # The original behaviour, which must survive: require 4, boost 5 -> 5.
+        picked = [c.model for c in self.r.candidates("reviewer", boost={"reasoning": 5})]
+        self.assertEqual(picked, ["opus-class-strong"])
+
 
 class TestVerifyAndScope(unittest.TestCase):
     def test_scope_violations_are_case_insensitive_where_the_fs_is(self):
@@ -911,6 +945,49 @@ class TestRuntimeSurfaces(unittest.TestCase):
         self.assertTrue((s.handle or {}).get("herdr"))
         self.assertEqual(s.handle["pane"], "w1:p9")
 
+    def test_a_variadic_grant_flag_is_passed_once(self):
+        a = runtime.LocalAdapter()
+        argv = a._argv("claude", {"AGENT_DELEGATION_TASK_DIR": "/x/T-1",
+                                  "AGENT_DELEGATION_SKILL_DIR": "/s/ad"})
+        self.assertEqual(argv[-3:], ["--add-dir", "/x/T-1", "/s/ad"])
+
+    def test_a_non_variadic_grant_flag_is_repeated_per_path(self):
+        # `--add-dir A B` does not error on a CLI that declares `<path>`: B is
+        # silently absorbed as a positional prompt argument, so the skill dir
+        # becomes the instruction and the real prompt is the one that loses.
+        class A(runtime.LocalAdapter):
+            GRANTS = dict(runtime.LocalAdapter.GRANTS, cursor="--add-dir")
+        argv = A()._argv("cursor", {"AGENT_DELEGATION_TASK_DIR": "/x/T-1",
+                                    "AGENT_DELEGATION_SKILL_DIR": "/s/ad"})
+        self.assertEqual(argv[-4:], ["--add-dir", "/x/T-1", "--add-dir", "/s/ad"])
+
+    def test_cursor_retries_continue_its_own_session(self):
+        # Verified against a real seat: cursor-agent --continue resumes the
+        # previous conversation in this directory. Falling back to a fresh turn
+        # made every retry re-read the protocol, the task and the repo.
+        seen = {}
+
+        class A(runtime.LocalAdapter):
+            def prompt(self, session, text, timeout, argv=None):
+                seen["argv"] = argv
+                return {"settled": "ok"}
+        sess = runtime.Session("x", "/tmp", handle={
+            "kind": "cursor", "argv": list(runtime.LocalAdapter.LAUNCH["cursor"])})
+        A().follow_up(sess, "fix it", timeout=10)
+        self.assertEqual(seen["argv"][-1], "--continue")
+
+    def test_a_kind_that_cannot_continue_falls_back_to_a_new_turn(self):
+        seen = {}
+
+        class A(runtime.LocalAdapter):
+            def prompt(self, session, text, timeout, argv=None):
+                seen["argv"] = argv
+                return {"settled": "ok"}
+        sess = runtime.Session("x", "/tmp", handle={
+            "kind": "gemini", "argv": list(runtime.LocalAdapter.LAUNCH["gemini"])})
+        A().follow_up(sess, "fix it", timeout=10)
+        self.assertIsNone(seen["argv"], "a fresh turn must not carry a resume flag")
+
     def test_a_refused_prompt_is_reported_not_disguised_as_a_timeout(self):
         class H(runtime.HerdrAdapter):
             def _cli(self, args, check=True):
@@ -1456,6 +1533,92 @@ class TestWinnow(unittest.TestCase):
             {"severity": "P1", "path": "a.py", "line": 3, "message": "except/pass"}]}))
         self.assertIn("advisory", t)
         self.assertIn("not requirement failures", t)
+
+    def test_an_empty_scope_is_not_a_clean_scan(self):
+        # scan.py answers "no diff found" with exit 0, findings [] and files 0 --
+        # identical to a reviewed change that came back clean. Reporting that as
+        # "nothing significant" is the fabricated clean this module refuses.
+        s = winnow.summarize({"files": 0, "findings": [], "complete": True,
+                              "warnings": ["No diff found in scope 'branch'."]})
+        self.assertFalse(s["ran"])
+        self.assertIn("nothing was scanned", winnow.as_text(s))
+
+    def test_a_scope_emptied_by_skips_says_which(self):
+        s = winnow.summarize({"files": 0, "findings": [],
+                              "errors": [{"path": "v.js", "error": "looks minified"}]})
+        self.assertFalse(s["ran"])
+        self.assertIn("skipped", s["why"])
+
+    def test_a_real_clean_scan_still_reports_clean(self):
+        s = winnow.summarize({"files": 4, "findings": [], "complete": True})
+        self.assertTrue(s["ran"])
+        self.assertIn("nothing significant", winnow.as_text(s))
+
+    def test_partial_coverage_is_stated_not_swallowed(self):
+        # complete:false means a file in scope was binary, minified or
+        # unreadable. The findings that landed are still true; the coverage
+        # behind them is not, and silence there reads as absence.
+        t = winnow.as_text(winnow.summarize({
+            "files": 2, "complete": False,
+            "findings": [{"severity": "P1", "path": "a.py", "line": 1,
+                          "message": "secret"}]}))
+        self.assertIn("INCOMPLETE", t)
+        self.assertIn("a.py", t)
+
+    def test_a_missing_file_count_is_not_assumed_clean(self):
+        # If the key is renamed upstream we cannot tell a clean tree from an
+        # unexamined one. Say that, rather than pick the flattering reading.
+        s = winnow.summarize({"findings": []})
+        self.assertFalse(s["ran"])
+
+    def test_a_moved_key_still_summarises_when_findings_exist(self):
+        # The other half of that: findings prove files were opened, so a schema
+        # drift must shrink the summary, never convert it into "did not run".
+        s = winnow.summarize({"findings": [{"sev": "P1"}, "not-a-dict", {}]})
+        self.assertTrue(s["ran"])
+
+    def test_exit_two_carries_findings_and_must_not_be_discarded(self):
+        # scan.py's contract is 0 = complete, 2 = incomplete. Exit 2 still
+        # prints a valid report: one unreadable file must not throw away a P1
+        # found in a different one.
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        fake = os.path.join(d, "scan.py")
+        with open(fake, "w") as fh:
+            fh.write("import json, sys\n"
+                     "print(json.dumps({'files': 2, 'complete': False,\n"
+                     "  'errors': [{'path': 'v.js', 'error': 'looks minified'}],\n"
+                     "  'findings': [{'severity': 'P1', 'path': 'a.py',\n"
+                     "                'line': 7, 'message': 'committed secret'}]}))\n"
+                     "sys.exit(2)\n")
+        written = {}
+
+        class _Task:
+            def write_text(self, path, text):
+                written[path] = text
+
+        s = winnow.run(_Task(), fake, d, "HEAD", "run-1")
+        self.assertTrue(s["ran"], "a partial scan was reported as no scan")
+        self.assertEqual(len(s["notable"]), 1)
+        self.assertFalse(s["complete"])
+        self.assertTrue(written, "the raw report was not persisted")
+
+    def test_an_unexpected_exit_code_is_still_refused(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        fake = os.path.join(d, "scan.py")
+        with open(fake, "w") as fh:
+            fh.write("import sys\nsys.stderr.write('boom\\n')\nsys.exit(3)\n")
+
+        class _Task:
+            def write_text(self, path, text):
+                raise AssertionError("nothing should be persisted for a failed run")
+
+        s = winnow.run(_Task(), fake, d, "HEAD", "run-1")
+        self.assertFalse(s["ran"])
+        self.assertIn("boom", s["why"])
 
 
 class TestEndToEnd(unittest.TestCase):
