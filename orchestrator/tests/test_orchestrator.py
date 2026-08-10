@@ -532,6 +532,55 @@ class TestEndToEnd(unittest.TestCase):
         roles = [c[1] for c in adapter.calls if c[0] == "follow_up"]
         self.assertNotIn("reviewer", roles)
 
+    def _run_simple(self, script, review=None, break_scope=False):
+        """A task the classifier calls simple, so the review policy applies."""
+        pol = dict(self.reg["policy"]["limits"],
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        task = store.Task.create(self.t.repo, "T-00S", "# t\n\nAdd subtract\n", pol)
+        if review:
+            task.update(review=review)
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "classifier":
+                    return {"settled": "idle", "output": "VERDICT: SIMPLE -- tiny change",
+                            "code": 0}
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        adapter = A(script)
+        logs = []
+        status = Orchestrator(task, self.reg, adapter, lambda k, t: True,
+                              log=logs.append).run()
+        return status, task, adapter, logs
+
+    def test_simple_task_skips_llm_review_by_default(self):
+        script, _ = self._script()
+        status, task, adapter, logs = self._run_simple(script)
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertFalse(task.state["review_outcome"]["reviewed"])
+        self.assertNotIn("reviewer", [c[1] for c in adapter.calls if c[0] != "notify"])
+        self.assertIn("checks green", task.state["review_outcome"]["why"])
+
+    def test_brief_says_plainly_that_no_review_ran(self):
+        script, _ = self._script()
+        _, task, _, _ = self._run_simple(script)
+        text = task.read_text("brief.md")
+        self.assertIn("No independent review was run", text)
+        self.assertIn("--review always", text)
+        self.assertEqual(brief.lint(text), [], "the notice must stay jargon-free")
+
+    def test_review_always_forces_it_on_a_simple_task(self):
+        script, _ = self._script()
+        status, task, adapter, logs = self._run_simple(script, review="always")
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertTrue(task.state["review_outcome"]["reviewed"])
+
+    def test_complex_task_still_always_reviewed(self):
+        script, _ = self._script()
+        status, task, _, logs = self._run(script)  # planner path = complex
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertTrue(task.state["review_outcome"]["reviewed"])
+
     def test_declined_gate_parks_instead_of_proceeding(self):
         script, _ = self._script()
         status, task, _, _ = self._run(script, gate=lambda k, t: k != "merge")

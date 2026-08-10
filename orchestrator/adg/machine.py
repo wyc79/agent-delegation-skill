@@ -302,10 +302,45 @@ class Orchestrator:
         if violations:
             self.log("  scope: %d file(s) outside declared scope" % len(violations))
 
+    def _review_policy(self):
+        """auto (default): independent review for complex work, deterministic
+        checks alone for simple work. always / never force it either way."""
+        state = self.task.state
+        return (state.get("review")
+                or (self.reg["policy"].get("review") if isinstance(self.reg.get("policy"), dict) else None)
+                or "auto")
+
+    def _skip_review(self, result):
+        """Reasons to run the reviewer anyway, even on a simple task. Each is a
+        deterministic signal that something happened nobody planned -- exactly
+        what an automated check cannot judge."""
+        mode = self._review_policy()
+        if mode == "always":
+            return None
+        if mode == "never":
+            return "review disabled for this task"
+        if self.task.state.get("classification", {}).get("tier") != "simple":
+            return None
+        if not result.ok:
+            return None
+        violations = [v for s in self.task.state["subtasks"]
+                      for v in (s.get("scope_violations") or [])]
+        if violations:
+            self.log("  review: running anyway — %d file(s) outside declared scope"
+                     % len(violations))
+            return None
+        return "simple change, all checks green, nothing outside the declared scope"
+
     def _stage_review(self):
-        self.budget.check_review_loop()
         base = self._ensure_worktree()
         result = verify.run(self.task, self.repo, base, "slow" if self.vcfg.get("slow") else "fast")
+        skip = self._skip_review(result)
+        if skip:
+            self.log("review: skipped — %s" % skip)
+            self.task.update(review_outcome={"reviewed": False, "why": skip},
+                             status="integrate")
+            return
+        self.budget.check_review_loop()
         if not result.ok:
             # Never review red code (D5). Send it back as work -- and reopen a
             # subtask, or implement would find nothing pending and bounce
@@ -321,6 +356,7 @@ class Orchestrator:
                           "%s/schemas/verdict.schema.json." % prompts.skill_path()))
         verdict = self._read_verdict()
         self.log("review: %s" % verdict["verdict"])
+        self.task.update(review_outcome={"reviewed": True, "verdict": verdict["verdict"]})
         self.budget.used_review_loop()
         self._apply_verdict(verdict)
 
@@ -372,11 +408,18 @@ class Orchestrator:
         state = self.task.state
         files = sorted({f for s in state["subtasks"] for f in s.get("actual_files", [])})
         result = verify.run(self.task, self.repo, self._ensure_worktree(), "fast")
+        ro = self.task.state.get("review_outcome") or {}
+        if ro.get("reviewed"):
+            note = "An independent reviewer checked this against the plan and approved it."
+        else:
+            note = ("**No independent review was run** (%s). The automated checks "
+                    "below are the only evidence. Re-run with `--review always` if "
+                    "you want a second opinion." % ro.get("why", "not requested"))
         text, problems = brief.write(
             self.task, "merge",
             "Land this change? It is complete and its checks pass. In attended mode "
             "the diff is applied to your working tree, uncommitted, for you to commit.",
-            files=files, verify=result)
+            files=files, verify=result, extra="## Review\n\n" + note)
         for p in problems:
             self.log("  brief lint: %s" % p)
         if self.budget.requires_approval("merge"):

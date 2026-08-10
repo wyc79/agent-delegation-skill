@@ -87,6 +87,8 @@ def cmd_run(args):
     body = request if request.lstrip().startswith("#") else \
         "# Task %s\n\n## Request (verbatim)\n\n%s\n" % (task_id, request.strip())
     task = store.Task.create(repo, task_id, body, merged, mode=args.mode)
+    if args.review != "auto":
+        task.update(review=args.review)
     print("task %s -> %s" % (task_id, task.path))
 
     adapter = runtime.get(args.adapter or _default_adapter(reg))
@@ -160,6 +162,9 @@ def main(argv=None):
     r.add_argument("--adapter", choices=["herdr", "local", "mock"])
     r.add_argument("--max-cost", type=float, help="lower the cost cap for this task")
     r.add_argument("--dry-run", action="store_true", help="drive the machine without agents")
+    r.add_argument("--review", choices=["auto", "always", "never"], default="auto",
+                   help="auto (default): independent LLM review for complex work, "
+                        "deterministic checks alone for simple work")
     r.add_argument("--yes", action="store_true",
                    help="auto-approve gates (unattended runs; merge still never happens)")
     r.set_defaults(func=cmd_run)
