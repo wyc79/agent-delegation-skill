@@ -191,7 +191,10 @@ class LocalAdapter(Adapter):
         argv = self.LAUNCH.get(kind)
         if argv is None:
             raise RuntimeError_("unknown agent kind %r" % kind)
-        if shutil.which(argv[0]) is None:
+        # Through can_run, not shutil.which directly: one seam decides whether a
+        # CLI is usable, so routing tests can stub it without the vendor binary
+        # installed -- and the answer here cannot drift from the one _pick used.
+        if not self.can_run(kind):
             raise RuntimeError_(
                 "%r not found on PATH -- install it or pick another channel" % argv[0])
         s = Session("%s-local" % role, cwd)

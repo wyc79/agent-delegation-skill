@@ -174,8 +174,9 @@ which is exactly what code is good at and prompts are not:
 | Sequential subtasks in one worktree | Parallel worktrees with lock/hotspot enforcement |
 | Asking the human at obvious moments | Schema validation, cost tracking, jargon-free briefs |
 
-**The orchestrator is designed but not yet built.** That is the program which
-would automate the parts you currently do by hand:
+**The orchestrator is built.** `adg` — the program in
+[`orchestrator/`](orchestrator/) — automates the parts above that code does
+better than prompts:
 
 - choosing which model runs each role (`DESIGN.md` §5)
 - creating and integrating worktrees (§7)
@@ -184,8 +185,23 @@ would automate the parts you currently do by hand:
   threshold (§9)
 - retrying and escalating failures up a ladder (§6)
 
-`DESIGN.md` §15 lists the minimum version of that program one developer could
-realistically build.
+```bash
+orchestrator/delegate init                       # what's detected, who gets which role
+orchestrator/delegate run "fix the failing auth test"
+python3 orchestrator/tests/test_orchestrator.py  # 119 tests, no tokens spent
+```
+
+Python 3.9+, stdlib only, no install step. The tests drive the real state
+machine over a real git repository with a scripted adapter, so they need no
+agent CLI installed and spend nothing.
+
+**Two limits to know before you rely on it.** Parallel subtasks still carry a
+shared-state race — roughly 1 full-suite run in 8 — so keep
+`max_parallel_agents: 1` until it is closed; the sequential path is unaffected.
+And live quota metering, telemetry-driven registry recalibration, and container
+isolation are absent. [`orchestrator/README.md`](orchestrator/README.md) has the
+configuration, the full scope boundary, and the defect write-up; `DESIGN.md` §15
+has the design it was built from.
 
 ## License
 
