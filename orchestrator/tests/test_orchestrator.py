@@ -638,6 +638,49 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(status, "done", "\n".join(logs))
         self.assertTrue(task.state["review_outcome"]["reviewed"])
 
+    def test_reviewer_findings_reach_the_implementer(self):
+        # Reopening a subtask without the findings sends the agent back to the
+        # same code with the same prompt -- it rebuilds what was rejected.
+        script, _ = self._script()
+        rounds = {"n": 0}
+        seen = []
+
+        def reviewer(env, cwd):
+            rounds["n"] += 1
+            first = rounds["n"] == 1
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
+                                   "reports", "review-reviewer.json"), "w") as fh:
+                json.dump({
+                    "verdict": "REQUEST_CHANGES" if first else "APPROVE",
+                    "ac_table": [{"ac": "AC-1", "status": "unmet" if first else "met"}],
+                    "findings": ([{"id": "f-1", "severity": "blocking",
+                                   "claim": "subtract must reject non-numeric input",
+                                   "cite": "task.md#AC-1", "file": "app.py"}]
+                                 if first else []),
+                }, fh)
+        script["reviewer"] = reviewer
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "implementer":
+                    seen.append(text)
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        pol = dict(self.reg["policy"]["limits"],
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        task = store.Task.create(self.t.repo, "T-004", "# t\n\nAdd subtract API\n", pol)
+        status = Orchestrator(task, self.reg, A(script), lambda k, t: True,
+                              log=lambda *_: None).run()
+        self.assertEqual(status, "done")
+        self.assertGreaterEqual(len(seen), 2, "implementer should have run twice")
+        self.assertIn("reject non-numeric input", seen[-1], "findings not delivered")
+        self.assertIn("task.md#AC-1", seen[-1], "citation not delivered")
+
+    def test_findings_are_cleared_once_the_subtask_is_green(self):
+        script, _ = self._script()
+        _, task, _, _ = self._run(script)
+        self.assertEqual(task.state.get("pending_findings"), [])
+
     def test_declined_gate_parks_instead_of_proceeding(self):
         script, _ = self._script()
         status, task, _, _ = self._run(script, gate=lambda k, t: k != "merge")

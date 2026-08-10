@@ -13,7 +13,7 @@ import os
 import re
 import time
 
-from . import brief, limits as lim, prompts, router as routing, schema, verify, winnow, yamlite
+from . import brief, companions, limits as lim, prompts, router as routing, schema, verify, winnow, yamlite
 from .store import git
 
 STAGES = ["intake", "classify", "plan", "implement", "verify", "review", "integrate", "done"]
@@ -106,7 +106,10 @@ class Orchestrator:
     # --------------------------------------------------------------- stages
     def _stage_intake(self):
         self.log("intake: %s" % self.task.state["id"])
-        self.task.update(status="classify")
+        found = companions.detect()
+        if any(found.values()):
+            self.log("companions: %s" % ", ".join(k for k, v in found.items() if v))
+        self.task.update(companions=found, status="classify")
 
     def _repo_facts(self):
         """Cheap, factual context so the classifier judges the change against
@@ -245,7 +248,8 @@ class Orchestrator:
             self.log("implement %s: attempt %d (%s%s)" % (
                 sub["id"], attempts, role_choice.model, "" if session is None else ", continued"))
             session = self._invoke("implementer", role_choice, cwd=base, subtask=sub,
-                                   session=session, failure=self._last_failure)
+                                   session=session, failure=self._last_failure,
+                                   extra=self._findings_brief(sub))
             self.budget.used_attempt(sub["id"])
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
@@ -301,6 +305,7 @@ class Orchestrator:
         self.task.write_json("task.json", state)
         if violations:
             self.log("  scope: %d file(s) outside declared scope" % len(violations))
+        self.task.update(pending_findings=[])
 
     def _review_policy(self):
         """auto (default): independent review for complex work, deterministic
@@ -405,6 +410,10 @@ class Orchestrator:
             blocking = [f for f in verdict.get("findings", []) if f.get("severity") == "blocking"]
             owners = {f.get("suggested_owner") for f in blocking if f.get("suggested_owner")}
             self._reopen_subtasks(owners)
+            # Carry the findings to the implementer. Reopening a subtask without
+            # them sends an agent back to the same code with the same prompt and
+            # no idea what was wrong -- it rebuilds what the reviewer rejected.
+            self.task.update(pending_findings=blocking)
             self.log("  %d blocking finding(s) sent back" % len(blocking))
             self.task.update(status="implement")
         elif v == "REPLAN":
@@ -414,6 +423,23 @@ class Orchestrator:
         else:
             raise Halt("needs_human", "reviewer escalated: %s" %
                        (verdict.get("findings") or [{}])[0].get("claim", "no detail"))
+
+    def _findings_brief(self, sub):
+        """What the reviewer rejected, for the implementer that has to fix it."""
+        findings = self.task.state.get("pending_findings") or []
+        mine = [f for f in findings
+                if not f.get("suggested_owner") or sub["id"] in f.get("suggested_owner", "")]
+        if not mine:
+            return None
+        lines = ["A reviewer rejected the previous attempt. Address these before "
+                 "anything else — each cites the requirement or plan line it comes from:"]
+        for f in mine:
+            where = " (%s%s)" % (f.get("file", ""),
+                                 ":%s" % f["line"] if f.get("line") else "") if f.get("file") else ""
+            lines.append("- [%s]%s %s" % (f.get("cite", "uncited"), where, f.get("claim", "")))
+        lines.append("If you believe a finding is wrong, say so in your report with "
+                     "evidence rather than silently ignoring it.")
+        return "\n".join(lines)
 
     def _reopen_subtasks(self, owners=None):
         """Mark subtasks pending again. When the reviewer named owners, only

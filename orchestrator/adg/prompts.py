@@ -65,6 +65,11 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
         "  %s/reports/" % task.path,
         "It must validate against %s/schemas/report.schema.json." % skill,
     ]
+    found = {k: v for k, v in (state.get("companions") or {}).items() if v}
+    if found:
+        lines += ["", "Companion skills installed here: %s. See %s/references/"
+                      "companions.md for which apply to your role and their limits."
+                  % (", ".join(sorted(found)), skill)]
     if extra:
         lines += ["", extra.strip()]
     return "\n".join(lines)
