@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from adg import cooldown, quota, router, runtime, store          # noqa: E402
+from adg import cli, cooldown, quota, router, runtime, store     # noqa: E402
 from adg.machine import Orchestrator                             # noqa: E402
 from test_orchestrator import REGISTRY, TempRepo, _report, sh    # noqa: E402,F401
 
@@ -126,6 +126,19 @@ class TestWindowAndCapacityParsing(unittest.TestCase):
     def test_an_unparseable_window_uses_the_default_rather_than_zero(self):
         self.assertEqual(quota.parse_window("whenever", default=99.0), 99.0)
 
+    def test_a_zero_window_is_refused(self):
+        # A zero window makes _reopen_at return `now`, so the breaker is pruned
+        # by the same write that opens it and failover bounces forever.
+        self.assertEqual(quota.parse_window("0h", default=99.0), 99.0)
+        self.assertEqual(quota.parse_window(0, default=99.0), 99.0)
+
+    def test_a_unit_is_matched_whole_never_by_first_letter(self):
+        # `1month` read as one *minute* is wrong by four orders of magnitude on
+        # a monthly seat, and nothing downstream could tell.
+        self.assertEqual(quota.parse_window("1month", default=99.0), 99.0)
+        self.assertEqual(quota.parse_window("1mo", default=99.0), 99.0)
+        self.assertEqual(quota.parse_window("30m"), 30 * 60)
+
     def test_capacity_tolerates_the_units_design_md_uses(self):
         # DESIGN.md §5.4 writes these as `40u` and `500req`.
         self.assertEqual(quota.parse_capacity(40), 40.0)
@@ -181,6 +194,59 @@ class TestCooldownStore(unittest.TestCase):
         self.assertEqual(usage, {})
         self.assertIsNotNone(warn)
         self.assertIn(cooldown.path(), warn, "the warning must name the file to delete")
+
+    # The docstring promises "never fatal". Valid JSON of the wrong *shape* is
+    # what a hand-edit or a future schema change actually produces, and it
+    # sailed past the top-level dict check straight into an AttributeError.
+    MALFORMED = ['{"cooldowns": [1, 2]}',
+                 '{"usage": ["a"]}',
+                 '{"usage": {"claude-seat": ["oops"]}}',
+                 '{"usage": {"claude-seat": {"a": 1}}}',
+                 '{"cooldowns": {"claude-seat": "soon"}}',
+                 '[]']
+
+    def _write_raw(self, text):
+        os.makedirs(os.path.dirname(cooldown.path()), exist_ok=True)
+        with open(cooldown.path(), "w") as fh:
+            fh.write(text)
+
+    def test_wrongly_shaped_json_reads_as_empty_rather_than_raising(self):
+        for text in self.MALFORMED:
+            with self.subTest(content=text):
+                self._write_raw(text)
+                cools, usage, warn = cooldown.read(T0)
+                self.assertEqual(cools, {})
+                # A surviving key with no usable stamps is fine; a surviving
+                # *stamp* is not, because it would skew the shadow price.
+                self.assertEqual([s for v in usage.values() for s in v], [])
+                self.assertIsNotNone(warn, "a silent empty read hides the problem")
+
+    def test_wrongly_shaped_json_does_not_break_a_write_either(self):
+        # A run must survive it: _meter fires after *every* invocation.
+        for text in self.MALFORMED:
+            with self.subTest(content=text):
+                self._write_raw(text)
+                cooldown.record_use("claude-seat", 3600, T0)
+                cooldown.open_breaker("claude-seat", "quota", T0 + 60, T0)
+                self.assertEqual(cooldown.active(T0), {"claude-seat"},
+                                 "the write did not recover the file")
+
+    def test_an_unwritable_state_dir_is_reported_not_raised(self):
+        # A read-only $XDG_STATE_HOME with a writable task dir is an ordinary CI
+        # sandbox. _meter runs on the first agent call, so raising here kills
+        # the run before it starts.
+        root = store.state_root()
+        os.makedirs(root, exist_ok=True)
+        mode = os.stat(root).st_mode
+        os.chmod(root, 0o500)
+        try:
+            cooldown.record_use("claude-seat", 3600, T0)          # must not raise
+            err = cooldown.open_breaker("claude-seat", "quota", T0 + 60, T0)
+            self.assertIsNotNone(cooldown.last_error(),
+                                 "an unwritable breaker failed silently")
+            self.assertIsNotNone(err)
+        finally:
+            os.chmod(root, mode)
 
     def test_a_missing_file_is_simply_empty_and_quiet(self):
         cools, usage, warn = cooldown.read(T0)
@@ -313,13 +379,23 @@ class TestReserve(unittest.TestCase):
                                 utilization={"claude-seat": 0.5, "cursor-seat": 0.0})
         self.assertIn("claude-seat", {c.channel for c in got})
 
-    def test_the_seat_comes_back_demoted_when_it_is_the_only_one(self):
-        # A guarantee that parks work it could have done is not worth having.
-        got = self.r.candidates("implementer",
-                                utilization={"claude-seat": 0.8},
-                                cooldowns={"cursor-seat"})
-        self.assertEqual([c.channel for c in got], ["claude-seat"])
-        self.assertTrue(got[0].demoted)
+    def test_the_withheld_seat_is_available_on_request_and_flagged(self):
+        # The router withholds; it does not decide whether withholding is
+        # affordable, because only the caller knows which CLI is installed.
+        held = self.r.candidates("implementer", utilization={"claude-seat": 0.8},
+                                 cooldowns={"cursor-seat"}, ignore_reserve=True)
+        self.assertEqual([c.channel for c in held], ["claude-seat"])
+        self.assertTrue(held[0].demoted)
+        self.assertEqual(self.r.candidates("implementer",
+                                           utilization={"claude-seat": 0.8},
+                                           cooldowns={"cursor-seat"}), [])
+
+    def test_select_falls_back_to_a_reserved_seat_once_exclude_empties_the_rest(self):
+        got = self.r.select("implementer", utilization={"claude-seat": 0.8},
+                            exclude=(("balanced-coder", "cursor-seat"),
+                                     ("fast-cheap", "cursor-seat")))
+        self.assertEqual(got.channel, "claude-seat")
+        self.assertTrue(got.demoted)
 
     def test_a_nonsense_reserve_fraction_refuses_rather_than_ignoring_it(self):
         reg = router.load_registry(REGISTRY)
@@ -470,6 +546,33 @@ class TestMachineSelection(unittest.TestCase):
         self.assertEqual(tier, "complex", "the fail-safe classification was lost")
         self.assertEqual(by, "fallback")
 
+    def test_a_reserved_seat_is_handed_back_when_the_alternative_is_not_installed(self):
+        """Regression. The reserve fallback used to be decided inside the router,
+        which cannot see which CLI exists. On a box with the claude CLI but not
+        cursor-agent, a claude-seat past its reserve floor was withheld in favour
+        of a cursor-seat candidate that could never launch — and the run died
+        with 'no runnable model' on a seat that was up and merely reserved."""
+        for i in range(29):                       # past 1 - reserve_fraction (0.3)
+            cooldown.record_use("claude-seat", 5 * 3600, T0 - i)
+
+        class OnlyClaude(runtime.MockAdapter):
+            def can_run(self, kind):
+                return kind == "claude"
+
+        logs = []
+        orch = _orch(self.reg, OnlyClaude(), self.task, logs=logs)
+        choice = orch._pick("implementer")
+        self.assertEqual(choice.channel, "claude-seat")
+        self.assertTrue(choice.demoted)
+        self.assertTrue(any("reserve:" in x for x in logs), logs)
+
+    def test_a_reserved_seat_is_still_withheld_when_a_runnable_alternative_exists(self):
+        # The fallback must not degrade into "the reservation never applies".
+        for i in range(29):
+            cooldown.record_use("claude-seat", 5 * 3600, T0 - i)
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        self.assertEqual(orch._pick("implementer").channel, "cursor-seat")
+
     def test_invocations_are_metered_against_the_window(self):
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
         choice = orch._pick("implementer")
@@ -587,8 +690,22 @@ class TestFailoverEndToEnd(unittest.TestCase):
         self.assertEqual(cools["claude-seat"]["reopen_at"], T0 + 5 * 3600)
         self.assertTrue(any("stated no reset time" in x for x in logs), "\n".join(logs))
 
+    def _red_until_done(self):
+        """A fast check that actually fails until the work lands, so a retry
+        really happens. With an always-green check the machine halts on the
+        first attempt ('changed no files, and the checks were already green'),
+        and a test asserting `attempts >= 1` cannot tell a billed failure from a
+        billed success."""
+        with open(os.path.join(self.t.repo, "check.py"), "w") as fh:
+            fh.write("import os, sys\nsys.exit(0 if os.path.exists('done.txt') else 1)\n")
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 check.py"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "red check"], self.t.repo)
+
     def test_a_generic_failure_still_consumes_an_attempt(self):
         # AC-5: the other half of the contract. A stack trace is a retry.
+        self._red_until_done()
         state, script = self._script(quota_first=False)
         original = script["implementer"]
         calls = {"n": 0}
@@ -596,13 +713,21 @@ class TestFailoverEndToEnd(unittest.TestCase):
         def implementer(env, cwd):
             calls["n"] += 1
             if calls["n"] == 1:
+                with open(os.path.join(cwd, "partial.py"), "w") as fh:
+                    fh.write("# started\n")
                 return blocked("Traceback (most recent call last):\nValueError: x")
+            open(os.path.join(cwd, "done.txt"), "w").close()
             return original(env, cwd)
 
         task, status, logs = self._run(dict(script, implementer=implementer))
         self.assertFalse(any("failover:" in x for x in logs), "\n".join(logs))
-        self.assertGreaterEqual(task.state["spent"]["attempts"].get("st-1-main", 0), 1)
         self.assertEqual(cooldown.active(T0), set(), "a stack trace opened a breaker")
+        # `>= 1` could not tell "the failure was billed" from "the success was".
+        # Two attempts is the whole claim: the failure consumed one, the retry
+        # consumed the other, and the run still finished.
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertEqual(task.state["spent"]["attempts"].get("st-1-main"), 2,
+                         "a generic failure stopped costing an attempt")
 
     def test_every_channel_cooled_parks_with_the_quota_reason(self):
         # AC-3.
@@ -630,9 +755,61 @@ class TestFailoverEndToEnd(unittest.TestCase):
         text = task.read_text("brief.md", "")
         self.assertIn("usage limit", text.lower())
         self.assertIn("claude-seat", text)
+        # The name said "and the reopen time" while asserting only the seat.
+        import time as _time
+        when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(T0 + 2 * 3600))
+        self.assertIn(when, text, "the brief never states when the seat comes back")
 
-    def test_work_already_committed_survives_the_hop(self):
-        # §5.5: the replacement resumes from the checkpoint, it does not restart.
+    def test_a_quota_failure_does_not_read_as_an_unbilled_run(self):
+        # The quota record has no `usd`, so the cost table counted it as a run
+        # that mysteriously reported nothing and warned that the real total was
+        # higher. A seat that refused the call cost exactly zero.
+        _, script = self._script(quota_first=True)
+        task, status, logs = self._run(script)
+        self.assertEqual(status, "done", "\n".join(logs))
+        text = task.read_text("brief.md", "")
+        cost_table = text.split("## Who did the work")[1].split("##")[0]
+        self.assertNotIn("claude-seat", cost_table,
+                         "the refused seat was billed a row saying it reported no cost")
+        self.assertIn("cursor-seat", cost_table, "the seat that did the work is missing")
+        self.assertNotIn("quota_exhausted", text, "raw protocol token reached the human")
+        self.assertIn("ran out of its provider's capacity", text,
+                      "the hop is invisible to the human who paid for it")
+
+    def test_a_wave_that_runs_out_of_quota_parks_like_the_sequential_path(self):
+        """Both subtasks hit the wall in parallel. The wave worker catches every
+        Exception and re-raised it as a generic halt, so `park` was never
+        written and `resume --when-open` had nothing to wait on — the two paths
+        disagreed about the same event."""
+        cooldown.open_breaker("cursor-seat", "quota", T0 + 9000, T0)
+        plan = PLAN_MD.replace(
+            "- id: st-1-main\n  goal: Add a subtract function to app.py\n"
+            "  file_scope: [\"app.py\"]\n  acceptance: [AC-1]\n",
+            "- id: st-1-a\n  goal: Add a\n  file_scope: [\"a.py\"]\n  acceptance: [AC-1]\n"
+            "- id: st-2-b\n  goal: Add b\n  file_scope: [\"b.py\"]\n  acceptance: [AC-1]\n")
+
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(plan)
+
+        _, script = self._script(quota_first=True)
+        script = dict(script, planner=planner,
+                      implementer=lambda e, c: blocked(QUOTA_MSG),
+                      classifier=lambda e, c: {"output": "VERDICT: COMPLEX -- two parts"})
+        task, status, logs = self._run(script)
+        self.assertEqual(status, "needs_human", "\n".join(logs))
+        self.assertEqual((task.state.get("park") or {}).get("reason"),
+                         "quota_all_exhausted",
+                         "the wave path lost the park record: %s" % "\n".join(logs))
+
+    def test_the_replacement_inherits_a_commit_not_a_dirty_tree(self):
+        """§5.5: the replacement resumes from a *checkpoint*.
+
+        The old version of this asserted only that `partial.py` still existed,
+        which the same worktree path guarantees whether or not anything was ever
+        committed — it would have passed with checkpointing entirely broken. The
+        claim worth pinning is that `git log` shows the predecessor's work, since
+        that is what the handover note tells the replacement to go and read."""
         state, script = self._script(quota_first=False)
         original = script["implementer"]
         calls = {"n": 0}
@@ -644,13 +821,33 @@ class TestFailoverEndToEnd(unittest.TestCase):
                 with open(os.path.join(cwd, "partial.py"), "w") as fh:
                     fh.write("# half done\n")
                 return blocked(QUOTA_MSG)
-            saw["partial"] = os.path.exists(os.path.join(cwd, "partial.py"))
+            saw["log"] = store.git(["log", "--oneline"], cwd, check=False)
+            saw["dirty"] = store.git(["status", "--porcelain"], cwd, check=False)
+            saw["tracked"] = store.git(["ls-files", "partial.py"], cwd, check=False)
             return original(env, cwd)
 
         task, status, logs = self._run(dict(script, implementer=implementer))
         self.assertEqual(status, "done", "\n".join(logs))
-        self.assertTrue(saw.get("partial"),
-                        "the replacement got a clean worktree, losing the work")
+        self.assertIn("salvaged", saw.get("log", ""),
+                      "the predecessor's work was not committed for the replacement")
+        self.assertEqual(saw.get("tracked"), "partial.py",
+                         "the inherited file is untracked, so `git log` cannot show it")
+        self.assertEqual(saw.get("dirty"), "",
+                         "the replacement inherited a dirty tree")
+
+    def test_salvage_never_commits_into_the_users_checkout(self):
+        # planner and brainstorm run with cwd=self.repo. This program has no
+        # path that commits to the user's own branch, and failover must not
+        # become one.
+        before = store.git(["rev-parse", "HEAD"], self.t.repo)
+        with open(os.path.join(self.t.repo, "stray.py"), "w") as fh:
+            fh.write("# uncommitted, in the real checkout\n")
+        task = store.Task.create(self.t.repo, "T-002", "# t\n", self.pol)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, x: True,
+                            log=lambda *_: None, clock=lambda: T0)
+        self.assertFalse(orch._salvage(self.t.repo, "planner", None))
+        self.assertEqual(store.git(["rev-parse", "HEAD"], self.t.repo), before)
+        self.assertIn("stray.py", store.git(["status", "--porcelain"], self.t.repo))
 
 
 class TestChannelsCommand(unittest.TestCase):
@@ -724,6 +921,11 @@ class TestResumeAtTheWindow(unittest.TestCase):
                          park={"reason": "quota_all_exhausted",
                                "reopen_at": T0 + 3600,
                                "channels": ["claude-seat"], "role": "implementer"})
+        # The breaker the park refers to. Tests that build only the task.json
+        # record describe a state the machine never produces -- and one that
+        # cannot distinguish "still cooling" from "the user already cleared it",
+        # which is exactly the bug these tests exist to pin.
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
 
     def tearDown(self):
         self.t.close()
@@ -760,6 +962,50 @@ class TestResumeAtTheWindow(unittest.TestCase):
         self.assertTrue(slept, "--when-open did not wait at all")
         self.assertAlmostEqual(sum(slept), 3600, delta=1)
         self.assertGreaterEqual(fake["t"], T0 + 3600)
+        self.assertIsNone(self.task.state.get("park"))
+
+    def test_clearing_the_breaker_actually_unblocks_the_task(self):
+        """The guard's own message tells the user to run `channels --clear`. If
+        the guard then keeps refusing, that advice is a closed loop with no exit
+        but waiting out the window or hand-editing task.json.
+
+        The breaker file is the truth; `park` is only a record of why we stopped.
+        """
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        self.assertTrue(cooldown.clear("claude-seat"))
+        cli._quota_guard(self.task, when_open=False, clock=lambda: T0)   # must not exit
+        self.assertIsNone(self.task.state.get("park"), "the stale park survived a clear")
+
+    def test_a_breaker_that_expired_on_its_own_also_unblocks(self):
+        # Same path, no user action: the window simply reopened.
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        cli._quota_guard(self.task, when_open=False, clock=lambda: T0 + 3601)
+        self.assertIsNone(self.task.state.get("park"))
+
+    def test_a_seat_still_cooling_still_refuses(self):
+        # The fix must not degrade into "always proceed".
+        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        with self.assertRaises(SystemExit):
+            cli._quota_guard(self.task, when_open=False, clock=lambda: T0)
+
+    def test_the_live_breaker_outranks_a_stale_reopen_time(self):
+        # task.json still records the original 1h park. The seat was cleared and
+        # re-cooled with a much shorter window (a later attempt got a smaller
+        # reset from the provider), so the live breaker is the shorter one.
+        # A breaker is never *shortened* in place -- clearing first is what makes
+        # the shorter window real rather than silently extended.
+        cooldown.clear("claude-seat")
+        cooldown.open_breaker("claude-seat", "quota", T0 + 60, T0)
+        cli._quota_guard(self.task, when_open=False, clock=lambda: T0 + 61)
+        self.assertIsNone(self.task.state.get("park"),
+                          "the guard trusted task.json over the live breaker")
+
+    def test_a_park_naming_no_channels_does_not_wedge_the_task(self):
+        # reopen_at may be None when no breaker carried one; refusing forever on
+        # a park nothing corroborates would be unrecoverable.
+        self.task.update(park={"reason": "quota_all_exhausted", "reopen_at": None,
+                               "channels": [], "role": "implementer"})
+        cli._quota_guard(self.task, when_open=False, clock=lambda: T0)
         self.assertIsNone(self.task.state.get("park"))
 
     def test_a_task_parked_for_any_other_reason_is_untouched(self):

@@ -64,6 +64,11 @@ def _cost_section(state):
 
     rows = {}
     for h in state.get("delegation_history") or []:
+        if h.get("outcome") == "quota_exhausted":
+            # A seat that refused the call did no work and cost nothing. Counting
+            # it as a run that "reported no cost" appends a warning that the real
+            # total is higher, which is the opposite of true.
+            continue
         in_pane = (h.get("adapter") == "herdr")
         key = (h.get("model") or "unknown", h.get("channel") or "unknown", in_pane)
         row = rows.setdefault(key, {"steps": [], "usd": 0.0, "silent": 0, "est": False})
@@ -126,7 +131,10 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
         md += ["## What happened", ""]
         for h in history[-8:]:
             outcome = {"complete": "finished", "escalate": "handed off for more help",
-                       "blocked": "got stuck"}.get(h.get("outcome"), h.get("outcome", "ran"))
+                       "blocked": "got stuck",
+                       "quota_exhausted": "ran out of its provider's capacity and "
+                                          "handed over to another one",
+                       }.get(h.get("outcome"), h.get("outcome", "ran"))
             md.append("- The %s step %s." % (h.get("role", "agent"), outcome))
         md.append("")
 

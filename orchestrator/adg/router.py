@@ -145,13 +145,18 @@ class Router:
 
     # --- selection --------------------------------------------------------
     def candidates(self, role, ceiling=None, boost=None, cooldowns=(),
-                   utilization=None):
+                   utilization=None, ignore_reserve=False):
         """All (model, channel) pairs legal for this role, best first.
 
         `cooldowns` is a set of channel names to filter exactly like
         `disabled: true`; `utilization` maps channel name -> 0.0-1.0 draw on its
         quota window. Both are computed by the caller from one `now`, so this
         method reads no clock and a routing decision replays from logged state.
+
+        `ignore_reserve` returns the seats a channel's headroom reservation
+        would normally withhold, flagged `demoted`. The caller asks for it when
+        its own filters -- which model is actually installed -- leave nothing
+        runnable, because only the caller knows that.
         """
         profile = self.reg["profiles"].get(role)
         if profile is None:
@@ -165,7 +170,7 @@ class Router:
             if chan.get("disabled") or cname in cooldowns:
                 continue
             u = float(util.get(cname, 0.0))
-            held = self._reserved_out(chan, role, u)
+            legal = []
             for mname in chan.get("exposes") or []:
                 spec = self.reg["models"].get(mname)
                 if spec is None:
@@ -176,22 +181,37 @@ class Router:
                     continue
                 if not self._meets(spec, profile.get("require"), boost):
                     continue
+                legal.append((mname, spec))
+            if not legal:
+                continue
+            # Only now: a malformed reserve_fraction on a channel this role can
+            # never use is not this role's problem, and raising for it would
+            # crash-park a run over a config error somewhere else entirely.
+            held = self._reserved_out(chan, role, u)
+            for mname, spec in legal:
                 (reserved if held else out).append(
                     Choice(mname, cname, spec, chan,
                            self._score(spec, chan, profile, u), u, held))
         # A reservation that would leave the role with nothing is a reservation
-        # that parks work it could have done. Hand the seat back, flagged, and
-        # let the machine log the demotion.
-        chosen = out or reserved
+        # that parks work it could have done -- but "nothing" is not decidable
+        # here: the caller still filters by which CLI is installed. So return the
+        # withheld seats only when asked, and let the caller decide.
+        chosen = reserved if ignore_reserve else out
         chosen.sort(key=lambda c: (-c.score, c.model, c.channel))
         return chosen
 
     def select(self, role, ceiling=None, boost=None, exclude=(), cooldowns=(),
                utilization=None):
-        """Best legal choice. The remaining sorted list is the fallback chain."""
-        for c in self.candidates(role, ceiling, boost, cooldowns, utilization):
-            if (c.model, c.channel) not in exclude and c.model not in exclude:
-                return c
+        """Best legal choice. The remaining sorted list is the fallback chain.
+
+        Reserved seats are considered only once `exclude` has emptied the
+        unreserved ones -- the same "withhold unless it would leave nothing"
+        rule `_pick` applies, evaluated after this method's own filter."""
+        for reserved_pass in (False, True):
+            for c in self.candidates(role, ceiling, boost, cooldowns, utilization,
+                                     ignore_reserve=reserved_pass):
+                if (c.model, c.channel) not in exclude and c.model not in exclude:
+                    return c
         raise NoModelAvailable(
             "no enrolled model for role %r within the ceiling (excluded: %s). "
             "Enroll a model in registry.default.yaml or raise the ceiling -- "

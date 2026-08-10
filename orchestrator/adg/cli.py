@@ -66,20 +66,32 @@ def _wait_until(epoch, clock=time.time, log=print):
 
 def _quota_guard(task, when_open, clock=time.time, log=print):
     """A task parked on quota is not broken, it is early. Refuse quietly and
-    say when, rather than starting a run every seat will reject."""
+    say when, rather than starting a run every seat will reject.
+
+    The **breaker file is the truth**; `park` only records why we stopped. Ask
+    it which of the parked seats are still cooling, because the record in
+    task.json is a snapshot: `channels --clear` and a window that simply reopened
+    both leave it stale. Deciding from the snapshot alone made this guard's own
+    advice ("clear the seat and re-run") a closed loop with no way out but
+    hand-editing task.json."""
     park = task.state.get("park") or {}
     if park.get("reason") != "quota_all_exhausted":
         return
-    reopen = float(park.get("reopen_at") or 0)
-    if clock() < reopen:
+    now = clock()
+    cools, _, warning = cooldown.read(now)
+    if warning:
+        log("warning: %s" % warning)
+    still = {c: e for c, e in cools.items() if c in (park.get("channels") or ())}
+    reopen = cooldown.earliest_reopen(still)
+    if reopen and now < reopen:
         if not when_open:
             sys.exit(
                 "%s is waiting on a provider quota window: %s reopens at %s.\n"
                 "Re-run then, or `delegate resume --when-open --id %s` to wait "
                 "here, or `delegate channels --clear <name>` if you believe a "
                 "seat is already back."
-                % (task.state["id"], ", ".join(park.get("channels") or ["the seat"]),
-                   _stamp(reopen), task.state["id"]))
+                % (task.state["id"], ", ".join(sorted(still)), _stamp(reopen),
+                   task.state["id"]))
         _wait_until(reopen, clock=clock, log=log)
     task.update(park=None)
 
@@ -252,9 +264,20 @@ def cmd_status(args):
     for t in tasks:
         s = t.state
         done = sum(1 for x in s.get("subtasks", []) if x.get("status") == "complete")
-        print("%-8s %-12s %2d/%-2d subtasks  $%.2f  %s" % (
-            s["id"], s["status"], done, len(s.get("subtasks", [])),
+        status = s["status"]
+        park = s.get("park") or {}
+        if park.get("reason") == "quota_all_exhausted":
+            # Otherwise a task that is merely early is indistinguishable from one
+            # that needs a human to think, which is the whole point of parking
+            # it differently.
+            status = "waiting on quota"
+        print("%-8s %-17s %2d/%-2d subtasks  $%.2f  %s" % (
+            s["id"], status, done, len(s.get("subtasks", [])),
             float(s.get("spent", {}).get("usd", 0)), t.path))
+        if park.get("reason") == "quota_all_exhausted" and park.get("reopen_at"):
+            print("%-8s   %s reopens at %s" % (
+                "", ", ".join(park.get("channels") or ["the seat"]),
+                _stamp(park["reopen_at"])))
 
 
 def cmd_show(args):

@@ -77,8 +77,16 @@ target can still escalate later if the work itself is stuck.
 The breaker lives in `$XDG_STATE_HOME/agent-delegation/channels.json` — beside
 `projects/`, **not** inside one, because a quota belongs to a seat and two repos
 driving the same subscription must see one cooldown. Expired entries are ignored
-on read and pruned on write. A corrupt or unreadable file is reported and
-treated as *no cooldowns*; it never invents one and never crashes a run.
+on read and pruned on write. A corrupt, wrongly-shaped, or unwritable file is
+reported and treated as *no cooldowns*; it never invents one and never crashes a
+run. Concurrency is honest about its limits: writes merge under an in-process
+lock, which makes a lost breaker between two `delegate` processes recoverable
+(the next call to that seat re-opens it) but does **not** make the file safe for
+simultaneous writers in the strict sense — there is no cross-process lock.
+
+`delegate channels --clear` is the override, and it really does unblock: the
+breaker file is what `resume` consults, so clearing a seat lets a parked task
+run again immediately rather than waiting out the recorded window.
 
 ```bash
 orchestrator/delegate channels                       # cooldowns and quota draw
@@ -105,7 +113,9 @@ wall. `reserve_for` / `reserve_fraction` keep the declared share of a seat free
 for the roles named there: a reserved role is never filtered out, a non-reserved
 one is once the seat passes `1 − reserve_fraction`, *unless* that would leave it
 with nowhere to go — then it gets the seat anyway and the demotion is logged. A
-reservation that parks work it could have done is not worth having.
+reservation that parks work it could have done is not worth having. "Nowhere to
+go" is judged **after** the check for which agent CLI is actually installed, not
+before: a candidate on an uninstalled CLI is not an alternative.
 
 `weekly_cap: true` is **not** modelled on the utilization path: estimating a
 weekly capacity from a five-hour `est_capacity` would be inventing a number. A

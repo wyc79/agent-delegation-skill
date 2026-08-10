@@ -531,6 +531,12 @@ a planner does that next, from your design.
             t.join()
         for sub in wave:
             outcome = results.get(sub["id"])
+            if isinstance(outcome, routing.AllChannelsCooled):
+                # Re-raised, not flattened into a Halt: a quota park carries a
+                # reopen time and drives `resume --when-open`. Downgrading it
+                # here left a wave-mode run with no `park` record at all, so the
+                # sequential and parallel paths disagreed about the same event.
+                raise outcome
             if isinstance(outcome, Exception):
                 raise Halt("needs_human", "%s failed: %s" % (sub["id"], outcome))
         self._integrate_wave(wave)
@@ -888,10 +894,19 @@ a planner does that next, from your design.
         error that knows when the seats come back."""
         _, cooled, util, entries = self._channel_state()
         blocked = cooled | set(exclude or ())
-        candidates = self.router.candidates(role, ceiling=self.budget.ceiling(),
-                                            boost=boost, cooldowns=blocked,
-                                            utilization=util)
-        for c in candidates:
+
+        def ask(ignore_reserve):
+            return self.router.candidates(role, ceiling=self.budget.ceiling(),
+                                          boost=boost, cooldowns=blocked,
+                                          utilization=util,
+                                          ignore_reserve=ignore_reserve)
+
+        # Two passes, and the order matters. A reservation only withholds a seat
+        # while the role has somewhere else to go, and "somewhere else" means a
+        # CLI this runtime can actually launch -- which the router cannot know.
+        # Deciding it there withheld a healthy seat and killed the run instead.
+        candidates = ask(False)
+        for c in candidates + ask(True):
             if self.adapter.can_run(c.agent_kind):
                 if c.demoted:
                     self.log("  reserve: %s on %s anyway — no alternative"
@@ -1003,7 +1018,7 @@ a planner does that next, from your design.
             self.log("  %s: skipped — %s" % (role, e))
             return None
 
-    def _direct(self, role, choice, text, timeout=180, pick_as=None):
+    def _direct(self, role, choice, text, timeout=180, pick_as=None, cooled=()):
         """One prompt, one answer, no report file -- the text-reply roles
         (§4.6). Shares the metering, billing and quota failover that `_invoke`
         gives every other role, which three hand-rolled copies of this dance
@@ -1017,10 +1032,16 @@ a planner does that next, from your design.
             self._close(session)
         if res.get("failure") == "quota_exhausted":
             at = self._cool(choice, res)
-            nxt = self._pick(pick_as or role, exclude=(choice.channel,))
+            # Accumulated, exactly as `_invoke` does: if the breaker could not be
+            # written -- an unwritable state dir, or a concurrent `--clear` --
+            # excluding only the last seat lets this bounce A->B->A->B through
+            # real, billed invocations until the stack runs out.
+            cooled = tuple(cooled) + (choice.channel,)
+            nxt = self._pick(pick_as or role, exclude=cooled)
             self.log("failover: %s %s -> %s (quota, reopens %s)"
                      % (role, choice.channel, nxt.channel, _stamp(at)))
-            return self._direct(role, nxt, text, timeout, pick_as=pick_as)
+            return self._direct(role, nxt, text, timeout, pick_as=pick_as,
+                                cooled=cooled)
         self._meter(choice)
         self._bill(res, choice)
         # Who actually ran it. After a failover that is not the channel the
@@ -1060,8 +1081,15 @@ a planner does that next, from your design.
             self._log_transcript(role, text, res)
             if res.get("failure") != "quota_exhausted":
                 break
-            at = self._cool(choice, res)
+            # Close first: `_cool` touches a shared file, and letting it run
+            # ahead of teardown meant a write failure leaked the session -- under
+            # the herdr adapter, an orphaned pane.
+            # Close first: `_cool` touches a shared file, and letting it run
+            # ahead of teardown meant a write failure leaked the session -- under
+            # the herdr adapter, an orphaned pane.
             self._close(session)
+            self._salvage(cwd, role, subtask)
+            at = self._cool(choice, res)
             cooled.append(choice.channel)
             self.task.record_delegation({
                 "stage": self.task.state["status"], "role": role,
@@ -1103,14 +1131,35 @@ a planner does that next, from your design.
         # a success.
         return session, report, choice
 
+    def _salvage(self, cwd, role, subtask):
+        """Commit whatever the killed agent left, so the replacement inherits a
+        checkpoint rather than a dirty tree.
+
+        A quota kill is involuntary -- the agent gets no turn to tidy up -- and
+        `_checkpoint` otherwise runs only after a green verify, so a seat that
+        dies on the first attempt leaves nothing committed at all. Without this
+        the handover note below would be asserting something usually false.
+
+        Guarded on the worktree: planner and brainstorm run with `cwd=self.repo`,
+        and this program has no path that commits to the user's own branch."""
+        if os.path.abspath(cwd) == os.path.abspath(self.repo):
+            return False
+        label = subtask.get("id") if subtask else role
+        if self._checkpoint(cwd, "adg %s: salvaged before quota failover" % label):
+            self.log("  salvaged %s's uncommitted work as a checkpoint" % label)
+            return True
+        return False
+
     def _handover(self, extra, failure):
-        """What the replacement agent is told. It inherits a worktree that
-        already holds the previous agent's checkpoints, and saying so is the
-        difference between continuing and starting over."""
+        """What the replacement agent is told. It inherits a worktree holding the
+        predecessor's checkpoints, including the one `_salvage` just made — but
+        it is told to look rather than to assume, because a hop can land after a
+        turn that produced nothing at all."""
         note = ("The agent that started this ran out of its provider's quota "
-                "part-way through. Its committed work is already in this "
-                "worktree — read it first and continue from there. Do not start "
-                "over, and do not revert anything you find.")
+                "part-way through. Whatever it finished is committed in this "
+                "worktree — check `git log` before you do anything, read what is "
+                "there, and continue from it. Do not start over, and do not "
+                "revert work you find.")
         if failure:
             note += "\n\nThe checks it left failing:\n\n%s" % failure
         return "%s\n\n%s" % (extra, note) if extra else note

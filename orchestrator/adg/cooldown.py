@@ -23,6 +23,7 @@ from .store import atomic_write, state_root
 
 VERSION = 1
 _LOCK = threading.RLock()
+_LAST_ERROR = None
 
 # Longest window any channel could declare, used to bound the usage log when a
 # caller does not say. Stamps beyond it cannot affect any utilisation figure.
@@ -37,11 +38,35 @@ def read(now):
     """-> (cooldowns, usage, warning). Expired breakers are already dropped, so
     a caller never has to remember to check the clock twice."""
     data, warning = _raw()
-    cools = {name: e for name, e in (data.get("cooldowns") or {}).items()
-             if _entry_ok(e) and float(e["reopen_at"]) > now}
-    usage = {name: [float(s) for s in stamps]
-             for name, stamps in (data.get("usage") or {}).items()
-             if isinstance(stamps, list)}
+    dropped = 0
+    try:
+        raw_cools = data.get("cooldowns") or {}
+        cools = {}
+        for name, e in raw_cools.items():
+            if not _entry_ok(e):
+                dropped += 1              # unreadable entry: we are about to
+                continue                  # treat a cooled seat as available
+            if float(e["reopen_at"]) > now:
+                cools[name] = e
+        usage = {}
+        for name, stamps in (data.get("usage") or {}).items():
+            if not isinstance(stamps, list):
+                dropped += 1
+                continue
+            usage[name] = [float(s) for s in stamps if _number(s)]
+            dropped += len(stamps) - len(usage[name])
+    except (AttributeError, TypeError, ValueError) as e:
+        # Valid JSON of the wrong *shape* -- a hand-edit, or a future version of
+        # this file. The top-level dict check does not catch it, and the promise
+        # at the top of this module is that nothing here is ever fatal.
+        return {}, {}, ("%s is the wrong shape (%s) -- continuing with no "
+                        "cooldowns. Delete it to start clean." % (path(), e))
+    if dropped and not warning:
+        # Dropping a breaker fails *open* -- it makes a cooled seat look
+        # available. Never do that quietly.
+        warning = ("%s has %d unreadable entr%s, ignored -- a cooldown recorded "
+                   "there is not being honoured. Delete it to start clean."
+                   % (path(), dropped, "y" if dropped == 1 else "ies"))
     return cools, usage, warning
 
 
@@ -56,23 +81,25 @@ def open_breaker(channel, reason, reopen_at, now, detail=""):
              "reopen_at": float(reopen_at), "detail": (detail or "")[:200]}
 
     def apply(data):
-        cur = (data.setdefault("cooldowns", {})).get(channel)
+        cur = data["cooldowns"].get(channel)
         if _entry_ok(cur) and float(cur["reopen_at"]) > entry["reopen_at"]:
             entry["reopen_at"] = float(cur["reopen_at"])
         data["cooldowns"][channel] = entry
 
-    _mutate(apply, now)
-    return entry
+    return _mutate(apply, now)
 
 
 def clear(channel):
     """-> True when something was actually removed, so the CLI can say so.
-    Clearing nothing writes nothing: a no-op should not conjure a state file."""
+
+    Goes through `_mutate` like every other write: a hand-rolled
+    read-modify-write here skipped the version default, the prune, and the
+    re-read that lets a concurrent writer's entry survive."""
     with _LOCK:
-        data, _ = _raw()
-        if (data.get("cooldowns") or {}).pop(channel, None) is None:
-            return False
-        atomic_write(path(), json.dumps(data, indent=2, sort_keys=True) + "\n")
+        cools, _, _ = read(float("-inf"))     # -inf: expiry is not the question
+        if channel not in cools:
+            return False                      # a no-op should not conjure a file
+        _mutate(lambda data: data["cooldowns"].pop(channel, None), None)
         return True
 
 
@@ -83,11 +110,13 @@ def record_use(channel, window_seconds, now):
     cutoff = float(now) - min(float(window_seconds or _MAX_WINDOW), _MAX_WINDOW)
 
     def apply(data):
-        stamps = (data.setdefault("usage", {})).setdefault(channel, [])
+        stamps = data["usage"].get(channel)
+        stamps = list(stamps) if isinstance(stamps, list) else []
         stamps.append(float(now))
-        data["usage"][channel] = [float(s) for s in stamps if float(s) >= cutoff]
+        data["usage"][channel] = [float(s) for s in stamps
+                                  if _number(s) and float(s) >= cutoff]
 
-    _mutate(apply, now)
+    return _mutate(apply, now)
 
 
 def utilization(stamps, quota_spec, now):
@@ -111,9 +140,15 @@ def earliest_reopen(cooldowns, channels=None):
 
 # --- internals -------------------------------------------------------------
 
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _entry_ok(entry):
+    if not isinstance(entry, dict):
+        return False
     try:
-        float((entry or {})["reopen_at"])
+        float(entry["reopen_at"])
         return True
     except (TypeError, ValueError, KeyError):
         return False
@@ -137,12 +172,41 @@ def _raw():
 
 
 def _mutate(fn, now):
+    """Apply fn to the file's contents. Returns None on success, else a warning.
+
+    Never raises. This file is advisory: a run whose breaker cannot be persisted
+    must keep going -- the failover loop excludes the dead channel in memory for
+    the rest of the invocation regardless -- but it must not pretend the write
+    happened, so the caller gets a string to log."""
+    global _LAST_ERROR
     with _LOCK:
         data, _ = _raw()                      # re-read: another writer may have won
+        if not isinstance(data.get("cooldowns"), dict):
+            data["cooldowns"] = {}            # recover a wrongly-shaped file
+        if not isinstance(data.get("usage"), dict):
+            data["usage"] = {}
         data.setdefault("version", VERSION)
-        fn(data)
-        if now is not None:                   # prune on write, never on read
-            data["cooldowns"] = {
-                n: e for n, e in (data.get("cooldowns") or {}).items()
-                if _entry_ok(e) and float(e["reopen_at"]) > float(now)}
-        atomic_write(path(), json.dumps(data, indent=2, sort_keys=True) + "\n")
+        try:
+            fn(data)
+            if now is not None:               # prune on write, never on read
+                data["cooldowns"] = {
+                    n: e for n, e in data["cooldowns"].items()
+                    if _entry_ok(e) and float(e["reopen_at"]) > float(now)}
+            atomic_write(path(), json.dumps(data, indent=2, sort_keys=True) + "\n")
+        except (AttributeError, TypeError, ValueError) as e:
+            _LAST_ERROR = "%s could not be updated (%s)" % (path(), e)
+        except OSError as e:
+            # A read-only or full state dir. Ordinary in a CI sandbox, and
+            # `_meter` runs after every single invocation -- raising here would
+            # kill a run that has nothing wrong with it.
+            _LAST_ERROR = ("%s is not writable (%s) -- quota cooldowns will not "
+                           "persist across runs." % (path(), e))
+        else:
+            _LAST_ERROR = None
+        return _LAST_ERROR
+
+
+def last_error():
+    """The most recent write failure, or None. Callers log it; nothing retries,
+    because the next write attempt is the retry."""
+    return _LAST_ERROR

@@ -165,7 +165,8 @@ def _from_clock(text, now):
 
 def parse_window(text, default=5 * 3600.0):
     """`5h`, `24h`, `weekly`, `monthly` -> seconds. An unparseable window
-    returns the default rather than 0, which would mean 'always exhausted'."""
+    returns the default rather than 0, which would mean 'always exhausted' --
+    and a zero window makes a breaker expire in the same write that opens it."""
     if isinstance(text, (int, float)) and not isinstance(text, bool):
         return float(text) if text > 0 else float(default)
     key = str(text or "").strip().lower()
@@ -173,10 +174,14 @@ def parse_window(text, default=5 * 3600.0):
         return float(_WINDOWS[key])
     m = _DURATION.match(key)
     if m:
-        unit = m.group(2).rstrip("s")
-        secs = _UNITS.get(unit) or _UNITS.get(unit[:1])
+        # Whole-word units only. A first-letter fallback silently read `1month`
+        # as one *minute*, which is a 60-second window on a monthly seat --
+        # wrong by four orders of magnitude and completely invisible.
+        secs = _UNITS.get(m.group(2).rstrip("s"))
         if secs:
-            return float(m.group(1)) * secs
+            got = float(m.group(1)) * secs
+            if got > 0:
+                return got
     return float(default)
 
 
