@@ -13,7 +13,7 @@ import os
 import re
 import time
 
-from . import brief, limits as lim, prompts, router as routing, schema, verify, yamlite
+from . import brief, limits as lim, prompts, router as routing, schema, verify, winnow, yamlite
 from .store import git
 
 STAGES = ["intake", "classify", "plan", "implement", "verify", "review", "integrate", "done"]
@@ -331,9 +331,28 @@ class Orchestrator:
             return None
         return "simple change, all checks green, nothing outside the declared scope"
 
+    def _winnow(self, base, result):
+        """Deterministic chaff scan, if code-winnow is installed. Free enough to
+        run even when LLM review is skipped, which is exactly when the extra
+        evidence is worth most."""
+        if (self.vcfg.get("winnow") or "auto") == "never":
+            return None
+        scan_py = winnow.find(self.repo, self.vcfg.get("winnow_scan"))
+        if not scan_py:
+            return {"ran": False, "why": "code-winnow not installed"}
+        summary = winnow.run(self.task, scan_py, base,
+                             self.task.state["repo"].get("base_commit", "HEAD"),
+                             result.run_id)
+        if summary and summary.get("ran"):
+            self.log("  chaff scan: %d note(s), %d notable"
+                     % (summary["total"], len(summary["notable"])))
+        return summary
+
     def _stage_review(self):
         base = self._ensure_worktree()
         result = verify.run(self.task, self.repo, base, "slow" if self.vcfg.get("slow") else "fast")
+        wn = self._winnow(base, result)
+        self.task.update(winnow=wn)
         skip = self._skip_review(result)
         if skip:
             self.log("review: skipped — %s" % skip)
@@ -351,9 +370,15 @@ class Orchestrator:
             return
         choice = self._pick("reviewer")
         self.log("review: %s via %s" % (choice.model, choice.channel))
-        self._close(self._invoke("reviewer", choice, cwd=base,
-                    extra="Write your verdict to reports/review-reviewer.json, matching "
-                          "%s/schemas/verdict.schema.json." % prompts.skill_path()))
+        extra = ("Write your verdict to reports/review-reviewer.json, matching "
+                 "%s/schemas/verdict.schema.json." % prompts.skill_path())
+        chaff = winnow.as_text(self.task.state.get("winnow"))
+        if chaff:
+            extra += ("\n\n%s\nRead these after the diff, not before. They may only "
+                      "block if they independently land on authority — an acceptance "
+                      "criterion, a plan line, or a stated non-goal. Otherwise record "
+                      "them under `advisory`." % chaff)
+        self._close(self._invoke("reviewer", choice, cwd=base, extra=extra))
         verdict = self._read_verdict()
         self.log("review: %s" % verdict["verdict"])
         self.task.update(review_outcome={"reviewed": True, "verdict": verdict["verdict"]})
@@ -415,6 +440,9 @@ class Orchestrator:
             note = ("**No independent review was run** (%s). The automated checks "
                     "below are the only evidence. Re-run with `--review always` if "
                     "you want a second opinion." % ro.get("why", "not requested"))
+        chaff = winnow.as_text(self.task.state.get("winnow"))
+        if chaff:
+            note += "\n\n" + chaff
         text, problems = brief.write(
             self.task, "merge",
             "Land this change? It is complete and its checks pass. In attended mode "

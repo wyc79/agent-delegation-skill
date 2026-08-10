@@ -17,7 +17,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from adg import brief, limits, prompts, router, runtime, schema, store, verify, yamlite
+from adg import brief, limits, prompts, router, runtime, schema, store, verify, winnow, yamlite
 from adg.machine import Orchestrator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -386,6 +386,63 @@ class TestChannelAvailability(unittest.TestCase):
         with self.assertRaises(router.NoModelAvailable) as cm:
             orch2._pick("implementer")
         self.assertIn("needs", str(cm.exception), "error should name the missing CLI")
+
+
+class TestWinnow(unittest.TestCase):
+    """code-winnow is referenced, never vendored: a stale copy that reports
+    nothing looks exactly like a clean scan."""
+
+    def test_absent_scanner_degrades_loudly_not_silently(self):
+        import tempfile
+        empty = tempfile.mkdtemp()          # a machine with no skills installed
+        prev = os.environ.get("HOME")
+        os.environ["HOME"] = empty
+        try:
+            self.assertIsNone(winnow.find(empty, configured="/nope/scan.py"))
+        finally:
+            if prev is not None:
+                os.environ["HOME"] = prev
+            shutil.rmtree(empty, ignore_errors=True)
+
+    def test_explicit_path_and_env_override_win(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        fake = os.path.join(d, "scan.py")
+        open(fake, "w").close()
+        self.assertEqual(winnow.find("/nonexistent", configured=fake), fake)
+        os.environ[winnow.ENV_OVERRIDE] = fake
+        try:
+            self.assertEqual(winnow.find("/nonexistent"), fake)
+        finally:
+            del os.environ[winnow.ENV_OVERRIDE]
+        shutil.rmtree(d, ignore_errors=True)
+
+    def test_summary_keeps_only_significant_findings(self):
+        s = winnow.summarize({"findings": [
+            {"severity": "P1", "path": "a.py", "line": 3, "message": "except/pass"},
+            {"severity": "P3", "path": "b.py", "line": 9, "message": "em dash"},
+            {"severity": "P2", "path": "a.py", "line": 1, "message": "no assertion"},
+        ]})
+        self.assertEqual(s["total"], 3)
+        self.assertEqual([n["severity"] for n in s["notable"]], ["P1", "P2"])
+
+    def test_foreign_schema_changes_degrade_instead_of_crashing(self):
+        # Another project's JSON: a moved key must shrink the summary, not
+        # break the pipeline.
+        s = winnow.summarize({"findings": [{"sev": "P1"}, "not-a-dict", {}]})
+        self.assertTrue(s["ran"])
+        self.assertEqual(s["notable"], [])
+
+    def test_text_never_implies_a_scan_that_did_not_happen(self):
+        t = winnow.as_text({"ran": False, "why": "code-winnow not installed"})
+        self.assertIn("did not run", t)
+        self.assertIn("not installed", t)
+
+    def test_findings_are_labelled_advisory(self):
+        t = winnow.as_text(winnow.summarize({"findings": [
+            {"severity": "P1", "path": "a.py", "line": 3, "message": "except/pass"}]}))
+        self.assertIn("advisory", t)
+        self.assertIn("not requirement failures", t)
 
 
 class TestEndToEnd(unittest.TestCase):

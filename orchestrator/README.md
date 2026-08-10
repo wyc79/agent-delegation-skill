@@ -36,6 +36,8 @@ hotspots:                   # force COMPLEX classification when mentioned
   - "src/combat/combat_system.gd"
 ignore:                     # extra generated paths to exclude from scope accounting
   - "Build/*"
+winnow: auto                # auto (default) | never — deterministic chaff scan
+winnow_scan: ~/.claude/skills/code-winnow/scripts/scan.py   # only if autodetect misses
 ```
 
 No config is legal — checks are then reported as *not run* rather than faked.
@@ -50,6 +52,7 @@ No config is legal — checks are then reported as *not run* rather than faked.
 | `adg/limits.py` | Hard limits, checked before the action, failing closed. |
 | `adg/runtime.py` | The seven-operation adapter: `local`, `herdr`, `mock`. |
 | `adg/verify.py` | Deterministic checks and mechanical scope comparison. |
+| `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. |
 | `adg/brief.py` | Human-facing gate briefs, plus the jargon lint. |
 | `adg/schema.py` | Report/verdict validation against the skill's schemas. |
 | `adg/prompts.py` | Injects role, paths, scope, budget — and nothing else. |
