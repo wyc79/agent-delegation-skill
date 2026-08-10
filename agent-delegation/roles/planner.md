@@ -8,10 +8,12 @@ You write **no production code**. Reading code is your main activity.
 
 ## Step 1 — Read the request and pin the requirements
 
-Read `$TASK_DIR/task.md`. If its acceptance criteria are not already numbered
-`AC-1`, `AC-2`, …, number them now: each must be a single, checkable statement
-("old save files still load"), not a paragraph. Add explicit **non-goals** — they
-are what stops downstream agents from expanding scope.
+Read `$TASK_DIR/task.md`. If acceptance criteria are **missing entirely**, add
+them — that is the one amendment to `task.md` a non-human may make, and it is
+yours. Each is a single checkable statement ("old save files still load"), not a
+paragraph; add non-goals too. Never reword or remove a criterion already there:
+downstream agents cite these ids, so editing one silently rewrites the target
+everyone else is working to.
 
 If a requirement is genuinely ambiguous, do not silently pick: record it in Step 5
 as an open question **with your recommended default**, so the human can approve by
@@ -35,12 +37,11 @@ Budget this step. Reading three key files well beats skimming thirty.
 Append each real design decision to `decisions.md`, one line each:
 
 ```text
-D-1 | planner | Reuse the existing EventBus rather than a new dispatcher — one
+D-plan-1 | planner | Reuse the existing EventBus rather than a new dispatcher — one
      subscription path is easier to debug and the perf headroom is sufficient.
 ```
 
-Record decisions that constrain downstream agents or that a reviewer would
-otherwise question. Skip the obvious.
+Record what constrains downstream agents or would otherwise puzzle a reviewer.
 
 ## Step 4 — Decompose into subtasks
 
@@ -59,8 +60,10 @@ plan* — write the exact signature or signal — so both can proceed in paralle
 Write `plan.md` from `templates/plan.md`: prose approach and risks for humans,
 plus one YAML block per subtask with `id`, `goal`, `file_scope` (write scope,
 be precise — this is enforced), `reads`, `depends_on`, `parallel_group`,
-`hotspots`, `capability_hint`, `estimated_loc`, and the `acceptance` criteria
-it satisfies.
+`hotspots`, `frozen_interfaces` (the exact signature or signal another subtask
+codes against), `capability_hint`, `estimated_loc`, `test_notes`, and the
+`acceptance` criteria it satisfies. `schemas/subtask.schema.json` is the full
+field list.
 
 Every `AC-n` in `task.md` must appear in at least one subtask's `acceptance`.
 Check this explicitly before moving on; an unassigned AC is a guaranteed review
@@ -74,8 +77,9 @@ dependency changes, public API or save-format changes, deletions, hotspot edits.
 
 ## Step 6 — Report
 
-Write `reports/plan-planner.json` (see `schemas/report.schema.json`), including
-`subtask_ids`, `open_questions`, and your `estimated_total_loc`.
+Write `reports/plan-planner.json` (`schemas/report.schema.json`). Anything the
+schema has no field for goes under `role_data` — here `role_data.subtask_ids`
+and `role_data.estimated_total_loc`; `open_questions` is already top level.
 
 ## If you were invoked to re-plan
 

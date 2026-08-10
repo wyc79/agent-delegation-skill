@@ -313,6 +313,7 @@ a planner does that next, from your design.
 
     def _stage_plan(self):
         choice = self._pick("planner")
+        self._archive_reports("plan-")
         self.log("plan: %s via %s" % (choice.model, choice.channel))
         self.budget.check_cost(0.0)
         extra = ("Write plan.md now. Use the template at %s/templates/plan.md."
@@ -654,6 +655,7 @@ a planner does that next, from your design.
             self.task.update(status="implement")
             return
         choice = self._pick("reviewer")
+        self._archive_reports("review-")
         self.log("review: %s via %s" % (choice.model, choice.channel))
         extra = ("Write your verdict to reports/review-reviewer.json, matching "
                  "%s/schemas/verdict.schema.json." % prompts.skill_path())
@@ -676,6 +678,17 @@ a planner does that next, from your design.
             data = self.task.read_json(path)
         except (OSError, ValueError):
             raise Halt("needs_human", "reviewer wrote no valid verdict file")
+        # The verdict rides inside a normal report as role_data.verdict. A bare
+        # verdict file is still accepted: older reviewers and hand-driven runs
+        # write one, and refusing it would discard a real review over shape.
+        if "verdict" not in data:
+            inner = (data.get("role_data") or {}).get("verdict")
+            if inner is None:
+                if data.get("status") in ("blocked", "escalate"):
+                    raise Halt("needs_human", "reviewer could not review: %s"
+                               % (data.get("summary", "")[:200]))
+                raise Halt("needs_human", "reviewer report carries no verdict")
+            data = inner
         try:
             schema.validate_verdict(data)
         except schema.Invalid as e:
@@ -845,6 +858,24 @@ a planner does that next, from your design.
         repo_info = dict(state["repo"], base_commit=base)
         self.task.update(worktree=path, branch=branch, repo=repo_info)
         return path
+
+    def _archive_reports(self, match):
+        """Move a stage's previous reports aside before it runs again. Reviewers
+        are told to check whether their earlier findings were addressed, which
+        is impossible against a file the next round overwrites."""
+        src = self.task.file("reports")
+        if not os.path.isdir(src):
+            return
+        dest = self.task.file("reports", "archive")
+        for name in sorted(os.listdir(src)):
+            if not name.endswith(".json") or match not in name:
+                continue
+            os.makedirs(dest, exist_ok=True)
+            n, target = 1, None
+            while target is None or os.path.exists(target):
+                target = os.path.join(dest, "%s-r%d.json" % (name[:-5], n))
+                n += 1
+            os.replace(os.path.join(src, name), target)
 
     def _invoke(self, role, choice, cwd, subtask=None, extra=None,
                 session=None, failure=None):

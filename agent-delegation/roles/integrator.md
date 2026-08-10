@@ -48,7 +48,7 @@ a `blocked` report, not an invitation to redesign.
 Append to `decisions.md` — this is the entry a confused reader will need most:
 
 ```text
-D-7 | integrator | st-2 and st-4 both registered the poison handler. Kept st-4's
+D-int-1 | integrator | st-2 and st-4 both registered the poison handler. Kept st-4's
      registration (plan.md:L61 assigns wiring to st-4); removed st-2's duplicate.
 ```
 

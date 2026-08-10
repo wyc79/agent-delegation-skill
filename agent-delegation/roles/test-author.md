@@ -65,9 +65,10 @@ Capture that output. It is the proof your tests measure something.
 
 ## Step 6 — Report
 
-Write `reports/test-test-author.json` per `schemas/report.schema.json`. Include
-the `AC-n → test name` mapping from Step 2, the criteria you could **not** cover
-and why, and the failing-run output as evidence.
+Write `reports/test-test-author.json` per `schemas/report.schema.json`. The
+Step 2 mapping goes under `role_data.ac_coverage` as `{"AC-1": "test_name"}`,
+the criteria you could **not** cover and why under `role_data.uncovered`, and
+the failing-run output in `evidence`.
 
 ## Stop and escalate when
 

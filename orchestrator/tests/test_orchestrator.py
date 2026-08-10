@@ -1060,6 +1060,105 @@ class TestCostBreakdown(unittest.TestCase):
         self.assertEqual(brief.lint("\n".join(brief._cost_section(self.STATE))), [])
 
 
+class TestSkillContract(unittest.TestCase):
+    """The systemic gap: schemas and role cards were written in separate passes
+    and never checked against each other. A reviewer literally could not write a
+    file that satisfied both, and nothing caught it because every fixture in
+    this suite was hand-written to be valid."""
+
+    SKILL = os.path.join(REPO_ROOT, "agent-delegation")
+
+    def _card(self, name):
+        with open(os.path.join(self.SKILL, "roles", "%s.md" % name)) as fh:
+            return fh.read()
+
+    def test_a_reviewer_report_validates_as_a_report(self):
+        report = {
+            "stage": "review", "role": "reviewer", "status": "complete",
+            "summary": "checked the criteria", "evidence": {"tests": "214 passed"},
+            "role_data": {"verdict": {
+                "verdict": "APPROVE",
+                "ac_table": [{"ac": "AC-1", "status": "met", "evidence": "t.py:9"}],
+                "findings": []}},
+        }
+        schema.validate_report(report)
+        schema.validate_verdict(report["role_data"]["verdict"])
+
+    def test_the_reviewer_can_report_blocked(self):
+        # It had no legal way to say "I could not review this".
+        schema.validate_report({
+            "stage": "review", "role": "reviewer", "status": "blocked",
+            "summary": "no diff was provided", "evidence": {"not_verified": ["everything"]}})
+
+    def test_every_field_a_card_names_is_legal(self):
+        # Fields a role card tells an agent to write must exist in the schema or
+        # be explicitly routed to role_data.
+        report = json.load(open(os.path.join(self.SKILL, "schemas", "report.schema.json")))
+        allowed = set(report["properties"])
+        for role, named in [("planner", ["subtask_ids", "estimated_total_loc"]),
+                            ("test-author", ["ac_coverage"])]:
+            card = self._card(role)
+            for field in named:
+                self.assertIn(field, card, "%s no longer names %s" % (role, field))
+                self.assertNotIn(field, allowed, "schema gained %s; update the card" % field)
+                near = card[max(0, card.find(field) - 220):card.find(field) + 40]
+                self.assertIn("role_data", near,
+                              "%s tells the agent to write %s without routing it to "
+                              "role_data" % (role, field))
+
+    def test_cards_do_not_point_at_the_verdict_schema_as_a_file(self):
+        self.assertNotIn("per `schemas/verdict.schema.json`", self._card("reviewer"))
+
+    def test_namespaced_deviation_ids_are_accepted_and_bare_ones_are_not(self):
+        base = {"stage": "implement", "role": "implementer", "status": "complete",
+                "summary": "s", "evidence": {"tests": "ok"}}
+        schema.validate_report(dict(base, deviations=["dev-st-2-1"]))
+        with self.assertRaises(schema.Invalid):
+            schema.validate_report(dict(base, deviations=["dev-3"]))
+
+    def test_empty_evidence_is_rejected(self):
+        with self.assertRaises(schema.Invalid):
+            schema.validate_report({"stage": "implement", "role": "implementer",
+                                    "status": "complete", "summary": "s", "evidence": {}})
+
+    def test_out_of_scope_severity_is_stated_once_and_agrees(self):
+        ref = open(os.path.join(self.SKILL, "references", "deviations.md")).read()
+        impl = self._card("implementer")
+        self.assertIn("One exception:", ref, "the carve-out belongs with the rule")
+        self.assertNotIn("Small mechanical exceptions", impl,
+                         "implementer.md restates the severity rule differently again")
+
+    def test_task_md_authority_matches_what_the_planner_is_told(self):
+        skill = open(os.path.join(self.SKILL, "SKILL.md")).read()
+        self.assertNotIn("amended only by humans", skill)
+        self.assertIn("planner may add criteria", skill)
+        self.assertIn("missing entirely", self._card("planner"))
+
+
+class TestRoundVersioning(unittest.TestCase):
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_a_second_round_does_not_destroy_the_first(self):
+        task = store.Task.create(self.t.repo, "T-A", "# t\n",
+                                 dict(self.reg["policy"]["limits"]))
+        _report(task.path, "review-reviewer.json", {"round": 1})
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        orch._archive_reports("review-")
+        _report(task.path, "review-reviewer.json", {"round": 2})
+        orch._archive_reports("review-")
+        archived = sorted(os.listdir(task.file("reports", "archive")))
+        self.assertEqual(archived, ["review-reviewer-r1.json", "review-reviewer-r2.json"])
+        rounds = [json.load(open(task.file("reports", "archive", a)))["round"]
+                  for a in archived]
+        self.assertEqual(rounds, [1, 2], "an earlier round was overwritten")
+
+
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
     nothing looks exactly like a clean scan."""

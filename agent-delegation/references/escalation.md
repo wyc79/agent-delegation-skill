@@ -17,10 +17,10 @@ These are thresholds, not suggestions. Do not negotiate with them.
 |---|---|
 | `test_stuck` | The same test has failed **3** consecutive fix attempts |
 | `edit_churn` | You have rewritten the same file **4+** times without converging |
-| `scope_overrun` | Your change needs more than ~5 files beyond `file_scope`, or is roughly double `estimated_loc` |
+| `scope_overrun` | The work is far bigger than planned — beyond ~5 files outside `file_scope`, or roughly double `estimated_loc`. This is about **magnitude**, not permission: a single out-of-scope file is a deviation question, not this signal |
 | `plan_conflict` | The plan asserts something the code contradicts, and you cannot patch it locally |
 | `ambiguous_requirement` | A requirement admits two reasonable readings that produce different code, and picking wrong is expensive |
-| `blocked_command` | A command you need is denied by the permission broker |
+| `blocked_command` | A command you need is refused by the sandbox or the runtime |
 | `missing_dependency` | The work needs a new dependency, tool, or engine version |
 
 Three attempts is the threshold because attempts 4 through 10 by the *same*
@@ -37,7 +37,7 @@ agent skip everything you already ruled out:
 {
   "type": "plan_conflict",
   "detail": "plan.md:L48 says extend BaseSystem, but BaseSystem is final in engine 4.3 and cannot be subclassed.",
-  "evidence": "godot --headless --check src/effects/poison.gd → ERROR: Cannot extend final class 'BaseSystem' (line 3)",
+  "evidence": "godot --headless --check-only --script src/effects/poison.gd → ERROR: Cannot extend final class 'BaseSystem' (line 3)",
   "attempted": [
     "Subclass directly — compile error above",
     "Composition wrapper — works, but plan.md:L52 assumes callers get a BaseSystem"
