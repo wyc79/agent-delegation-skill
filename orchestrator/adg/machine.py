@@ -241,7 +241,8 @@ admits only one sensible reading.
         sizes = []
         for f in files[:400]:
             try:
-                sizes.append((len(open(os.path.join(self.repo, f), "rb").read().splitlines()), f))
+                with open(os.path.join(self.repo, f), "rb") as fh:
+                    sizes.append((len(fh.read().splitlines()), f))
             except OSError:
                 continue
         sizes.sort(reverse=True)
@@ -1344,10 +1345,11 @@ a planner does that next, from your design.
             return None, None, choice
         cooled, base_extra = [], extra
         while True:
-            # Reports are matched by mtime after this point: on a rework loop the
-            # previous attempt's report is still on disk, and accepting it would
-            # read a stale success as a fresh one.
-            started = time.time() - 1
+            # Snapshot the reports directory: on a rework loop the previous
+            # attempt's file is still on disk at the same path, and accepting it
+            # would read a stale success as a fresh one. Comparing against what
+            # was there before the turn needs no clock and no tolerance.
+            before = self._report_state()
             if session is None:
                 text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
                                        verify_cfg=self.vcfg)
@@ -1392,7 +1394,7 @@ a planner does that next, from your design.
         self._meter(choice)
         self._bill(res, choice)
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
-        report, problems = self._collect_report(role, subtask, since=started)
+        report, problems = self._collect_report(role, subtask, before=before)
 
         if report is None:
             outcome = "blocked"
@@ -1507,10 +1509,34 @@ a planner does that next, from your design.
                              % (prompt, res.get("settled"), res.get("code"),
                                 (res.get("output") or "")[-8000:]))
 
-    def _collect_report(self, role, subtask, since=0):
+    def _report_state(self):
+        """Fingerprint every report on disk, so "did this turn write it?" is
+        answered by comparison rather than by a clock.
+
+        (mtime, size) rather than mtime alone: a filesystem with coarse
+        timestamps can stamp two writes inside one tick, and their sizes almost
+        always differ. Identical bytes rewritten within one tick still read as
+        unchanged -- which fails toward "no report", the safe direction, since
+        the report is evidence and absent beats wrongly attributed."""
+        out = {}
+        try:
+            names = os.listdir(self.task.file("reports"))
+        except OSError:
+            return out
+        for name in names:
+            try:
+                st = os.stat(self.task.file("reports", name))
+            except OSError:
+                continue
+            out[name] = (st.st_mtime, st.st_size)
+        return out
+
+    def _collect_report(self, role, subtask, before=None):
         """Find and validate this role's report from *this* invocation.
         Liveness is not success -- an agent can settle idle having done
-        nothing (§4.6), so the report is the evidence, not the exit code."""
+        nothing (§4.6), so the report is the evidence, not the exit code.
+
+        `before` is `_report_state()` from the start of the turn."""
         for name, data in sorted(self.task.reports().items()):
             # When a subtask is named, its id is the ONLY thing that identifies
             # its report. Accepting `role in name` as an alternative could not
@@ -1525,11 +1551,13 @@ a planner does that next, from your design.
                     continue
             elif role not in name:
                 continue
-            try:
-                if os.path.getmtime(self.task.file("reports", name)) < since:
-                    continue  # left over from an earlier attempt
-            except OSError:
-                continue
+            if before is not None:
+                try:
+                    st = os.stat(self.task.file("reports", name))
+                except OSError:
+                    continue
+                if before.get(name) == (st.st_mtime, st.st_size):
+                    continue  # untouched this turn: an earlier attempt's file
             if data is None:
                 return None, ["%s is not valid JSON" % name]
             try:
