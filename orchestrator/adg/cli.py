@@ -132,9 +132,17 @@ def cmd_resume(args):
     repo = _repo(args.repo)
     reg = routing.load_registry(args.registry)
     task = store.Task.open(repo, args.id)
-    print("resuming %s from %s" % (task.state["id"], task.state["status"]))
-    if task.state["status"] in ("needs_human", "abandoned"):
-        task.update(status=args.stage or "implement")
+    was = task.state["status"]
+    # An explicit --stage is honoured whenever it is given. A task interrupted
+    # mid-flight keeps the status of the stage that was running, so gating the
+    # override on "parked" silently dropped the flag exactly when it was most
+    # needed -- and re-ran a stage the user was trying to skip past.
+    if args.stage:
+        task.update(status=args.stage)
+    elif was in ("needs_human", "abandoned"):
+        task.update(status="implement")
+    print("resuming %s from %s%s" % (task.state["id"], task.state["status"],
+                                     "" if task.state["status"] == was else " (was %s)" % was))
     adapter = runtime.get(args.adapter or _default_adapter(reg))
     from .machine import Orchestrator
     gate = _auto_approve if args.yes else _confirm

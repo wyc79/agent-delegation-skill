@@ -928,6 +928,34 @@ class TestIntakeAndBrainstorm(unittest.TestCase):
         self.assertIn("rather than redesigning", prompts_seen[0])
 
 
+class TestResume(unittest.TestCase):
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_explicit_stage_is_honoured_mid_flight(self):
+        # A run killed during `plan` keeps status "plan". Gating the override on
+        # "parked" dropped --stage exactly when it mattered and re-ran the very
+        # stage the user was skipping past.
+        from adg import cli
+        task = store.Task.create(self.t.repo, "T-RS", "# t\n",
+                                 dict(self.reg["policy"]["limits"]))
+        task.update(status="plan")
+
+        class Args:
+            repo, registry, id, stage = self.t.repo, REGISTRY, "T-RS", "implement"
+            adapter, dry_run, yes = "mock", True, True
+
+        try:
+            cli.cmd_resume(Args())
+        except SystemExit:
+            pass
+        self.assertNotEqual(store.Task.open(self.t.repo, "T-RS").state["status"], "plan")
+
+
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
     nothing looks exactly like a clean scan."""
