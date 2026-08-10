@@ -73,3 +73,17 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
 def env_for(task):
     return {"AGENT_DELEGATION_TASK_DIR": task.path,
             "AGENT_DELEGATION_SKILL_DIR": skill_path()}
+
+
+def retry(failure):
+    """Follow-up turn for an agent that is already loaded with the task. It has
+    the protocol, the plan and the code in context, so this says only what is
+    new -- what broke."""
+    return (
+        "The checks did not pass. Real output:\n\n%s\n\n"
+        "Fix the cause, not the symptom, and stay inside your file scope. "
+        "Re-run the checks yourself before finishing. If you now believe the "
+        "plan or the test is wrong rather than the code, stop and say so in "
+        "your report with the evidence instead of forcing a pass."
+        % (failure or "(no output captured)")
+    )

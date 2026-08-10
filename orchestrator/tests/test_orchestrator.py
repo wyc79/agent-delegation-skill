@@ -291,6 +291,103 @@ def _report(cwd_task, name, payload):
         json.dump(payload, fh)
 
 
+class TestClassifier(unittest.TestCase):
+    """The keyword classifier sent a 12-line change down the full planning
+    pipeline. Classification is a judgement, so a model makes it."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.limits = dict(self.reg["policy"]["limits"],
+                           escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        self.t.close()
+
+    def _classify(self, request, verdict="SIMPLE -- small self-contained change",
+                  hotspots=None):
+        if hotspots:
+            with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+                fh.write("hotspots:\n" + "".join('  - "%s"\n' % h for h in hotspots))
+        task = store.Task.create(self.t.repo, "T-001", "# t\n\n%s\n" % request, self.limits)
+        seen = {}
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                seen["role"] = session.handle["role"]
+                seen["prompt"] = text
+                return {"settled": "idle", "output": "VERDICT: %s" % verdict, "code": 0}
+
+        orch = Orchestrator(task, self.reg, A(), lambda k, t: True, log=lambda *_: None)
+        orch._stage_classify()
+        return task.state["classification"], seen
+
+    def test_adding_a_function_is_simple(self):
+        # The exact request that took 40 minutes on the keyword classifier.
+        c, _ = self._classify("Add a subtract function to the calculator API, "
+                              "with a unit test covering it.")
+        self.assertEqual(c["tier"], "simple")
+
+    def test_the_word_api_does_not_decide_anything(self):
+        c, _ = self._classify("Add an API helper", verdict="SIMPLE -- one function")
+        self.assertEqual(c["tier"], "simple", "a keyword must not outvote the judge")
+
+    def test_model_can_say_complex(self):
+        c, _ = self._classify("Migrate the save format",
+                              verdict="COMPLEX -- changes a shared format")
+        self.assertEqual(c["tier"], "complex")
+
+    def test_classifier_sees_repo_facts_not_just_the_request(self):
+        _, seen = self._classify("Add a subtract function")
+        self.assertIn("tracked files", seen["prompt"])
+        self.assertIn("app.py", seen["prompt"])
+
+    def test_hotspot_overrides_the_model(self):
+        # Not a judgement call: declared hotspots always get a plan.
+        c, seen = self._classify("Change combat_system.gd damage",
+                                 verdict="SIMPLE -- looks small",
+                                 hotspots=["combat_system.gd"])
+        self.assertEqual(c["tier"], "complex")
+        self.assertEqual(c["by"], "policy")
+        self.assertNotIn("prompt", seen, "no model call needed for a policy override")
+
+    def test_unparseable_verdict_fails_safe(self):
+        c, _ = self._classify("Add a thing", verdict="I think maybe it depends")
+        self.assertEqual(c["tier"], "complex")
+        self.assertEqual(c["by"], "fallback")
+
+
+class TestChannelAvailability(unittest.TestCase):
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_uninstalled_cli_is_skipped_not_crashed_on(self):
+        task = store.Task.create(self.t.repo, "T-001", "# t\n",
+                                 dict(self.reg["policy"]["limits"]))
+
+        class OnlyCursor(runtime.MockAdapter):
+            def can_run(self, kind):
+                return kind == "cursor"
+
+        orch = Orchestrator(task, self.reg, OnlyCursor(), lambda k, t: True,
+                            log=lambda *_: None)
+        self.assertEqual(orch._pick("implementer").agent_kind, "cursor")
+
+        class NothingInstalled(runtime.MockAdapter):
+            def can_run(self, kind):
+                return False
+
+        orch2 = Orchestrator(task, self.reg, NothingInstalled(), lambda k, t: True,
+                             log=lambda *_: None)
+        with self.assertRaises(router.NoModelAvailable) as cm:
+            orch2._pick("implementer")
+        self.assertIn("needs", str(cm.exception), "error should name the missing CLI")
+
+
 class TestEndToEnd(unittest.TestCase):
     """Milestone 1 (DESIGN.md §15.1)."""
 
@@ -397,6 +494,43 @@ class TestEndToEnd(unittest.TestCase):
         roles = [h["role"] for h in task.state["delegation_history"]]
         self.assertEqual(roles.count("implementer"), 2)
         self.assertLess(roles.index("implementer"), roles.index("reviewer"))
+
+    def test_retry_continues_the_same_agent_instead_of_restarting(self):
+        # A fresh agent per attempt re-reads the protocol, the task and the
+        # repo every time -- most of the wall clock on a short task.
+        script, state = self._script(fail_first=True)
+        status, task, adapter, logs = self._run(script)
+        self.assertEqual(status, "done", "\n".join(logs))
+        follow_ups = [c for c in adapter.calls if c[0] == "follow_up"]
+        self.assertEqual(len(follow_ups), 1, "second attempt should be a follow-up")
+        self.assertEqual(follow_ups[0][1], "implementer")
+        self.assertIn("continued", "\n".join(logs))
+
+    def test_retry_prompt_carries_the_real_failure(self):
+        script, _ = self._script(fail_first=True)
+        captured = []
+
+        class A(runtime.MockAdapter):
+            def follow_up(self, session, text, timeout):
+                captured.append(text)
+                return runtime.MockAdapter.follow_up(self, session, text, timeout)
+
+        pol = dict(self.reg["policy"]["limits"],
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        task = store.Task.create(self.t.repo, "T-003", "# t\n\nAdd subtract\n", pol)
+        Orchestrator(task, self.reg, A(script), lambda k, t: True, log=lambda *_: None).run()
+        self.assertTrue(captured, "no follow-up sent")
+        self.assertIn("did not pass", captured[0])
+        self.assertIn("import app", captured[0], "should quote the failing command")
+
+    def test_reviewer_is_always_a_fresh_session(self):
+        # Independence is the whole point of review: it must not inherit the
+        # implementer's context.
+        script, _ = self._script()
+        status, task, adapter, _ = self._run(script)
+        self.assertEqual(status, "done")
+        roles = [c[1] for c in adapter.calls if c[0] == "follow_up"]
+        self.assertNotIn("reviewer", roles)
 
     def test_declined_gate_parks_instead_of_proceeding(self):
         script, _ = self._script()

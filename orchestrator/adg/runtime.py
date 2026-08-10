@@ -38,11 +38,23 @@ class Adapter:
     def remove_worktree(self, repo, path):
         raise NotImplementedError
 
+    def can_run(self, kind):
+        """Is this agent kind actually usable here? The registry lists what a
+        deployment *could* use; only the runtime knows what is installed."""
+        return True
+
     def start_agent(self, role, kind, cwd, env):
         raise NotImplementedError
 
     def prompt(self, session, text, timeout):
         raise NotImplementedError
+
+    def follow_up(self, session, text, timeout):
+        """Continue an existing session, keeping its context. Retrying a fix in
+        a fresh session throws away everything the agent just learned and makes
+        it re-read the protocol, the task and the repo -- most of the wall clock
+        in a short task. Adapters that cannot continue fall back to a new turn."""
+        return self.prompt(session, text, timeout)
 
     def status(self, session):
         raise NotImplementedError
@@ -78,6 +90,9 @@ class LocalAdapter(Adapter):
     # protocol it is being told to follow, and cannot write its report.
     GRANTS = {"claude": "--add-dir"}
 
+    # Flag that resumes the CLI's own previous conversation in this directory.
+    CONTINUE = {"claude": "--continue"}
+
     def _argv(self, kind, env):
         argv = list(self.LAUNCH[kind])
         flag = self.GRANTS.get(kind)
@@ -86,6 +101,10 @@ class LocalAdapter(Adapter):
         if flag and dirs:
             argv += [flag] + dirs
         return argv
+
+    def can_run(self, kind):
+        argv = self.LAUNCH.get(kind)
+        return bool(argv) and shutil.which(argv[0]) is not None
 
     def create_worktree(self, repo, branch, base, path):
         """Idempotent. A leftover branch or checkout from an interrupted run is
@@ -123,21 +142,28 @@ class LocalAdapter(Adapter):
                 "%r not found on PATH -- install it or pick another channel" % argv[0])
         s = Session("%s-local" % role, cwd)
         s.handle = {"argv": self._argv(kind, env), "env": dict(os.environ, **env),
-                    "role": role}
+                    "role": role, "kind": kind}
         return s
 
-    def prompt(self, session, text, timeout):
+    def prompt(self, session, text, timeout, argv=None):
         # Prompt goes on stdin, not argv: variadic flags such as claude's
         # --add-dir will otherwise swallow a trailing positional prompt, and
         # stdin has no argument-length limit.
         try:
-            p = subprocess.run(session.handle["argv"], cwd=session.cwd,
+            p = subprocess.run(argv or session.handle["argv"], cwd=session.cwd,
                                env=session.handle["env"], input=text,
                                capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"settled": "timeout", "output": "", "code": None}
         return {"settled": "idle" if p.returncode == 0 else "blocked",
                 "output": (p.stdout or "") + (p.stderr or ""), "code": p.returncode}
+
+    def follow_up(self, session, text, timeout):
+        flag = self.CONTINUE.get(session.handle.get("kind"))
+        if not flag:
+            return self.prompt(session, text, timeout)
+        return self.prompt(session, text, timeout,
+                           argv=session.handle["argv"] + [flag])
 
     def status(self, session):
         return "idle"
@@ -203,6 +229,9 @@ class MockAdapter(Adapter):
     def remove_worktree(self, repo, path):
         return LocalAdapter.remove_worktree(self, repo, path)
 
+    def can_run(self, kind):
+        return True
+
     def start_agent(self, role, kind, cwd, env):
         return Session("%s-mock" % role, cwd, handle={"role": role, "env": env})
 
@@ -214,6 +243,10 @@ class MockAdapter(Adapter):
             return {"settled": "idle", "output": "", "code": 0}
         fn(session.handle["env"], session.cwd)
         return {"settled": "idle", "output": "mock:%s" % role, "code": 0}
+
+    def follow_up(self, session, text, timeout):
+        self.calls.append(("follow_up", session.handle["role"]))
+        return self.prompt(session, text, timeout)
 
     def status(self, session):
         return "idle"

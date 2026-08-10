@@ -19,11 +19,33 @@ from .store import git
 STAGES = ["intake", "classify", "plan", "implement", "verify", "review", "integrate", "done"]
 TERMINAL = {"done", "abandoned", "needs_human"}
 
-SIMPLE_HINTS = re.compile(
-    r"\b(typo|rename|comment|bump|version|log|readme|format|lint)\b", re.I)
-COMPLEX_HINTS = re.compile(
-    r"\b(refactor|migrat|redesign|architect|rewrite|save format|schema|protocol|"
-    r"across|integrat|system|multiple|api)\b", re.I)
+# Keyword matching on natural language does not work: "API" in "calculator API"
+# forced a 12-line change down the full planning pipeline, and no keyword list
+# recognises "add a subtract function" as simple. Classification is a judgement,
+# so a cheap model makes it -- the call costs ~$0.0002 against a ~$2.60 mistake.
+# Only non-negotiable facts stay hard-coded, below.
+CLASSIFY_PROMPT = """Classify this software task as SIMPLE or COMPLEX.
+
+SIMPLE: one coherent change a single competent engineer would finish in one
+sitting without a written plan. A few files, no new architecture, no format or
+interface that other code depends on.
+
+COMPLEX: needs a plan first -- multiple independent parts, a new abstraction or
+dependency, a change to a shared interface / schema / save format, wide blast
+radius, or genuine ambiguity about what is wanted.
+
+Bias: when the work is small and self-contained, say SIMPLE. Planning a small
+task wastes far more than it saves.
+
+--- REQUEST ---
+%(request)s
+
+--- REPOSITORY ---
+%(facts)s
+
+Reply with exactly one line:
+VERDICT: SIMPLE|COMPLEX -- <one short clause of reasoning>
+"""
 
 
 class Halt(Exception):
@@ -44,6 +66,7 @@ class Orchestrator:
         self.log = log
         self.dry_run = dry_run
         self.budget = lim.Budget(task)
+        self._last_failure = None
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
 
@@ -85,23 +108,65 @@ class Orchestrator:
         self.log("intake: %s" % self.task.state["id"])
         self.task.update(status="classify")
 
+    def _repo_facts(self):
+        """Cheap, factual context so the classifier judges the change against
+        this repository rather than against the wording of the request."""
+        files = git(["ls-files"], self.repo, check=False).splitlines()
+        sizes = []
+        for f in files[:400]:
+            try:
+                sizes.append((len(open(os.path.join(self.repo, f), "rb").read().splitlines()), f))
+            except OSError:
+                continue
+        sizes.sort(reverse=True)
+        lines = ["%d tracked files, %d total lines" % (len(files), sum(n for n, _ in sizes))]
+        lines.append("largest: " + ", ".join("%s (%d lines)" % (f, n) for n, f in sizes[:8]))
+        if self.vcfg.get("hotspots"):
+            lines.append("declared hotspots: " + ", ".join(self.vcfg["hotspots"]))
+        return "\n".join(lines)
+
     def _stage_classify(self):
-        """Heuristics first; an LLM call only when they are ambiguous, and
-        COMPLEX when still unsure -- under-planning costs more than
-        over-planning (§2.2)."""
+        """A cheap model judges; only facts override it (§2.2)."""
         text = self.task.read_text("task.md", "")
-        simple, complex_ = SIMPLE_HINTS.search(text), COMPLEX_HINTS.search(text)
         hotspots = [h for h in (self.vcfg.get("hotspots") or []) if h and h in text]
-        if hotspots or complex_ or len(text) > 1200:
-            tier, why = "complex", "hotspot/keyword/length"
-        elif simple and len(text) < 400:
-            tier, why = "simple", "short and mechanical"
-        else:
-            tier, why = "complex", "ambiguous — defaulting to complex"
+        if hotspots:
+            # Not a judgement call: a hotspot is unmergeable or high-coupling by
+            # declaration, so it always gets a plan.
+            return self._classified("complex", "touches a declared hotspot: %s"
+                                    % ", ".join(hotspots), "policy")
+        tier, why, by = self._ask_classifier(text)
+        self._classified(tier, why, by)
+
+    def _ask_classifier(self, text):
+        if self.dry_run:
+            return "simple", "dry run", "stub"
+        try:
+            choice = self._pick("classifier")
+        except routing.NoModelAvailable as e:
+            return "complex", "no classifier model available (%s)" % e, "fallback"
+        prompt = CLASSIFY_PROMPT % {"request": text.strip()[:4000],
+                                    "facts": self._repo_facts()}
+        session = self.adapter.start_agent("classifier", choice.agent_kind,
+                                           self.repo, prompts.env_for(self.task))
+        try:
+            res = self.adapter.prompt(session, prompt, timeout=180)
+        finally:
+            self.adapter.teardown(session)
+        out = (res.get("output") or "")
+        m = re.search(r"VERDICT:\s*(SIMPLE|COMPLEX)\s*-*\s*(.*)", out, re.I)
+        if not m:
+            # Unparseable: fail safe. Over-planning a small task wastes time;
+            # under-planning a large one wastes the whole run.
+            return "complex", "classifier gave no usable verdict", "fallback"
+        self.task.record_delegation({"stage": "classify", "role": "classifier",
+                                     "model": choice.model, "channel": choice.channel,
+                                     "adapter": self.adapter.name, "outcome": "complete"})
+        return m.group(1).lower(), m.group(2).strip()[:200] or "no reason given", choice.model
+
+    def _classified(self, tier, why, by):
         self.log("classify: %s (%s)" % (tier, why))
-        self.task.update(
-            classification={"tier": tier, "by": "heuristic", "why": why},
-            status="plan" if tier == "complex" else "implement")
+        self.task.update(classification={"tier": tier, "by": by, "why": why},
+                         status="plan" if tier == "complex" else "implement")
         if tier == "simple":
             self._seed_single_subtask()
 
@@ -113,12 +178,12 @@ class Orchestrator:
         }])
 
     def _stage_plan(self):
-        choice = self.router.select("planner", ceiling=self.budget.ceiling())
+        choice = self._pick("planner")
         self.log("plan: %s via %s" % (choice.model, choice.channel))
         self.budget.check_cost(0.0)
-        self._invoke("planner", choice, cwd=self.repo,
-                     extra="Write plan.md now. Use the template at "
-                           "%s/templates/plan.md." % prompts.skill_path())
+        self._close(self._invoke("planner", choice, cwd=self.repo,
+                    extra="Write plan.md now. Use the template at "
+                          "%s/templates/plan.md." % prompts.skill_path()))
         subtasks = self._read_plan_subtasks()
         if not subtasks:
             raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
@@ -171,20 +236,26 @@ class Orchestrator:
             return
         sub = pending[0]
         base = self._ensure_worktree()
-        role_choice = self.router.select("implementer", ceiling=self.budget.ceiling())
-        attempts = 0
+        role_choice = self._pick("implementer")
+        attempts, session = 0, None
         while True:
             self.budget.check_attempt(sub["id"])
             self.budget.check_cost(0.0)
             attempts += 1
-            self.log("implement %s: attempt %d (%s)" % (sub["id"], attempts, role_choice.model))
-            self._invoke("implementer", role_choice, cwd=base, subtask=sub)
+            self.log("implement %s: attempt %d (%s%s)" % (
+                sub["id"], attempts, role_choice.model, "" if session is None else ", continued"))
+            session = self._invoke("implementer", role_choice, cwd=base, subtask=sub,
+                                   session=session, failure=self._last_failure)
             self.budget.used_attempt(sub["id"])
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
             if result.ok:
+                self._last_failure = None
+                self._close(session)
                 self._checkpoint(base, "adg %s: %s" % (sub["id"], sub.get("goal", ""))[:72])
                 break
+            self._last_failure = "\n".join(
+                "$ %s\n%s" % (f["cmd"], f["output"][-1500:]) for f in result.failures())
             # Signal: test_stuck. Escalate one rung rather than letting the
             # same model try the same idea a fourth time (§6).
             threshold = int((self.reg["policy"].get("escalation_thresholds") or {})
@@ -197,7 +268,10 @@ class Orchestrator:
                                "%s still failing after %d attempts and nothing stronger is "
                                "enrolled within the ceiling" % (sub["id"], attempts))
                 self.log("  escalating to %s" % stronger.model)
-                role_choice, attempts = stronger, 0
+                # A stronger model starts clean: the point of escalating is a
+                # different approach, not more of the same context.
+                self._close(session)
+                role_choice, attempts, session = stronger, 0, None
         self._finish_subtask(sub, base)
 
     def _checkpoint(self, cwd, message):
@@ -240,11 +314,11 @@ class Orchestrator:
             self._reopen_subtasks()
             self.task.update(status="implement")
             return
-        choice = self.router.select("reviewer", ceiling=self.budget.ceiling())
+        choice = self._pick("reviewer")
         self.log("review: %s via %s" % (choice.model, choice.channel))
-        self._invoke("reviewer", choice, cwd=base,
-                     extra="Write your verdict to reports/review-reviewer.json, matching "
-                           "%s/schemas/verdict.schema.json." % prompts.skill_path())
+        self._close(self._invoke("reviewer", choice, cwd=base,
+                    extra="Write your verdict to reports/review-reviewer.json, matching "
+                          "%s/schemas/verdict.schema.json." % prompts.skill_path()))
         verdict = self._read_verdict()
         self.log("review: %s" % verdict["verdict"])
         self.budget.used_review_loop()
@@ -335,6 +409,19 @@ class Orchestrator:
             self.log("integrate: branch %s is ready to push and open a PR" % branch)
 
     # ---------------------------------------------------------------- infra
+    def _pick(self, role, boost=None):
+        """Best candidate this runtime can actually launch. The registry says
+        what a deployment could use; only the adapter knows what is installed,
+        so an uninstalled CLI is skipped rather than crashing the run."""
+        candidates = self.router.candidates(role, ceiling=self.budget.ceiling(), boost=boost)
+        for c in candidates:
+            if self.adapter.can_run(c.agent_kind):
+                return c
+        raise routing.NoModelAvailable(
+            "no runnable model for role %r: %s" % (
+                role, ", ".join("%s needs %s" % (c.model, c.agent_kind)
+                                for c in candidates) or "nothing enrolled"))
+
     def _ensure_worktree(self):
         state = self.task.state
         if state.get("worktree") and os.path.isdir(state["worktree"]):
@@ -349,8 +436,12 @@ class Orchestrator:
         self.task.update(worktree=path, branch=branch, repo=repo_info)
         return path
 
-    def _invoke(self, role, choice, cwd, subtask=None, extra=None):
-        """One agent session: compose, run, validate the report."""
+    def _invoke(self, role, choice, cwd, subtask=None, extra=None,
+                session=None, failure=None):
+        """Run one turn. With `session`, it continues that agent instead of
+        starting a fresh one -- a retry keeps everything the agent already
+        learned, which is most of the wall clock on a short task. Returns the
+        session so a caller can continue it again."""
         if self.dry_run:
             self.log("  [dry-run] would run %s as %s" % (choice.model, role))
             return None
@@ -358,14 +449,15 @@ class Orchestrator:
         # previous attempt's report is still on disk, and accepting it would
         # read a stale success as a fresh one.
         started = time.time() - 1
-        text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
-                               verify_cfg=self.vcfg)
-        session = self.adapter.start_agent(role, choice.agent_kind, cwd,
-                                           prompts.env_for(self.task))
-        try:
+        if session is None:
+            text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
+                                   verify_cfg=self.vcfg)
+            session = self.adapter.start_agent(role, choice.agent_kind, cwd,
+                                               prompts.env_for(self.task))
             res = self.adapter.prompt(session, text, timeout=3600)
-        finally:
-            self.adapter.teardown(session)
+        else:
+            text = prompts.retry(failure)
+            res = self.adapter.follow_up(session, text, timeout=3600)
         self._log_transcript(role, text, res)
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
         report, problems = self._collect_report(role, subtask, since=started)
@@ -379,8 +471,16 @@ class Orchestrator:
             "report_problems": problems or None,
         })
         if outcome == "blocked" and res.get("settled") == "timeout":
+            self._close(session)
             raise Halt("needs_human", "%s agent timed out" % role)
-        return report
+        return session
+
+    def _close(self, session):
+        if session is not None:
+            try:
+                self.adapter.teardown(session)
+            except Exception:  # teardown must never mask the real outcome
+                pass
 
     def _log_transcript(self, role, prompt, res):
         """Keep what the agent was asked and what it said. An agent that does
