@@ -89,11 +89,31 @@ class Router:
         return TIERS.index(spec.get("tier", "t1")) <= TIERS.index(max_tier)
 
     def _meets(self, spec, require, boost):
-        for cap, need in (require or {}).items():
+        """Does this model clear the role's floors, as raised by `boost`?
+
+        Both key sets, not just `require`. A boost is how the ladder asks for
+        something the profile did not think to demand, so iterating `require`
+        alone dropped every boost on an undeclared capability -- silently, and
+        exactly where it mattered: `escalate` boosts `reasoning`, and neither
+        the implementer nor the test-author profile requires it. Rung 2 was
+        therefore never legal for the two roles that actually climb it,
+        `escalate` returned None, and the caller told an operator that nothing
+        stronger was enrolled when they had just enrolled it.
+
+        Sorted so a refusal is decided by the same capability every run; the
+        answer is order-independent, but which floor it trips on is not.
+        """
+        require = require or {}
+        boost = boost or {}
+        for cap in sorted(set(require) | set(boost)):
             have = spec.get(cap)
+            # Unscored is unverifiable, and a raised floor is not the place to
+            # give a model the benefit of the doubt.
             if have is None:
                 return False
-            want = _LEVELS.get(need, need) if isinstance(need, str) else need
+            need = require.get(cap)
+            want = 0 if need is None else (
+                _LEVELS.get(need, need) if isinstance(need, str) else need)
             if cap in boost:
                 want = max(want, boost[cap])
             if have < want:

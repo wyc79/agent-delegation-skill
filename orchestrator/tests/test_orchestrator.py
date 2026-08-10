@@ -239,6 +239,40 @@ class TestRouter(unittest.TestCase):
         with self.assertRaises(router.RoutingError):
             self.r.candidates("planner", ceiling={"max_tier": "unlimited"})
 
+    def test_a_boost_raises_a_floor_the_profile_never_declared(self):
+        # The implementer profile requires coding and tool, not reasoning, and
+        # rung 2 of the ladder (DESIGN §6.2) is exactly a reasoning+1 re-route.
+        # Applying the boost only to declared requirements made that rung a
+        # no-op for the one role that climbs it most.
+        self.assertNotIn("reasoning", self.reg["profiles"]["implementer"]["require"])
+        picked = [c.model for c in
+                  self.r.candidates("implementer", boost={"reasoning": 5})]
+        self.assertNotIn("balanced-coder", picked,
+                         "reasoning 4 cleared a boosted floor of 5")
+
+    def test_the_implementer_ladder_climbs_once_a_stronger_model_is_enrolled(self):
+        # The failure this fixes: an operator enrolls the strong model to make
+        # escalation work, and is still told nothing stronger is enrolled.
+        self.reg["models"]["opus-class-strong"]["enrolled_roles"].append("implementer")
+        r = router.Router(self.reg)
+        cur = r.select("implementer")
+        self.assertEqual(cur.model, "balanced-coder")
+        stronger = r.escalate("implementer", cur)
+        self.assertIsNotNone(stronger, "rung 2 refused a legal, enrolled rung")
+        self.assertEqual(stronger.model, "opus-class-strong")
+
+    def test_an_unscored_capability_cannot_clear_a_boosted_floor(self):
+        self.reg["models"]["balanced-coder"].pop("reasoning")
+        r = router.Router(self.reg)
+        picked = [c.model for c in r.candidates("implementer", boost={"reasoning": 3})]
+        self.assertNotIn("balanced-coder", picked,
+                         "an unscored dimension is unverifiable, not a pass")
+
+    def test_boosting_a_declared_requirement_still_takes_the_higher_floor(self):
+        # The original behaviour, which must survive: require 4, boost 5 -> 5.
+        picked = [c.model for c in self.r.candidates("reviewer", boost={"reasoning": 5})]
+        self.assertEqual(picked, ["opus-class-strong"])
+
 
 class TestVerifyAndScope(unittest.TestCase):
     def test_scope_violations_are_case_insensitive_where_the_fs_is(self):
