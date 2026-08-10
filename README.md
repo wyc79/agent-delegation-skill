@@ -125,7 +125,7 @@ are reported as missing rather than silently skipped.
   deterministic scanner runs as part of verification (stdlib, sub-second, no
   model call) and flags generated-code chaff. Evaluated on this repo's own
   orchestrator, it found two real defects in 0.4 seconds.
-- **`andrej-karpathy-skills:karpathy-guidelines`** — 67 lines on the mistakes
+- **[`andrej-karpathy-skills:karpathy-guidelines`](https://github.com/multica-ai/andrej-karpathy-skills)** — 67 lines on the mistakes
   that make generated code fail review (overcomplication, unrequested scope,
   unstated assumptions). Read by agents *before* they write code.
 - **[superpowers](https://github.com/obra/superpowers)** — `brainstorming`
