@@ -107,3 +107,19 @@ model-rendered briefs.
 Still absent: live quota metering per subscription window, telemetry-driven
 registry recalibration, and container isolation. Escalation is two signals
 (`test_stuck`, `scope_overrun`) and a two-rung ladder.
+
+## Known defect
+
+`TestWaveRaces.test_one_subtask_escalating_stops_the_run_even_as_a_sibling_succeeds`
+and `TestParallelEndToEnd.test_two_subtasks_get_two_worktrees_and_both_land`
+fail intermittently — roughly 1 run in 8 of the **full** suite, never
+reproducible in isolation (12/12 clean runs of the test alone). Both are
+parallel-path tests, and in the captured failure an implementer's `escalate`
+report did not reach the halt check, so a wave subtask completed that should
+have parked.
+
+Serializing `task.json` mutations and making verify/transcript ids unique per
+invocation reduced it from 2/8 to 1/8 without removing it, so at least one
+shared-state race remains in the wave path. **Treat parallel mode as
+unfinished**: run sequentially (one subtask per plan, or `max_parallel_agents:
+1`) until this is closed. The sequential path is not affected.

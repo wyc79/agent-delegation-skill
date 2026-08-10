@@ -49,6 +49,10 @@ VERDICT: SIMPLE|COMPLEX -- <one short clause of reasoning>
 """
 
 
+_LOG_SEQ = [0]
+_LOG_LOCK = __import__("threading").Lock()
+
+
 class Halt(Exception):
     """Stop cleanly and leave the task resumable."""
 
@@ -460,6 +464,8 @@ a planner does that next, from your design.
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
             claimed = (report or {}).get("status")
+            if claimed and claimed != "complete":
+                self.log("  %s: agent reported %s" % (sub["id"], claimed))
             if claimed in ("blocked", "escalate"):
                 raise Halt("needs_human", "%s reported %s: %s" % (
                     sub["id"], claimed, (report or {}).get("summary", "")[:200]))
@@ -588,13 +594,13 @@ a planner does that next, from your design.
                                      self.task.state["repo"].get("base_commit", "HEAD"),
                                      ignore=self.vcfg.get("ignore"))
         violations = verify.scope_violations(files, sub.get("planned_scope") or ["**"])
-        state = self.task.state
-        for s in state["subtasks"]:
-            if s["id"] == sub["id"]:
-                s["status"] = "complete"
-                s["actual_files"] = files
-                s["scope_violations"] = violations
-        self.task.write_json("task.json", state)
+        def mark(state):
+            for s in state["subtasks"]:
+                if s["id"] == sub["id"]:
+                    s["status"] = "complete"
+                    s["actual_files"] = files
+                    s["scope_violations"] = violations
+        self.task.mutate(mark)
         if violations:
             self.log("  scope: %d file(s) outside declared scope" % len(violations))
         self.task.update(pending_findings=[])
@@ -748,16 +754,16 @@ a planner does that next, from your design.
     def _reopen_subtasks(self, owners=None):
         """Mark subtasks pending again. When the reviewer named owners, only
         those reopen -- reworking everything would discard green work."""
-        state = self.task.state
-        hit = False
-        for s in state["subtasks"]:
-            named = owners and any(s["id"] in o for o in owners)
-            if not owners or named:
-                s["status"] = "pending"
-                hit = True
-        if not hit and state["subtasks"]:
-            state["subtasks"][0]["status"] = "pending"
-        self.task.write_json("task.json", state)
+        def reopen(state):
+            hit = False
+            for s in state["subtasks"]:
+                named = owners and any(s["id"] in o for o in owners)
+                if not owners or named:
+                    s["status"] = "pending"
+                    hit = True
+            if not hit and state["subtasks"]:
+                state["subtasks"][0]["status"] = "pending"
+        self.task.mutate(reopen)
 
     def _stage_integrate(self):
         state = self.task.state
@@ -972,8 +978,11 @@ a planner does that next, from your design.
     def _log_transcript(self, role, prompt, res):
         """Keep what the agent was asked and what it said. An agent that does
         nothing is otherwise invisible -- which is exactly when you need it."""
-        name = os.path.join("agent-logs", "%s-%s.log" % (
-            role, time.strftime("%Y%m%d-%H%M%S", time.gmtime())))
+        with _LOG_LOCK:
+            _LOG_SEQ[0] += 1
+            seq = _LOG_SEQ[0]
+        name = os.path.join("agent-logs", "%s-%s-%03d.log" % (
+            role, time.strftime("%Y%m%d-%H%M%S", time.gmtime()), seq))
         os.makedirs(self.task.file("agent-logs"), exist_ok=True)
         self.task.write_text(name, "=== PROMPT ===\n%s\n\n=== SETTLED: %s (exit %s) ===\n%s\n"
                              % (prompt, res.get("settled"), res.get("code"),

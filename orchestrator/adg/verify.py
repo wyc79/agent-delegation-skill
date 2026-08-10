@@ -68,11 +68,22 @@ class Result:
                 "skipped": self.skipped, "summary": self.summary()}
 
 
+_RUN_SEQ = [0]
+_RUN_LOCK = __import__("threading").Lock()
+
+
+def _run_id(tier):
+    with _RUN_LOCK:
+        _RUN_SEQ[0] += 1
+        n = _RUN_SEQ[0]
+    return "v-%s-%s-%03d" % (tier, time.strftime("%Y%m%d-%H%M%S", time.gmtime()), n)
+
+
 def run(task, repo, cwd, tier="fast", timeout=900):
     """Run one tier of checks and persist the output under verify/<run-id>."""
     cfg = load_project_config(repo)
     commands = cfg.get(tier) or []
-    run_id = "v-%s-%s" % (tier, time.strftime("%Y%m%d-%H%M%S", time.gmtime()))
+    run_id = _run_id(tier)
     steps = []
     for cmd in commands:
         started = time.time()
