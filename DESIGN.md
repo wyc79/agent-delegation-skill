@@ -822,7 +822,7 @@ The whole interface is seven operations:
 |---|---|---|---|
 | `create_worktree(branch, base, path)` | Isolated checkout exists | `herdr worktree create` | `git worktree add` |
 | `remove_worktree(path)` | Best-effort; may defer (§4.4b) | `herdr worktree remove` | `git worktree remove`, then `prune` |
-| `start_agent(role, channel, cwd, env)` | A live agent session, task dir in `env` | `workspace create --env` + `agent start --kind` | `spawn <cli> --cwd` with env |
+| `start_agent(role, channel, cwd, env)` | A live agent session, task dir in `env` | `pane split` + `agent start --kind`, so the run is visible. Roles whose entire answer is a parsed line of text (classifier, intake, reporter) use the local path instead: a pane renders on the alternate screen, so reading it back returns TUI chrome, not the reply. | `spawn <cli> --cwd` with env |
 | `prompt(session, text) -> settled` | Returns when the agent settles | `agent prompt --wait` | write stdin, wait for exit |
 | `status(session)` | `working` / `idle` / `blocked` / `gone` | agent lifecycle states | process alive + exit code |
 | `notify(kind, brief)` | Human sees a gate request | `notification show`, `workspace report-metadata` | terminal prompt / stdout |

@@ -681,6 +681,37 @@ class TestRuntimeSurfaces(unittest.TestCase):
         h.notify("merge", "land it?")
         self.assertIn("notification", calls)
 
+    def test_text_reply_roles_bypass_panes(self):
+        # A pane renders on the alternate screen, so reading it back gives TUI
+        # chrome instead of the "VERDICT: ..." line the orchestrator parses.
+        class H(runtime.HerdrAdapter):
+            def _cli(self, args, check=True):
+                raise AssertionError("classifier must not open a pane")
+        h = H(workspace="w1")
+        s = h.start_agent("classifier", "claude", "/tmp", {})
+        self.assertFalse((s.handle or {}).get("herdr"))
+
+    def test_working_roles_do_get_a_pane(self):
+        class H(runtime.HerdrAdapter):
+            def _cli(self, args, check=True):
+                if args[:2] == ["pane", "split"]:
+                    return {"result": {"pane": {"pane_id": "w1:p9"}}}
+                return {"result": {"ok": True}}
+        s = H(workspace="w1").start_agent("implementer", "claude", "/tmp",
+                                          {"AGENT_DELEGATION_TASK_DIR": "/x/T-1"})
+        self.assertTrue((s.handle or {}).get("herdr"))
+        self.assertEqual(s.handle["pane"], "w1:p9")
+
+    def test_a_refused_prompt_is_reported_not_disguised_as_a_timeout(self):
+        class H(runtime.HerdrAdapter):
+            def _cli(self, args, check=True):
+                self.last_error = "agent_prompt_stalled"
+                return None
+        h = H(workspace="w1")
+        sess = runtime.Session("x", "/tmp", handle={"herdr": True, "role": "implementer"})
+        r = h.prompt(sess, "hi", timeout=10)
+        self.assertIn("agent_prompt_stalled", r["output"])
+
     def test_herdr_availability_needs_both_env_and_binary(self):
         prev = os.environ.get("HERDR_ENV")
         os.environ.pop("HERDR_ENV", None)

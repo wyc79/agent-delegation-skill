@@ -12,8 +12,10 @@ workflow decision leaks in here, the boundary has failed.
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 
 from .store import git
 
@@ -209,6 +211,7 @@ class HerdrAdapter(LocalAdapter):
 
     def __init__(self, workspace=None):
         self.workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
+        self.last_error = None
 
     @staticmethod
     def available():
@@ -216,14 +219,29 @@ class HerdrAdapter(LocalAdapter):
 
     def _cli(self, args, check=True):
         p = subprocess.run(["herdr"] + args, capture_output=True, text=True)
-        if p.returncode != 0:
-            if check:
-                raise RuntimeError_("herdr %s: %s" % (" ".join(args), p.stderr.strip()))
-            return None
+        payload = None
         try:
-            return json.loads(p.stdout)
+            payload = json.loads(p.stdout)
         except ValueError:
-            return {"raw": p.stdout}
+            payload = {"raw": p.stdout} if p.stdout.strip() else None
+        # herdr reports failures as JSON on stderr with exit 1. Returning a bare
+        # None for both "it failed" and "it said no" made every failure look
+        # like a timeout, which is the least actionable thing it could be.
+        if p.returncode != 0 or (isinstance(payload, dict) and "error" in payload):
+            err = ""
+            if isinstance(payload, dict):
+                err = (payload.get("error") or {}).get("code", "")
+            if not err:
+                try:
+                    err = (json.loads(p.stderr).get("error") or {}).get("code", "")
+                except ValueError:
+                    err = (p.stderr or "").strip()[:120]
+            self.last_error = err or "exit %s" % p.returncode
+            if check:
+                raise RuntimeError_("herdr %s: %s" % (" ".join(args[:3]), self.last_error))
+            return None
+        self.last_error = None
+        return payload
 
     def create_worktree(self, repo, branch, base, path):
         res = self._cli(["worktree", "create", "--cwd", str(repo), "--branch", branch,
@@ -242,6 +260,92 @@ class HerdrAdapter(LocalAdapter):
         self._cli(["notification", "show", "--message", "%s: %s" % (kind, first[:160])],
                   check=False)
         print("\n[%s] %s" % (kind, text))
+
+    # --- agent sessions in visible panes -----------------------------------
+    # Without these, `--adapter herdr` still ran every agent as a hidden
+    # subprocess: worktrees and notifications went through herdr and nothing
+    # ever appeared in the UI. Each of these degrades to LocalAdapter, so a
+    # herdr that refuses still runs the task.
+
+    @staticmethod
+    def _agent_name(role, task_dir):
+        # herdr requires [a-z][a-z0-9_-]{0,31}, unique among live agents.
+        tail = re.sub(r"[^a-z0-9]+", "", os.path.basename(task_dir.rstrip("/")).lower())[-6:]
+        return re.sub(r"[^a-z0-9-]+", "-", "%s-%s" % (role.lower(), tail or "task"))[:32]
+
+    # Roles whose whole answer is a line of text the orchestrator parses.
+    # A pane renders the agent on the terminal's alternate screen, so reading it
+    # back yields TUI chrome rather than the reply -- these run as subprocesses.
+    # Everything else communicates through report files, where a pane costs
+    # nothing and buys the human a window into the run.
+    TEXT_REPLY_ROLES = {"classifier", "intake", "reporter"}
+
+    def start_agent(self, role, kind, cwd, env):
+        if role in self.TEXT_REPLY_ROLES:
+            return LocalAdapter.start_agent(self, role, kind, cwd, env)
+        pane = self._cli(["pane", "split", "--current", "--direction", "right",
+                          "--cwd", cwd, "--no-focus"], check=False)
+        pane_id = (((pane or {}).get("result") or {}).get("pane") or {}).get("pane_id")
+        if not pane_id:
+            return LocalAdapter.start_agent(self, role, kind, cwd, env)
+        name = self._agent_name(role, env.get("AGENT_DELEGATION_TASK_DIR", role))
+        args = ["agent", "start", name, "--kind", kind, "--pane", pane_id]
+        grants = [d for d in (env.get("AGENT_DELEGATION_TASK_DIR"),
+                              env.get("AGENT_DELEGATION_SKILL_DIR")) if d]
+        if grants and self.GRANTS.get(kind):
+            args += ["--"] + [self.GRANTS[kind]] + grants
+        # A freshly split pane is not an available shell until its prompt is up;
+        # herdr rejects `agent start` until then (agent_pane_busy).
+        started = None
+        for _ in range(10):
+            started = self._cli(args, check=False)
+            if started is not None:
+                break
+            time.sleep(2)
+        if started is None:
+            self._cli(["pane", "close", pane_id], check=False)
+            return LocalAdapter.start_agent(self, role, kind, cwd, env)
+        s = Session(name, cwd, handle={"role": role, "kind": kind, "pane": pane_id,
+                                       "herdr": True, "env": env})
+        return s
+
+    def prompt(self, session, text, timeout, argv=None):
+        if not (session.handle or {}).get("herdr"):
+            return LocalAdapter.prompt(self, session, text, timeout, argv)
+        res = self._cli(["agent", "prompt", session.name, text, "--wait",
+                         "--timeout", str(int(timeout * 1000))], check=False)
+        if res is None:
+            why = getattr(self, "last_error", "") or "unknown"
+            return {"settled": "timeout" if "timeout" in why else "blocked",
+                    "output": "herdr refused the prompt: %s" % why,
+                    "code": None, "cost_usd": None}
+        read = self._cli(["agent", "read", session.name, "--source",
+                          "recent-unwrapped", "--lines", "400"], check=False) or {}
+        out = ((read.get("result") or {}).get("text")
+               or read.get("raw") or json.dumps(read))[-20000:]
+        agent = (res.get("result") or {}).get("agent") or {}
+        state = agent.get("agent_status") or agent.get("state") or "idle"
+        # herdr reports liveness, never success -- `blocked` means it is waiting
+        # on a human, which for an unattended run is a failure to report.
+        return {"settled": "blocked" if state == "blocked" else "idle",
+                "output": out, "code": 0 if state != "blocked" else 1,
+                "cost_usd": None}
+
+    def follow_up(self, session, text, timeout):
+        if not (session.handle or {}).get("herdr"):
+            return LocalAdapter.follow_up(self, session, text, timeout)
+        return self.prompt(session, text, timeout)   # the pane keeps its context
+
+    def status(self, session):
+        if not (session.handle or {}).get("herdr"):
+            return "idle"
+        got = self._cli(["agent", "get", session.name], check=False) or {}
+        agent = (got.get("result") or {}).get("agent") or {}
+        return agent.get("agent_status") or agent.get("state") or "unknown"
+
+    def teardown(self, session):
+        if (session.handle or {}).get("herdr") and session.handle.get("pane"):
+            self._cli(["pane", "close", session.handle["pane"]], check=False)
 
 
 class MockAdapter(Adapter):

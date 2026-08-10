@@ -58,7 +58,7 @@ No config is legal — checks are then reported as *not run* rather than faked.
 | `adg/store.py` | Task state outside the repo; project key from the git common dir. |
 | `adg/router.py` | Capability scoring, enrollment, escalation ceiling. |
 | `adg/limits.py` | Hard limits, checked before the action, failing closed. |
-| `adg/runtime.py` | The seven-operation adapter: `local`, `herdr`, `mock`. |
+| `adg/runtime.py` | The seven-operation adapter: `local`, `herdr` (agents run in visible panes), `mock`. |
 | `adg/verify.py` | Deterministic checks and mechanical scope comparison. |
 | `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. |
 | `adg/companions.py` | Detects karpathy-guidelines and superpowers once, and declares them in `task.json`. |
