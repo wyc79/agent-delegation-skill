@@ -72,9 +72,18 @@ def run(task, scan_py, cwd, base_ref, run_id):
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"ran": False, "why": "scanner failed to run: %s" % e}
-    if p.returncode not in (0, 1) or not p.stdout.strip():
-        return {"ran": False, "why": "scanner exited %s: %s"
-                                     % (p.returncode, (p.stderr or "").strip()[:200])}
+    # scan.py's contract on this path is 0 = complete, 2 = incomplete -- a file
+    # in scope was binary, minified or unreadable. Exit 2 still prints a valid
+    # report carrying real findings, so treating it as a failed run discarded
+    # them: a P1 in one file was thrown away because a *different* file was
+    # minified. (Its exit 1 comes only from --report-name and --meta, which this
+    # never calls, so accepting it was dead code.) Partial coverage is a fact to
+    # report, not a reason to report nothing.
+    if p.returncode not in (0, 2) or not p.stdout.strip():
+        detail = (p.stderr or "").strip()[:200]
+        return {"ran": False, "why": "scanner exited %s%s"
+                                     % (p.returncode, ": " + detail if detail else
+                                        " with no diagnostic")}
     try:
         data = json.loads(p.stdout)
     except ValueError:
@@ -89,7 +98,34 @@ def summarize(data, run_id=None):
     """Normalise defensively: this is another project's schema, and a key that
     moves must degrade to a smaller summary rather than crash the pipeline."""
     findings = data.get("findings") or data.get("candidates") or []
-    out = {"ran": True, "run_id": run_id, "total": len(findings), "notable": []}
+    # An empty scope is not a clean scan. scan.py answers "no diff found" with
+    # exit 0 and zero findings, which is byte-for-byte what a reviewed change
+    # that came back clean looks like -- and reporting it as clean is precisely
+    # the fabricated result this module's docstring refuses to produce.
+    #
+    # Findings decide it first, and deliberately: you cannot get a finding out
+    # of a file nobody opened. Keying this on `files` alone would mean a renamed
+    # key in someone else's schema silently converted every real scan into
+    # "nothing was scanned" -- fail-safe in direction, but it buries live P1s,
+    # which is the same defect as discarding them on an exit code.
+    if not findings:
+        # Only an explicit count is a claim about scope. Absent, we cannot tell
+        # a clean tree from an unexamined one, and saying so beats guessing.
+        if "files" not in data:
+            return {"ran": False, "run_id": run_id,
+                    "why": "scanner reported no file count — cannot tell a "
+                           "clean scan from an empty one"}
+        if not data.get("files"):
+            return {"ran": False, "run_id": run_id,
+                    "why": ("every changed file was skipped as vendored, "
+                            "generated or unreadable — nothing was scanned"
+                            if data.get("errors") else
+                            "no diff in scope — nothing was scanned")}
+    out = {"ran": True, "run_id": run_id, "total": len(findings),
+           # False when a file in scope could not be read. The findings that did
+           # land are still true; the coverage behind them is not whole, and a
+           # reader who is not told that will read silence as absence.
+           "complete": bool(data.get("complete", True)), "notable": []}
     for f in findings:
         if not isinstance(f, dict):
             continue
@@ -111,10 +147,17 @@ def as_text(summary):
         return ""
     if not summary.get("ran"):
         return "Chaff scan: did not run (%s)." % summary.get("why", "unavailable")
+    # Partial coverage leads, because it changes how everything under it reads.
+    lines = ([] if summary.get("complete", True) else
+             ["Chaff scan was INCOMPLETE — some files in scope could not be read, "
+              "so what follows is partial and absence of a finding proves nothing."])
     if not summary["notable"]:
-        return "Chaff scan: %d minor note(s), nothing significant." % summary["total"]
-    lines = ["Chaff scan flagged %d item(s) worth a look (advisory — these are "
-             "style and robustness notes, not requirement failures):" % len(summary["notable"])]
+        lines.append("Chaff scan: %d minor note(s), nothing significant."
+                     % summary["total"])
+        return "\n".join(lines)
+    lines.append("Chaff scan flagged %d item(s) worth a look (advisory — these are "
+                 "style and robustness notes, not requirement failures):"
+                 % len(summary["notable"]))
     for n in summary["notable"][:10]:
         lines.append("  [%s] %s:%s — %s" % (n["severity"], n["path"], n["line"], n["message"]))
     return "\n".join(lines)

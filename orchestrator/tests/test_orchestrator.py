@@ -1457,6 +1457,92 @@ class TestWinnow(unittest.TestCase):
         self.assertIn("advisory", t)
         self.assertIn("not requirement failures", t)
 
+    def test_an_empty_scope_is_not_a_clean_scan(self):
+        # scan.py answers "no diff found" with exit 0, findings [] and files 0 --
+        # identical to a reviewed change that came back clean. Reporting that as
+        # "nothing significant" is the fabricated clean this module refuses.
+        s = winnow.summarize({"files": 0, "findings": [], "complete": True,
+                              "warnings": ["No diff found in scope 'branch'."]})
+        self.assertFalse(s["ran"])
+        self.assertIn("nothing was scanned", winnow.as_text(s))
+
+    def test_a_scope_emptied_by_skips_says_which(self):
+        s = winnow.summarize({"files": 0, "findings": [],
+                              "errors": [{"path": "v.js", "error": "looks minified"}]})
+        self.assertFalse(s["ran"])
+        self.assertIn("skipped", s["why"])
+
+    def test_a_real_clean_scan_still_reports_clean(self):
+        s = winnow.summarize({"files": 4, "findings": [], "complete": True})
+        self.assertTrue(s["ran"])
+        self.assertIn("nothing significant", winnow.as_text(s))
+
+    def test_partial_coverage_is_stated_not_swallowed(self):
+        # complete:false means a file in scope was binary, minified or
+        # unreadable. The findings that landed are still true; the coverage
+        # behind them is not, and silence there reads as absence.
+        t = winnow.as_text(winnow.summarize({
+            "files": 2, "complete": False,
+            "findings": [{"severity": "P1", "path": "a.py", "line": 1,
+                          "message": "secret"}]}))
+        self.assertIn("INCOMPLETE", t)
+        self.assertIn("a.py", t)
+
+    def test_a_missing_file_count_is_not_assumed_clean(self):
+        # If the key is renamed upstream we cannot tell a clean tree from an
+        # unexamined one. Say that, rather than pick the flattering reading.
+        s = winnow.summarize({"findings": []})
+        self.assertFalse(s["ran"])
+
+    def test_a_moved_key_still_summarises_when_findings_exist(self):
+        # The other half of that: findings prove files were opened, so a schema
+        # drift must shrink the summary, never convert it into "did not run".
+        s = winnow.summarize({"findings": [{"sev": "P1"}, "not-a-dict", {}]})
+        self.assertTrue(s["ran"])
+
+    def test_exit_two_carries_findings_and_must_not_be_discarded(self):
+        # scan.py's contract is 0 = complete, 2 = incomplete. Exit 2 still
+        # prints a valid report: one unreadable file must not throw away a P1
+        # found in a different one.
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        fake = os.path.join(d, "scan.py")
+        with open(fake, "w") as fh:
+            fh.write("import json, sys\n"
+                     "print(json.dumps({'files': 2, 'complete': False,\n"
+                     "  'errors': [{'path': 'v.js', 'error': 'looks minified'}],\n"
+                     "  'findings': [{'severity': 'P1', 'path': 'a.py',\n"
+                     "                'line': 7, 'message': 'committed secret'}]}))\n"
+                     "sys.exit(2)\n")
+        written = {}
+
+        class _Task:
+            def write_text(self, path, text):
+                written[path] = text
+
+        s = winnow.run(_Task(), fake, d, "HEAD", "run-1")
+        self.assertTrue(s["ran"], "a partial scan was reported as no scan")
+        self.assertEqual(len(s["notable"]), 1)
+        self.assertFalse(s["complete"])
+        self.assertTrue(written, "the raw report was not persisted")
+
+    def test_an_unexpected_exit_code_is_still_refused(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        fake = os.path.join(d, "scan.py")
+        with open(fake, "w") as fh:
+            fh.write("import sys\nsys.stderr.write('boom\\n')\nsys.exit(3)\n")
+
+        class _Task:
+            def write_text(self, path, text):
+                raise AssertionError("nothing should be persisted for a failed run")
+
+        s = winnow.run(_Task(), fake, d, "HEAD", "run-1")
+        self.assertFalse(s["ran"])
+        self.assertIn("boom", s["why"])
+
 
 class TestEndToEnd(unittest.TestCase):
     """Milestone 1 (DESIGN.md §15.1)."""

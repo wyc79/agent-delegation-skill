@@ -19,6 +19,15 @@ If a requirement is genuinely ambiguous, do not silently pick: record it in Step
 as an open question **with your recommended default**, so the human can approve by
 doing nothing.
 
+**If `$TASK_DIR/spec.md` exists, read it now.** It is an approved design — a
+human already chose that approach over the alternatives it names. Plan *against*
+it: your job is to decompose and scope it, not to redesign it. Disagreeing is
+allowed and sometimes right, but it is a departure to argue for in
+`decisions.md`, not a silent substitution. Re-litigating a settled approach
+spends the one expensive call in the system on a question already answered.
+
+No `spec.md` means the design work is yours, in Step 3.
+
 ## Step 2 — Explore before deciding
 
 Read the actual code. Identify, and write down as you go:
