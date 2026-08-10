@@ -66,14 +66,14 @@ def open_breaker(channel, reason, reopen_at, now, detail=""):
 
 
 def clear(channel):
-    """-> True when something was actually removed, so the CLI can say so."""
-    seen = {}
-
-    def apply(data):
-        seen["hit"] = (data.get("cooldowns") or {}).pop(channel, None) is not None
-
-    _mutate(apply, None)
-    return bool(seen.get("hit"))
+    """-> True when something was actually removed, so the CLI can say so.
+    Clearing nothing writes nothing: a no-op should not conjure a state file."""
+    with _LOCK:
+        data, _ = _raw()
+        if (data.get("cooldowns") or {}).pop(channel, None) is None:
+            return False
+        atomic_write(path(), json.dumps(data, indent=2, sort_keys=True) + "\n")
+        return True
 
 
 def record_use(channel, window_seconds, now):

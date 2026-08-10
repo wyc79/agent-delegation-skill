@@ -607,5 +607,120 @@ class TestFailoverEndToEnd(unittest.TestCase):
                         "the replacement got a clean worktree, losing the work")
 
 
+class TestChannelsCommand(unittest.TestCase):
+    """AC-4. These drive the real entry point, which reads the real clock, so
+    they place their fixtures relative to now rather than to the fixed T0 the
+    machine tests inject."""
+
+    def setUp(self):
+        import time as _time
+        self.t = TempRepo()
+        self.now = _time.time()
+        self.reg_arg = ["--registry", REGISTRY]
+
+    def tearDown(self):
+        self.t.close()
+
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        from adg import cli
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.main(self.reg_arg + argv)
+        return buf.getvalue()
+
+    def test_it_lists_an_open_breaker(self):
+        cooldown.open_breaker("claude-seat", "quota", self.now + 3600, self.now,
+                              "usage limit")
+        out = self._run(["channels"])
+        self.assertIn("claude-seat", out)
+        self.assertIn("cooling", out)
+
+    def test_it_says_so_when_nothing_is_cooling(self):
+        out = self._run(["channels"])
+        self.assertIn("claude-seat", out, "enrolled channels are listed either way")
+        self.assertNotIn("cooling", out)
+
+    def test_clear_removes_one(self):
+        cooldown.open_breaker("claude-seat", "quota", self.now + 3600, self.now)
+        out = self._run(["channels", "--clear", "claude-seat"])
+        self.assertIn("cleared", out)
+        self.assertEqual(cooldown.active(self.now), set())
+
+    def test_clearing_something_that_is_not_cooling_says_so(self):
+        out = self._run(["channels", "--clear", "cursor-seat"])
+        self.assertIn("not cooling", out)
+
+    def test_a_corrupt_file_is_reported_not_crashed_on(self):
+        os.makedirs(os.path.dirname(cooldown.path()), exist_ok=True)
+        with open(cooldown.path(), "w") as fh:
+            fh.write("garbage")
+        out = self._run(["channels"])
+        self.assertIn("unreadable", out)
+
+    def test_it_shows_utilization(self):
+        for i in range(10):
+            cooldown.record_use("claude-seat", 5 * 3600, self.now - i)
+        out = self._run(["channels"])
+        self.assertIn("25%", out, out)   # 10 of est_capacity 40
+
+
+class TestResumeAtTheWindow(unittest.TestCase):
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        self.task = store.Task.create(self.t.repo, "T-001", "# t\n", self.pol)
+        self.task.update(status="needs_human",
+                         park={"reason": "quota_all_exhausted",
+                               "reopen_at": T0 + 3600,
+                               "channels": ["claude-seat"], "role": "implementer"})
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_resuming_early_refuses_and_says_when(self):
+        from adg import cli
+        with self.assertRaises(SystemExit) as cm:
+            cli._quota_guard(self.task, when_open=False, clock=lambda: T0)
+        self.assertIn("quota", str(cm.exception).lower())
+        self.assertIn("--when-open", str(cm.exception))
+
+    def test_resuming_after_the_window_just_works(self):
+        from adg import cli
+        cli._quota_guard(self.task, when_open=False, clock=lambda: T0 + 3601)
+        self.assertIsNone(self.task.state.get("park"), "the park was not cleared")
+
+    def test_when_open_waits_out_the_window_without_ever_sleeping(self):
+        # The clock only moves because the fake sleep moves it, which is what
+        # proves the wait is driven by the remaining time and not by luck.
+        from adg import cli
+        fake = {"t": T0}
+        slept = []
+
+        def sleep(n):
+            slept.append(n)
+            fake["t"] += n
+
+        prev, cli._SLEEP = cli._SLEEP, sleep
+        try:
+            cli._quota_guard(self.task, when_open=True, clock=lambda: fake["t"],
+                             log=lambda *_: None)
+        finally:
+            cli._SLEEP = prev
+        self.assertTrue(slept, "--when-open did not wait at all")
+        self.assertAlmostEqual(sum(slept), 3600, delta=1)
+        self.assertGreaterEqual(fake["t"], T0 + 3600)
+        self.assertIsNone(self.task.state.get("park"))
+
+    def test_a_task_parked_for_any_other_reason_is_untouched(self):
+        from adg import cli
+        self.task.update(park=None)
+        cli._quota_guard(self.task, when_open=False, clock=lambda: T0)  # no exit
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

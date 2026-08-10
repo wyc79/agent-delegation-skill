@@ -7,7 +7,8 @@ import time
 
 import json
 
-from . import companions, limits as lim, router as routing, runtime, store, verify, winnow
+from . import (companions, cooldown, limits as lim, quota, router as routing,
+               runtime, store, verify, winnow)
 
 
 def _repo(path):
@@ -41,6 +42,82 @@ def _confirm(kind, text):
 def _new_id(repo):
     n = len(store.Task.list(repo)) + 1
     return "T-%03d" % n
+
+
+# The one place this program sleeps, named so a test can replace it.
+_SLEEP = time.sleep
+
+
+def _stamp(epoch):
+    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(float(epoch)))
+
+
+def _wait_until(epoch, clock=time.time, log=print):
+    """Block until a quota window reopens. Deliberately not a daemon: the user
+    started this and can stop it with ctrl-c, and nothing survives the shell."""
+    while True:
+        left = float(epoch) - clock()
+        if left <= 0:
+            return
+        log("waiting %d min for the quota window to reopen (%s) — ctrl-c to stop"
+            % (max(1, int(left // 60)), _stamp(epoch)))
+        _SLEEP(min(left, 300))
+
+
+def _quota_guard(task, when_open, clock=time.time, log=print):
+    """A task parked on quota is not broken, it is early. Refuse quietly and
+    say when, rather than starting a run every seat will reject."""
+    park = task.state.get("park") or {}
+    if park.get("reason") != "quota_all_exhausted":
+        return
+    reopen = float(park.get("reopen_at") or 0)
+    if clock() < reopen:
+        if not when_open:
+            sys.exit(
+                "%s is waiting on a provider quota window: %s reopens at %s.\n"
+                "Re-run then, or `delegate resume --when-open --id %s` to wait "
+                "here, or `delegate channels --clear <name>` if you believe a "
+                "seat is already back."
+                % (task.state["id"], ", ".join(park.get("channels") or ["the seat"]),
+                   _stamp(reopen), task.state["id"]))
+        _wait_until(reopen, clock=clock, log=log)
+    task.update(park=None)
+
+
+def cmd_channels(args):
+    """Cooldowns and quota draw per channel. Cross-project on purpose: the
+    breaker belongs to the seat, so it is the same list from every repo."""
+    reg = routing.load_registry(args.registry)
+    now = time.time()
+    cools, usage, warning = cooldown.read(now)
+    if warning:
+        print("warning: %s" % warning)
+    if args.clear:
+        if cooldown.clear(args.clear):
+            print("cleared the cooldown on %s" % args.clear)
+        else:
+            print("%s is not cooling — nothing to clear" % args.clear)
+        return
+    print("state file: %s" % cooldown.path())
+    print()
+    for name, chan in sorted((reg.get("channels") or {}).items()):
+        q = chan.get("quota") or {}
+        util = cooldown.utilization(usage.get(name), q, now)
+        entry = cools.get(name)
+        state = ("cooling until %s (%s)" % (_stamp(entry["reopen_at"]), entry["reason"])
+                 if entry else "ready")
+        cap = quota.parse_capacity(q.get("est_capacity"))
+        draw = ("%d%% of ~%g per %s" % (round(util * 100), cap, q.get("window"))
+                if cap else "no capacity estimate")
+        print("  %-14s %-38s %s" % (name, state, draw))
+        if entry and entry.get("detail"):
+            first = entry["detail"].strip().splitlines()
+            if first:
+                print("  %-14s   said: %s" % ("", first[0][:80]))
+    print()
+    print("Utilization is an estimate — providers expose no meter, so this "
+          "counts one invocation as one unit.\nClear a cooldown with "
+          "`delegate channels --clear <name>` if a seat is actually available.")
 
 
 def cmd_init(args):
@@ -143,6 +220,10 @@ def cmd_resume(args):
     repo = _repo(args.repo)
     reg = routing.load_registry(args.registry)
     task = store.Task.open(repo, args.id)
+    # getattr, like _make_adapter does for --no-panes: cmd_resume is called
+    # directly with hand-built args, and a missing flag must mean "off", not
+    # an AttributeError two lines into a resume.
+    _quota_guard(task, when_open=getattr(args, "when_open", False))
     was = task.state["status"]
     # An explicit --stage is honoured whenever it is given. A task interrupted
     # mid-flight keeps the status of the stage that was running, so gating the
@@ -222,6 +303,9 @@ def main(argv=None):
     rs.add_argument("--no-panes", action="store_true")
     rs.add_argument("--dry-run", action="store_true")
     rs.add_argument("--yes", action="store_true")
+    rs.add_argument("--when-open", action="store_true",
+                    help="if the task is waiting on a quota window, sleep here "
+                         "until it reopens and then resume")
     rs.set_defaults(func=cmd_resume)
 
     st = sub.add_parser("status", help="list tasks for this project")
@@ -231,6 +315,11 @@ def main(argv=None):
     sh.add_argument("--id")
     sh.add_argument("--brief", action="store_true")
     sh.set_defaults(func=cmd_show)
+
+    ch = sub.add_parser("channels", help="quota cooldowns and draw per channel")
+    ch.add_argument("--clear", metavar="NAME",
+                    help="drop the cooldown on one channel")
+    ch.set_defaults(func=cmd_channels)
 
     args = p.parse_args(argv)
     return args.func(args)
