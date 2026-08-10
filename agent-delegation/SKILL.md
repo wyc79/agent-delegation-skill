@@ -6,35 +6,27 @@ description: Use when taking part in a delegated multi-agent development workflo
 # Agent Delegation
 
 You are **one role in a pipeline**, not the whole system. Another agent planned
-this work, or will review it. You reach those agents only through files in the
-task directory — they never see your reasoning, only what you write down.
+this work, or will review it, and reaches you only through files — nobody ever
+sees your reasoning, only what you write down.
 
-## Step 1 — Locate the task directory
+## Step 1 — Establish what you are, and where the files are
 
-`$AGENT_DELEGATION_ROLE` names the role you are playing, and its presence is
-what says this protocol applies to you. `$AGENT_DELEGATION_TASK_DIR` only says
-*where the files are* — it is a location, not an assignment. An agent handed
-that path by some other tool, without a role, is not in this workflow and
-should not follow this skill.
+`$AGENT_DELEGATION_ROLE` names your role, and **its presence is what says this
+protocol applies to you**. `$AGENT_DELEGATION_TASK_DIR` says only *where the
+files are*: handed that path without a role, you are not in this workflow.
 
 Task state lives **outside the repository** — shared by every worktree, never in
-git history. `$AGENT_DELEGATION_TASK_DIR` holds its absolute path; that value is
-`$TASK_DIR` throughout this skill. If it is unset, derive it using
-`references/task-dir.md` (it gives the exact recipe for Linux, macOS, and
-Windows — do not improvise one, or you will read a different directory than the
-rest of the pipeline writes).
+git history; that path is `$TASK_DIR` below. Unset, derive it with
+`references/task-dir.md`, never by improvising one.
 
-**Never create the task directory yourself, and never write task artifacts into
-the repository.** If you cannot find it, stop. (Tool-forced exception: rule 2.)
+**Never create the task directory, and never write task artifacts into the
+repository.** If you cannot find it, stop. (Tool-forced exception: rule 2.)
 
-## Step 2 — Establish your assignment
+Your prompt must also carry a **task id**. Missing either, do not guess: write a
+`blocked` report naming what is missing — nobody is listening for a question, so
+the report is how you ask. The wrong role corrupts other agents' artifacts.
 
-Your prompt should give you a **role** and a **task id**. If either is missing,
-do not guess and do not pick one: write a `blocked` report saying what was
-missing. Nobody is listening for a question here — the report is how you ask.
-Working the wrong role corrupts artifacts other agents depend on.
-
-## Step 3 — Read exactly one role card
+## Step 2 — Read exactly one role card
 
 | Your role | Read | Your job, in one line |
 |---|---|---|
@@ -44,71 +36,65 @@ Working the wrong role corrupts artifacts other agents depend on.
 | Reviewer | `roles/reviewer.md` | Check requirements → plan → diff → evidence, and rule |
 | Integrator | `roles/integrator.md` | Reconcile conflicting subtask results with minimal change |
 
-Follow your card's numbered steps in order. Do not read the other cards.
+Follow its numbered steps in order. **Do not read the other cards** — a reviewer
+holding the implementer's card starts from the implementer's frame, and that
+independence is the point of the split.
 
-## The task directory
-
-Everything below is relative to `$TASK_DIR` from Step 1:
+## The task directory, relative to `$TASK_DIR`
 
 | File | Holds | Written by |
 |---|---|---|
 | `task.json` | Status, budgets, assignments, delegation history | Orchestrator only — **never edit** |
 | `task.md` | The request and its numbered acceptance criteria (`AC-n`) | Intake or a human. The planner may add criteria if there are none; nobody else edits it |
-| `spec.md` | The approved design, when one was written: purpose, the approach chosen over the alternatives, risks | Brainstorm stage, then approved by a human. Present on complex attended tasks only |
+| `spec.md` | The approved design: purpose, the approach chosen over the alternatives, risks | Brainstorm stage, then a human. Complex attended tasks only |
 | `plan.md` | Approach plus one YAML block per subtask | Planner |
-| `escalation.md` | Append-only. Why a subtask was handed back to the planner, with the failing checks, the implementer's account, and the completed work to disposition | Orchestrator, at rung 3 |
+| `escalation.md` | Append-only. Why a subtask came back to the planner: failing checks, the agent's account and signals, completed work to disposition | Orchestrator, at rung 3 |
 | `deviations.md` | Append-only log of departures from the plan | Anyone who departs |
 | `decisions.md` | Append-only design decisions and their reasons | Anyone deciding |
 | `reports/` | One JSON handoff per agent, per stage (`verify/` holds check output) | Every agent, at exit |
 
 **Authority when they disagree:** `task.md` (what was asked) outranks `spec.md`
 (the approach a human approved) outranks `plan.md` + `deviations.md` (how it is
-being done) outranks the code. Never "fix" a conflict silently in the direction
-of the code.
-
-`spec.md` sits where it does because a human approved it: it settles the
-approach, so re-opening that choice is a decision to record in `decisions.md`,
-not a judgement call to make quietly. It does not settle scope or sequencing —
-that is `plan.md`'s job — and it never outranks an acceptance criterion.
+being done) outranks the code — never resolve a conflict silently toward the
+code. Re-opening `spec.md` is a `decisions.md` entry, not a quiet call; it
+settles neither scope nor sequencing, and never outranks a criterion.
 
 ## Hard rules
 
-1. **Stay inside your declared file scope.** Touching files outside it is a
-   deviation at minimum and usually an escalation. Wanting to fix something
-   nearby is not permission to fix it.
-2. **Task artifacts never enter the repo** — they belong in `$TASK_DIR`. If a
-   tool forces an in-repo path, it must be one `git check-ignore -q` already
-   accepts, and `git status` must be clean of it — see `references/scratch-files.md`.
+1. **Stay inside your declared file scope.** Wanting to fix something nearby is
+   not permission to fix it.
+2. **Task artifacts never enter the repo.** A tool-forced in-repo path must be
+   one `git check-ignore -q` accepts — see `references/scratch-files.md`.
 3. **Never `git push`, never switch branches, never touch another agent's
    worktree.** Checkpoint inside your own often — uncommitted work is lost work.
-4. **Log every departure from the plan** in `deviations.md` as *plan said →
-   reality → what I did → severity*. An unlogged deviation reads as a defect.
-5. **An honest `blocked` is a success state.** Reporting that you are stuck with
-   evidence beats a plausible-looking result that does not work. Never fabricate
-   test output, never claim verification you did not run.
-6. **Do not expand scope.** Unrelated bugs, refactors, and cleanups belong in
-   `decisions.md` as observations, not in your diff.
-7. **Write your report before you exit** (Step 4). No report means you crashed.
+4. **Log every departure** in `deviations.md` as *plan said → reality → what I
+   did → severity*. An unlogged deviation reads as a defect.
+5. **An honest `blocked` is a success state.** Never fabricate output or claim
+   verification you did not run; a plausible result that fails is worse.
+6. **Do not expand scope.** Unrelated bugs and cleanups go in `decisions.md` as
+   observations, not in your diff.
+7. **Write your report before you exit** (Step 3). No report means you crashed.
 
-## When to read more
+## When to read more — only once the condition applies
 
-Read these **only when the condition applies** — not preemptively:
+The triggers every role shares. Your card carries its own; nobody carries another's.
 
 | Condition | Read |
 |---|---|
-| Your prompt says you are continuing work another agent started | `references/handover.md` |
-| You are stuck, tests failed 3+ times, or scope is ballooning | `references/escalation.md` |
-| You must depart from the plan and are unsure how severe it is | `references/deviations.md` |
-| You share files with another running agent, or hit a merge conflict | `references/parallelism.md` |
-| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |
-| A tool or engine forces you to write a file inside the repo | `references/scratch-files.md` |
-| You are about to write code, or `task.json` lists `companions` | `references/companions.md` |
-| You are about to write an artifact and want the exact fields | `schemas/`, `templates/` |
+| You are continuing work another agent started | `references/handover.md` |
+| Stuck, checks failed 3+ times, or scope ballooning | `references/escalation.md` |
+| Departing from the plan, unsure how severe it is | `references/deviations.md` |
+| A tool or engine forces a write inside the repo | `references/scratch-files.md` |
+| About to write an artifact and you want the exact fields | `schemas/`, `templates/` |
 
-## Step 4 — Report before you exit
+## Step 3 — Report before you exit
 
-Write `$TASK_DIR/reports/<stage>-<role-or-subtask>.json` matching `schemas/report.schema.json`:
-status (`complete` / `blocked` / `escalate`), a summary **written for the next
-agent** (what changed, what surprised you, what they must know — no pleasantries,
-no restating the task), artifacts written, deviations raised, signals fired, and
-evidence (real command output). Your role card names the extra fields it needs.
+Write `$TASK_DIR/reports/<stage>-<role-or-subtask>.json` against
+`schemas/report.schema.json`: status (`complete` / `blocked` / `escalate`), a
+summary **written for the next agent** (what changed, what surprised you, what
+they must know — no pleasantries, no restating the task), artifacts, deviations,
+signals, and evidence that is real output. Your card names the rest.
+
+**`escalate` is routed by your `signals`, not your prose.** A signal naming its
+type, citing an artifact and carrying real output reaches a stronger model or the
+planner; an `escalate` with nothing routable stops the run for a human.

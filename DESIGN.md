@@ -757,7 +757,7 @@ Three optional tools, each attached at the one place it belongs. All degrade to
 
 | Companion | Attaches at | Called by | Why there |
 |---|---|---|---|
-| [code-winnow](https://github.com/wyc79/code-winnow-skill) `scripts/scan.py` | Verify | **Orchestrator**, as a subprocess | Stdlib, ~0.2s, no model call — a deterministic check in the sense of D5, not an exception to it. Its five-judge review pipeline is a different and far costlier thing, and is not called. |
+| [code-winnow](https://github.com/wyc79/code-winnow-skill) `scripts/scan.py` | Verify | **Orchestrator**, as a subprocess | Stdlib, ~0.2s, no model call — a deterministic check in the sense of D5, not an exception to it. Its six judgment passes plus an arbitrated merge are a different and far costlier thing, and are not called. |
 | `andrej-karpathy-skills:karpathy-guidelines` | Before writing code | Implementer, Integrator | Its "surgical changes" section is the `file_scope` rule from the other direction; "simplicity first" is what the reviewer measures the diff against. |
 | `superpowers:systematic-debugging` | Second failed attempt | Implementer | By the third attempt the ladder is already escalating. It does not buy a fourth. |
 

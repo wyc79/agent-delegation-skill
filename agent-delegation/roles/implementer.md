@@ -93,5 +93,16 @@ gives the log format, which has required fields this card does not repeat.
 - The plan is wrong in a way you cannot patch locally.
 
 Escalating is not failure — it routes the problem to a stronger model or a human
-with your evidence attached. Read `references/escalation.md` for how to phrase
-the signal so the next agent can act on it.
+with your evidence attached, and **the signal you write is what does the
+routing**: an `escalate` carrying nothing routable stops the whole run for a
+human. Read `references/escalation.md` for the shapes.
+
+## Your triggers
+
+Beyond the shared ones in `SKILL.md`, and only when the condition applies:
+
+| Condition | Read |
+|---|---|
+| Before you write code | `references/companions.md` |
+| You share files with another running agent, or hit a merge conflict | `references/parallelism.md` |
+| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |

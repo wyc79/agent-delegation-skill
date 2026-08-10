@@ -200,7 +200,11 @@ policy:
     max_attempts_per_subtask: 8
     max_review_loops: 2
     max_replans: 1
-    max_parallel_agents: 3
+    # 1, not 3, until the wave race in orchestrator/README.md "Known defect" is
+    # closed. Shipping the unsafe number and documenting the safe one asks every
+    # reader to notice a paragraph before their first run; the sequential path
+    # loses nothing but wall-clock. Raise it deliberately, not by default.
+    max_parallel_agents: 1
     human_approval_required: [plan, merge, dependency_change, destructive_op]
   escalation_thresholds:
     test_stuck_attempts: 3

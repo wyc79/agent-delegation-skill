@@ -3,9 +3,9 @@
 Only the **deterministic scanner** is used here. `scripts/scan.py` is stdlib-only
 and finishes in well under a second, which makes it a deterministic check in the
 sense of D5 rather than an exception to it -- so it runs alongside build, test
-and lint, including on tasks that skip LLM review. code-winnow's five-judge
-review pipeline is a different, far more expensive thing and is not called from
-here.
+and lint, including on tasks that skip LLM review. code-winnow's six judgment
+passes and their arbitrated merge are a different, far more expensive thing and
+are not called from here.
 
 The skill is **referenced, never vendored**. Copying its scanner in would mean
 maintaining a fork of someone else's actively developed tool, and a stale fork
@@ -97,7 +97,13 @@ def run(task, scan_py, cwd, base_ref, run_id):
 def summarize(data, run_id=None):
     """Normalise defensively: this is another project's schema, and a key that
     moves must degrade to a smaller summary rather than crash the pipeline."""
-    findings = data.get("findings") or data.get("candidates") or []
+    # `findings` is the key scan.py has always emitted, on every JSON path
+    # including the empty-scope one. There used to be a `candidates` fallback
+    # beside it, guessing at a rename that has never happened -- and it could
+    # not have helped: a renamed key lands on the `files`-is-nonzero branch
+    # below and reports a real scan as zero findings either way. Speculating
+    # about another project's schema buys nothing you can test.
+    findings = data.get("findings") or []
     # An empty scope is not a clean scan. scan.py answers "no diff found" with
     # exit 0 and zero findings, which is byte-for-byte what a reviewed change
     # that came back clean looks like -- and reporting it as clean is precisely
