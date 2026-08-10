@@ -21,6 +21,9 @@ from test_orchestrator import REGISTRY, TempRepo, _report, sh    # noqa: E402,F4
 T0 = 1754800000.0        # a fixed epoch; every test clock starts here
 
 
+QUOTA_MSG = "Error: Claude AI usage limit reached. Your limit will reset in 2 hours."
+
+
 def blocked(text, code=1):
     """What an adapter hands back when the CLI failed."""
     return {"settled": "blocked", "output": text, "code": code}
@@ -437,6 +440,36 @@ class TestMachineSelection(unittest.TestCase):
         self.assertEqual(orch._pick("implementer").channel, "claude-seat")
         self.assertTrue(any("unreadable" in x for x in logs), logs)
 
+    def test_an_optional_role_going_dark_mid_call_degrades_instead_of_parking(self):
+        """A seat that dies *during* a cosmetic call must degrade exactly like a
+        seat that was already cooled before it. Parking a finished task because
+        the brief could not be prettified is absurd, and the guard around
+        `_pick` alone did not cover the call that follows it.
+
+        No breaker is opened up front on purpose: `fast-cheap` is the only model
+        enrolled for this role and only cursor-seat exposes it, so pre-cooling
+        would fail at the pick -- the path that was already guarded -- and prove
+        nothing about the call after it."""
+
+        def reporter(env, cwd):
+            return blocked(QUOTA_MSG)
+
+        orch = _orch(self.reg, runtime.MockAdapter({"reporter": reporter},
+                                                   now=lambda: T0), self.task)
+        original = "# T-001 — Merge\n\nA plain brief that is long enough to keep." * 3
+        self.assertEqual(orch._polish(original), original,
+                         "the template fallback was skipped")
+
+    def test_an_optional_role_going_dark_does_not_park_the_run(self):
+        def classifier(env, cwd):
+            return blocked(QUOTA_MSG)
+
+        orch = _orch(self.reg, runtime.MockAdapter({"classifier": classifier},
+                                                   now=lambda: T0), self.task)
+        tier, why, by = orch._ask_classifier("Add a subtract function")
+        self.assertEqual(tier, "complex", "the fail-safe classification was lost")
+        self.assertEqual(by, "fallback")
+
     def test_invocations_are_metered_against_the_window(self):
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
         choice = orch._pick("implementer")
@@ -457,7 +490,6 @@ PLAN_MD = """# Plan
 ```
 """
 
-QUOTA_MSG = "Error: Claude AI usage limit reached. Your limit will reset in 2 hours."
 
 
 class TestFailoverEndToEnd(unittest.TestCase):

@@ -173,12 +173,12 @@ admits only one sensible reading.
         text = self.task.read_text("task.md", "")
         if re.search(r"^\s*[-*]?\s*\*\*AC-\d", text, re.M) or self.dry_run:
             return                      # already stated by whoever wrote the task
-        try:
-            choice = self._pick("classifier")   # cheap tier; this is not judgement
-        except routing.NoModelAvailable:
+        # Routed on the cheap classifier tier; this is not judgement.
+        res = self._optional("intake", self.CRITERIA_PROMPT % {
+            "request": text.strip()[:4000], "facts": self._repo_facts()},
+            pick_as="classifier")
+        if res is None:
             return
-        res = self._direct("intake", choice, self.CRITERIA_PROMPT % {
-            "request": text.strip()[:4000], "facts": self._repo_facts()})
         out = (res.get("output") or "").strip()
         if "AC-1" not in out:
             self.log("intake: no criteria derived — the reviewer will have less to check")
@@ -218,13 +218,13 @@ admits only one sensible reading.
     def _ask_classifier(self, text):
         if self.dry_run:
             return "simple", "dry run", "stub"
-        try:
-            choice = self._pick("classifier")
-        except routing.NoModelAvailable as e:
-            return "complex", "no classifier model available (%s)" % e, "fallback"
         prompt = CLASSIFY_PROMPT % {"request": text.strip()[:4000],
                                     "facts": self._repo_facts()}
-        res = self._direct("classifier", choice, prompt)
+        res = self._optional("classifier", prompt)
+        if res is None:
+            # Fail safe, exactly as an unparseable verdict does: over-planning a
+            # small task wastes time, under-planning a large one wastes the run.
+            return "complex", "no classifier model available", "fallback"
         out = (res.get("output") or "")
         m = re.search(r"VERDICT:\s*(SIMPLE|COMPLEX)\s*-*\s*(.*)", out, re.I)
         if not m:
@@ -232,9 +232,10 @@ admits only one sensible reading.
             # under-planning a large one wastes the whole run.
             return "complex", "classifier gave no usable verdict", "fallback"
         self.task.record_delegation({"stage": "classify", "role": "classifier",
-                                     "model": choice.model, "channel": choice.channel,
+                                     "model": res.get("model"), "channel": res.get("channel"),
                                      "adapter": self.adapter.name, "outcome": "complete"})
-        return m.group(1).lower(), m.group(2).strip()[:200] or "no reason given", choice.model
+        return (m.group(1).lower(),
+                m.group(2).strip()[:200] or "no reason given", res.get("model"))
 
     def _classified(self, tier, why, by):
         self.log("classify: %s (%s)" % (tier, why))
@@ -982,11 +983,32 @@ a planner does that next, from your design.
         self._close(session)
         return report
 
-    def _direct(self, role, choice, text, timeout=180):
+    def _optional(self, role, text, timeout=180, pick_as=None):
+        """A text-reply role whose absence is survivable -> the result, or None.
+
+        `pick_as` is the *capability profile* to route on when it differs from
+        the agent's role name: intake is a classifier-tier job that the agent
+        still runs as "intake", and only profiles named in the registry can be
+        routed.
+
+        Selection and invocation are guarded together on purpose. A seat that is
+        already cooled and a seat that goes dark mid-call are the same fact to
+        these callers, and guarding only the pick meant the second one escaped
+        as a quota park -- parking a finished task because its brief could not
+        be prettified."""
+        try:
+            choice = self._pick(pick_as or role)
+            return self._direct(role, choice, text, timeout, pick_as=pick_as)
+        except routing.NoModelAvailable as e:
+            self.log("  %s: skipped — %s" % (role, e))
+            return None
+
+    def _direct(self, role, choice, text, timeout=180, pick_as=None):
         """One prompt, one answer, no report file -- the text-reply roles
         (§4.6). Shares the metering, billing and quota failover that `_invoke`
         gives every other role, which three hand-rolled copies of this dance
-        did not."""
+        did not. `pick_as` is the capability profile to re-route on, for roles
+        whose name is not a profile (see `_optional`)."""
         session = self.adapter.start_agent(role, choice.agent_kind, self.repo,
                                            prompts.env_for(self.task))
         try:
@@ -995,12 +1017,15 @@ a planner does that next, from your design.
             self._close(session)
         if res.get("failure") == "quota_exhausted":
             at = self._cool(choice, res)
-            nxt = self._pick(role, exclude=(choice.channel,))
+            nxt = self._pick(pick_as or role, exclude=(choice.channel,))
             self.log("failover: %s %s -> %s (quota, reopens %s)"
                      % (role, choice.channel, nxt.channel, _stamp(at)))
-            return self._direct(role, nxt, text, timeout)
+            return self._direct(role, nxt, text, timeout, pick_as=pick_as)
         self._meter(choice)
         self._bill(res, choice)
+        # Who actually ran it. After a failover that is not the channel the
+        # caller picked, and the delegation record must name the one that did.
+        res["model"], res["channel"] = choice.model, choice.channel
         return res
 
     # A quota wall is the seat's fault, not the approach's, so the hop happens
@@ -1175,11 +1200,9 @@ Rules:
         rewrite falls back to the template rather than replacing it."""
         if self.dry_run:
             return text
-        try:
-            choice = self._pick("reporter")
-        except routing.NoModelAvailable:
+        res = self._optional("reporter", self.REPORT_PROMPT % text)
+        if res is None:
             return text
-        res = self._direct("reporter", choice, self.REPORT_PROMPT % text)
         out = (res.get("output") or "").strip()
         if len(out) < 80 or brief.lint(out):
             return text
