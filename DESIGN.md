@@ -210,7 +210,8 @@ stateDiagram-v2
 
 | Stage | Mandatory? | Model tier | Notes |
 |-------|-----------|-----------|-------|
-| INTAKE | Always | none | Normalize request into `task.md`; capture acceptance criteria. Orchestrator + template. |
+| INTAKE | Always | cheap | Normalize the request into `task.md` and **derive numbered acceptance criteria**. Every task needs them: the reviewer's evidence chain keys off `AC-n`, so a task without them can only be reviewed on taste. Skipped when a human already wrote them. |
+| BRAINSTORM | Complex + attended only | **strong reasoning** | Design dialogue before decomposition: purpose, two or three approaches with a recommendation, risks, and questions carrying proposed defaults. Writes `spec.md`, gated to the human, then handed to the planner. Skipped unattended — a design conversation with nobody in the room is theatre. |
 | CLASSIFY | Always | none → cheap | Heuristics (keywords, estimated file count from a repo map, request length, "refactor/migrate/redesign" flags). Cheap LLM only if heuristics are ambiguous. |
 | PLAN | Complex only | **strong reasoning** | The single highest-leverage expensive call in the system. A good plan lets cheap implementers succeed. |
 | DECOMPOSE | Complex only | strong (same session as PLAN) | Declares subtasks, file scopes, dependencies, parallel groups. |

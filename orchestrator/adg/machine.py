@@ -107,12 +107,70 @@ class Orchestrator:
             return "needs_human"
 
     # --------------------------------------------------------------- stages
+    CRITERIA_PROMPT = """Turn this request into acceptance criteria.
+
+Reply with exactly this markdown and nothing else:
+
+## Acceptance criteria
+
+- **AC-1** — <one checkable statement>
+- **AC-2** — ...
+
+## Non-goals
+
+- <something a reasonable reader might assume is included, and is not>
+
+## Open questions
+
+- <question> — *default:* <what you will assume if nobody answers>
+
+Rules: each criterion is one observable claim someone could verify, not a
+paragraph. Infer nothing grand — if the request is small, two criteria is a
+complete answer. Omit the open-questions section entirely when the request
+admits only one sensible reading.
+
+--- REQUEST ---
+%(request)s
+
+--- REPOSITORY ---
+%(facts)s
+"""
+
     def _stage_intake(self):
         self.log("intake: %s" % self.task.state["id"])
         found = companions.detect()
         if any(found.values()):
             self.log("companions: %s" % ", ".join(k for k, v in found.items() if v))
-        self.task.update(companions=found, status="classify")
+        self.task.update(companions=found)
+        self._derive_criteria()
+        self.task.update(status="classify")
+
+    def _derive_criteria(self):
+        """Give every task numbered acceptance criteria, not just complex ones.
+        The reviewer's whole evidence chain keys off AC-n; without them a review
+        has nothing to check against and grades taste instead."""
+        text = self.task.read_text("task.md", "")
+        if re.search(r"^\s*[-*]?\s*\*\*AC-\d", text, re.M) or self.dry_run:
+            return                      # already stated by whoever wrote the task
+        try:
+            choice = self._pick("classifier")   # cheap tier; this is not judgement
+        except routing.NoModelAvailable:
+            return
+        session = self.adapter.start_agent("intake", choice.agent_kind, self.repo,
+                                           prompts.env_for(self.task))
+        try:
+            res = self.adapter.prompt(session, self.CRITERIA_PROMPT % {
+                "request": text.strip()[:4000], "facts": self._repo_facts()}, timeout=180)
+        finally:
+            self._close(session)
+        if res.get("cost_usd"):
+            self.budget.spend(res["cost_usd"])
+        out = (res.get("output") or "").strip()
+        if "AC-1" not in out:
+            self.log("intake: no criteria derived — the reviewer will have less to check")
+            return
+        self.task.write_text("task.md", text.rstrip() + "\n\n" + out + "\n")
+        self.log("intake: %d acceptance criteria" % len(re.findall(r"\*\*AC-\d+\*\*", out)))
 
     def _repo_facts(self):
         """Cheap, factual context so the classifier judges the change against
@@ -173,8 +231,10 @@ class Orchestrator:
 
     def _classified(self, tier, why, by):
         self.log("classify: %s (%s)" % (tier, why))
-        self.task.update(classification={"tier": tier, "by": by, "why": why},
-                         status="plan" if tier == "complex" else "implement")
+        nxt = "implement"
+        if tier == "complex":
+            nxt = "brainstorm" if self._brainstorm_wanted() else "plan"
+        self.task.update(classification={"tier": tier, "by": by, "why": why}, status=nxt)
         if tier == "simple":
             self._seed_single_subtask()
 
@@ -185,13 +245,86 @@ class Orchestrator:
             "planned_scope": ["**"], "acceptance": [], "actual_files": [],
         }])
 
+    def _brainstorm_wanted(self):
+        """Design dialogue is worth it on complex work, and only when a human is
+        there to answer. Unattended, the planner's open-questions-with-defaults
+        already covers the same ground without pretending to consult anyone."""
+        mode = (self.vcfg.get("brainstorm") or "auto")
+        if mode == "never":
+            return False
+        if mode == "always":
+            return True
+        return self.task.state.get("mode") == "attended"
+
+    BRAINSTORM_PROMPT = """Design this change before anyone implements it.
+
+%(discipline)s
+
+Write **only** to %(spec)s. Do not write into the repository and do not commit
+anything — this design is orchestration state, not project documentation.
+
+Produce, in this order:
+1. **Purpose** — what problem this solves, in the user's terms.
+2. **Approaches** — two or three, each with its trade-off, and say which you
+   recommend and why.
+3. **Design** — the recommended approach in enough detail to plan against:
+   the seams, the interfaces other code will touch, what stays unchanged.
+4. **Risks** — what could make this design wrong, and the earliest signal.
+5. **Questions for the human** — anything you genuinely cannot settle from the
+   code. Each one gets a *proposed default* so silence is a safe answer. Omit
+   the section if there is nothing real to ask; inventing questions to look
+   thorough wastes the one round you get.
+
+You are not implementing anything and you are not writing a task breakdown —
+a planner does that next, from your design.
+
+--- REQUEST ---
+%(request)s
+"""
+
+    def _stage_brainstorm(self):
+        try:
+            choice = self._pick("planner")
+        except routing.NoModelAvailable as e:
+            self.log("brainstorm: skipped — %s" % e)
+            self.task.update(status="plan")
+            return
+        installed = (self.task.state.get("companions") or {}).get("superpowers")
+        discipline = ("Use the `superpowers:brainstorming` skill's discipline for this: "
+                      "explore the code first, then reason about purpose, constraints and "
+                      "success criteria before proposing anything. Ignore its instructions "
+                      "about where to save files and about committing."
+                      if installed else
+                      "Explore the code before proposing anything.")
+        self.log("brainstorm: %s via %s" % (choice.model, choice.channel))
+        self._close(self._invoke(
+            "planner", choice, cwd=self.repo,
+            extra=self.BRAINSTORM_PROMPT % {
+                "discipline": discipline,
+                "spec": self.task.file("spec.md"),
+                "request": self.task.read_text("task.md", "").strip()[:4000]}))
+        spec = self.task.read_text("spec.md", "")
+        if not spec.strip():
+            self.log("brainstorm: produced no design — planning from the request alone")
+            self.task.update(status="plan")
+            return
+        self._gate("design", "Approve this design before a plan is written from it? "
+                             "Answer any open questions below, or accept the "
+                             "defaults by approving.")
+        self.task.update(status="plan")
+
     def _stage_plan(self):
         choice = self._pick("planner")
         self.log("plan: %s via %s" % (choice.model, choice.channel))
         self.budget.check_cost(0.0)
-        self._close(self._invoke("planner", choice, cwd=self.repo,
-                    extra="Write plan.md now. Use the template at "
-                          "%s/templates/plan.md." % prompts.skill_path()))
+        extra = ("Write plan.md now. Use the template at %s/templates/plan.md."
+                 % prompts.skill_path())
+        if self.task.read_text("spec.md", "").strip():
+            extra += ("\n\nAn approved design is at %s. Plan against it: it settles "
+                      "the approach, so decompose and scope rather than redesigning. "
+                      "Departing from it is a decision to record in decisions.md."
+                      % self.task.file("spec.md"))
+        self._close(self._invoke("planner", choice, cwd=self.repo, extra=extra))
         subtasks = self._read_plan_subtasks()
         if not subtasks:
             raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
@@ -839,8 +972,11 @@ Rules:
 
     def _gate(self, kind, question):
         files = sorted({f for s in self.task.state["subtasks"] for f in s.get("actual_files", [])})
+        extra = None
+        if kind == "design":
+            extra = self.task.read_text("spec.md", "")
         text, problems = brief.write(self.task, kind, question, files=files,
-                                     polish=self._polish)
+                                     extra=extra, polish=self._polish)
         for p in problems:
             self.log("  brief lint: %s" % p)
         if not self.gate(kind, text):
