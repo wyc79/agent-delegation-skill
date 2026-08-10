@@ -132,11 +132,9 @@ class Budget:
 
     # --- counters (call AFTER the action) ---------------------------------
     def _bump(self, fn):
-        state = self.task.state
-        spent = state.setdefault("spent", {})
-        fn(spent)
-        self.task.write_json("task.json", state)
-        self.spent = spent
+        # Under the task lock: a lost increment here is a limit that fails open.
+        state = self.task.mutate(lambda s: fn(s.setdefault("spent", {})))
+        self.spent = state.get("spent", {})
 
     def spend(self, usd):
         self._bump(lambda s: s.__setitem__("usd", round(float(s.get("usd", 0.0)) + float(usd), 4)))
