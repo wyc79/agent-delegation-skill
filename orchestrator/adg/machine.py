@@ -942,6 +942,7 @@ Rules:
 - Say what each changed file is for. They do not know this codebase.
 - State plainly anything that was NOT verified.
 - No praise, no filler, no restating the task twice.
+- Reproduce any markdown table exactly as given. Those are facts, not prose.
 
 --- NOTES ---
 %s

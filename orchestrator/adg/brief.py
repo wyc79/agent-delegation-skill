@@ -54,6 +54,48 @@ def _files_by_area(files, limit=12):
     return lines
 
 
+def _cost_section(state):
+    """Who actually did the work, and what it cost. Users should not have to
+    open task.json to find out which provider ran their code, and an unreported
+    cost is shown as unreported rather than folded into a total as zero."""
+    spent = state.get("spent", {})
+    limits_ = state.get("limits", {})
+    md = ["## Who did the work, and what it cost", ""]
+
+    rows = {}
+    for h in state.get("delegation_history") or []:
+        key = (h.get("model") or "unknown", h.get("channel") or "unknown",
+               h.get("adapter") or "")
+        row = rows.setdefault(key, {"steps": [], "usd": 0.0, "unpriced": 0})
+        row["steps"].append(h.get("role") or h.get("stage") or "step")
+        if isinstance(h.get("usd"), (int, float)):
+            row["usd"] += float(h["usd"])
+        else:
+            row["unpriced"] += 1
+
+    if rows:
+        md += ["| Model | Provider | Did | Cost |", "|---|---|---|---|"]
+        for (model, channel, adapter), row in sorted(rows.items()):
+            cost = "$%.2f" % row["usd"] if row["usd"] else ""
+            if row["unpriced"]:
+                note = "%d run%s not reported" % (row["unpriced"],
+                                                  "" if row["unpriced"] == 1 else "s")
+                cost = "%s (%s)" % (cost, note) if cost else note
+            md.append("| `%s` | %s%s | %s | %s |" % (
+                model, channel, " (in a terminal pane)" if adapter == "herdr" else "",
+                ", ".join(sorted(set(row["steps"]))), cost))
+        md.append("")
+
+    total = float(spent.get("usd", 0.0))
+    cap = float(limits_.get("max_cost_usd", 0))
+    md.append("- Total billed: $%.2f of a $%.2f cap." % (total, cap))
+    if any(r["unpriced"] for r in rows.values()):
+        md.append("- Some runs reported no cost, so the real total is higher than "
+                  "the figure above and the cap could not be enforced against them.")
+    md.append("")
+    return md
+
+
 def render(task, kind, decision_text, files=(), verify=None, extra=None):
     """Build a gate brief. Decision first: it is what the reader must act on."""
     state = task.state
@@ -90,10 +132,7 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
     if deviations and not deviations.startswith("#"):
         md += ["## What didn't go to plan", "", "See the deviations log for details.", ""]
 
-    spent = state.get("spent", {})
-    limits_ = state.get("limits", {})
-    md += ["## Cost", "", "- Spent $%.2f of a $%.2f cap." % (
-        float(spent.get("usd", 0.0)), float(limits_.get("max_cost_usd", 0))), ""]
+    md += _cost_section(state)
 
     if extra:
         md += [extra.strip(), ""]

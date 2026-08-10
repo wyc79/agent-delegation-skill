@@ -1436,7 +1436,12 @@ body, and park notification is rendered as a brief**, written to a single standa
    pass; 9 new tests cover the acceptance criteria"), plus anything *not*
    verified ("play-mode behavior was not engine-tested — the check is slow and
    deferred to CI").
-7. **Cost & spend** — money/quota used, and which seat it came from.
+7. **Who did the work, and what it cost** — a row per model naming the provider
+   it ran on, which steps it performed, and its cost. A run that reported no
+   cost says so rather than contributing zero to a total, and the brief states
+   plainly that the real total is higher and the cap could not be enforced
+   against it. Users should not have to open `task.json` to learn which
+   provider ran their code.
 8. **Drill-down links** — the internal artifacts (`plan.md`, `deviations.md`,
    reports, full diff) for readers who want the raw material. The IDs live down
    here, not up top.

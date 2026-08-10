@@ -1000,6 +1000,49 @@ class TestResume(unittest.TestCase):
         self.assertNotEqual(store.Task.open(self.t.repo, "T-RS").state["status"], "plan")
 
 
+class TestCostBreakdown(unittest.TestCase):
+    """The brief should say which model on which provider did what, and never
+    fold an unreported cost into a total as zero."""
+
+    STATE = {"id": "T-1", "spent": {"usd": 1.05}, "limits": {"max_cost_usd": 15},
+             "delegation_history": [
+                 {"role": "classifier", "model": "fast-cheap", "channel": "cursor-seat",
+                  "adapter": "local", "usd": None},
+                 {"role": "planner", "model": "opus-class-strong",
+                  "channel": "claude-seat", "adapter": "local", "usd": 1.05},
+                 {"role": "implementer", "model": "balanced-coder",
+                  "channel": "claude-seat", "adapter": "herdr", "usd": None}]}
+
+    def test_every_model_and_provider_is_named(self):
+        out = "\n".join(brief._cost_section(self.STATE))
+        for token in ("fast-cheap", "cursor-seat", "opus-class-strong",
+                      "claude-seat", "balanced-coder"):
+            self.assertIn(token, out, token)
+        self.assertIn("classifier", out)
+        self.assertIn("planner", out)
+
+    def test_unreported_cost_is_never_shown_as_zero(self):
+        out = "\n".join(brief._cost_section(self.STATE))
+        self.assertIn("not reported", out)
+        self.assertIn("the real total is higher", out)
+        self.assertNotIn("$0.00", out)
+
+    def test_pane_runs_are_labelled_so_the_gap_is_explicable(self):
+        out = "\n".join(brief._cost_section(self.STATE))
+        self.assertIn("terminal pane", out)
+
+    def test_a_fully_priced_run_makes_no_excuses(self):
+        state = dict(self.STATE, delegation_history=[
+            {"role": "planner", "model": "opus-class-strong", "channel": "claude-seat",
+             "adapter": "local", "usd": 1.05}])
+        out = "\n".join(brief._cost_section(state))
+        self.assertNotIn("not reported", out)
+        self.assertNotIn("the real total is higher", out)
+
+    def test_the_breakdown_survives_the_jargon_lint(self):
+        self.assertEqual(brief.lint("\n".join(brief._cost_section(self.STATE))), [])
+
+
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
     nothing looks exactly like a clean scan."""
