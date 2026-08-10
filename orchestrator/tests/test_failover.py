@@ -432,5 +432,180 @@ class TestMachineSelection(unittest.TestCase):
         self.assertEqual(len(usage[choice.channel]), 2)
 
 
+PLAN_MD = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-main
+  goal: Add a subtract function to app.py
+  file_scope: ["app.py"]
+  acceptance: [AC-1]
+```
+"""
+
+QUOTA_MSG = "Error: Claude AI usage limit reached. Your limit will reset in 2 hours."
+
+
+class TestFailoverEndToEnd(unittest.TestCase):
+    """AC-1, AC-3. The whole point: a seat empties and the run continues."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+
+    def tearDown(self):
+        self.t.close()
+
+    def _script(self, quota_first):
+        """An implementer that hits a quota wall on its first channel only."""
+        state = {"seen": []}
+
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(PLAN_MD)
+
+        def implementer(env, cwd):
+            state["seen"].append(cwd)
+            if quota_first and len(state["seen"]) == 1:
+                return blocked(QUOTA_MSG)
+            with open(os.path.join(cwd, "app.py"), "a") as fh:
+                fh.write("\ndef subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "subtask": "st-1-main",
+                "status": "complete", "summary": "added subtract",
+                "evidence": {"tests": "green"}})
+            return None
+
+        return state, {"planner": planner, "implementer": implementer,
+                       "test-author": lambda e, c: None,
+                       "classifier": lambda e, c: {"output": "VERDICT: SIMPLE -- small"},
+                       "reviewer": lambda e, c: None}
+
+    def _run(self, script, clock=None):
+        task = store.Task.create(self.t.repo, "T-001",
+                                 "# t\n\n- **AC-1** — subtract exists\n", self.pol)
+        logs = []
+        clock = clock or (lambda: T0)
+        adapter = runtime.MockAdapter(script, now=clock)
+        status = Orchestrator(task, self.reg, adapter, lambda k, x: True,
+                              log=logs.append, clock=clock).run()
+        return task, status, logs
+
+    def test_a_quota_wall_fails_over_and_the_task_still_finishes(self):
+        _, script = self._script(quota_first=True)
+        task, status, logs = self._run(script)
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertTrue(any("failover:" in x for x in logs), "\n".join(logs))
+
+    def test_the_quota_failure_costs_no_attempt(self):
+        # AC-1: a quota failure is the channel's fault, not the approach's.
+        _, script = self._script(quota_first=True)
+        task, _, logs = self._run(script)
+        attempts = task.state["spent"]["attempts"]
+        self.assertEqual(attempts.get("st-1-main"), 1,
+                         "the quota failure was billed to the subtask: %s" % attempts)
+
+    def test_the_run_moved_to_the_other_channel(self):
+        _, script = self._script(quota_first=True)
+        task, _, _ = self._run(script)
+        used = [h["channel"] for h in task.state["delegation_history"]
+                if h.get("role") == "implementer" and h.get("outcome") == "complete"]
+        self.assertEqual(used, ["cursor-seat"])
+
+    def test_the_cooled_channel_is_on_disk_with_the_stated_reset(self):
+        # AC-2: "reset in 2 hours" from the message, not the 5h window.
+        _, script = self._script(quota_first=True)
+        self._run(script)
+        cools, _, _ = cooldown.read(T0)
+        self.assertEqual(cools["claude-seat"]["reopen_at"], T0 + 2 * 3600)
+        self.assertEqual(cools["claude-seat"]["reason"], "quota")
+
+    def test_without_a_stated_reset_the_configured_window_is_used(self):
+        state, script = self._script(quota_first=False)
+        original = script["implementer"]
+
+        def implementer(env, cwd):
+            if not state["seen"]:
+                state["seen"].append(cwd)
+                return blocked("Error: usage limit reached")     # no time given
+            return original(env, cwd)
+
+        _, status, logs = self._run(dict(script, implementer=implementer))
+        cools, _, _ = cooldown.read(T0)
+        self.assertEqual(cools["claude-seat"]["reopen_at"], T0 + 5 * 3600)
+        self.assertTrue(any("stated no reset time" in x for x in logs), "\n".join(logs))
+
+    def test_a_generic_failure_still_consumes_an_attempt(self):
+        # AC-5: the other half of the contract. A stack trace is a retry.
+        state, script = self._script(quota_first=False)
+        original = script["implementer"]
+        calls = {"n": 0}
+
+        def implementer(env, cwd):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return blocked("Traceback (most recent call last):\nValueError: x")
+            return original(env, cwd)
+
+        task, status, logs = self._run(dict(script, implementer=implementer))
+        self.assertFalse(any("failover:" in x for x in logs), "\n".join(logs))
+        self.assertGreaterEqual(task.state["spent"]["attempts"].get("st-1-main", 0), 1)
+        self.assertEqual(cooldown.active(T0), set(), "a stack trace opened a breaker")
+
+    def test_every_channel_cooled_parks_with_the_quota_reason(self):
+        # AC-3.
+        cooldown.open_breaker("cursor-seat", "quota", T0 + 9000, T0)
+        _, script = self._script(quota_first=True)
+        task, status, logs = self._run(script)
+        self.assertEqual(status, "needs_human")
+        park = task.state.get("park") or {}
+        self.assertEqual(park.get("reason"), "quota_all_exhausted")
+        self.assertEqual(park.get("reopen_at"), T0 + 2 * 3600, "earliest reopen")
+        self.assertIn("claude-seat", park.get("channels", []))
+
+    def test_a_quota_park_consumes_no_attempt_budget(self):
+        # AC-3: parking must not also spend the thing that would let a retry
+        # work once the window reopens.
+        cooldown.open_breaker("cursor-seat", "quota", T0 + 9000, T0)
+        _, script = self._script(quota_first=True)
+        task, _, _ = self._run(script)
+        self.assertEqual(task.state["spent"]["attempts"].get("st-1-main", 0), 0)
+
+    def test_the_park_brief_names_the_seats_and_the_reopen_time(self):
+        cooldown.open_breaker("cursor-seat", "quota", T0 + 9000, T0)
+        _, script = self._script(quota_first=True)
+        task, _, _ = self._run(script)
+        text = task.read_text("brief.md", "")
+        self.assertIn("usage limit", text.lower())
+        self.assertIn("claude-seat", text)
+
+    def test_work_already_committed_survives_the_hop(self):
+        # §5.5: the replacement resumes from the checkpoint, it does not restart.
+        state, script = self._script(quota_first=False)
+        original = script["implementer"]
+        calls = {"n": 0}
+        saw = {}
+
+        def implementer(env, cwd):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                with open(os.path.join(cwd, "partial.py"), "w") as fh:
+                    fh.write("# half done\n")
+                return blocked(QUOTA_MSG)
+            saw["partial"] = os.path.exists(os.path.join(cwd, "partial.py"))
+            return original(env, cwd)
+
+        task, status, logs = self._run(dict(script, implementer=implementer))
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertTrue(saw.get("partial"),
+                        "the replacement got a clean worktree, losing the work")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

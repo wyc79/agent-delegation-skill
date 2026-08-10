@@ -99,6 +99,12 @@ class Orchestrator:
                 if handler is None:
                     raise Halt("needs_human", "no handler for stage %r" % status)
                 handler()
+        except routing.AllChannelsCooled as q:
+            # Ahead of the generic handler: this is not a crash and not a
+            # registry mistake, and reporting it as either sends the reader to
+            # the wrong fix.
+            self._quota_park(q)
+            return "needs_human"
         except Halt as h:
             self.task.update(status=h.status)
             self.log("\n== %s: %s" % (h.status.upper(), h))
@@ -459,7 +465,7 @@ a planner does that next, from your design.
             attempts += 1
             self.log("implement %s: attempt %d (%s%s)" % (
                 sub["id"], attempts, role_choice.model, "" if session is None else ", continued"))
-            session, report = self._invoke(
+            session, report, role_choice = self._invoke(
                 "implementer", role_choice, cwd=base, subtask=sub,
                 session=session, failure=failure, extra=self._findings_brief(sub))
             self.budget.used_attempt(sub["id"])
@@ -487,8 +493,10 @@ a planner does that next, from your design.
             threshold = int((self.reg["policy"].get("escalation_thresholds") or {})
                             .get("test_stuck_attempts", 3))
             if attempts >= threshold:
+                _, cooled, util, _ = self._channel_state()
                 stronger = self.router.escalate("implementer", role_choice,
-                                                ceiling=self.budget.ceiling())
+                                                ceiling=self.budget.ceiling(),
+                                                cooldowns=cooled, utilization=util)
                 if stronger is None:
                     raise Halt("needs_human",
                                "%s still failing after %d attempts and nothing stronger is "
@@ -970,7 +978,7 @@ a planner does that next, from your design.
 
     def _run_once(self, role, choice, cwd, **kw):
         """Invoke, close, and return the report. For roles that get one turn."""
-        session, report = self._invoke(role, choice, cwd, **kw)
+        session, report, _ = self._invoke(role, choice, cwd, **kw)
         self._close(session)
         return report
 
@@ -995,29 +1003,58 @@ a planner does that next, from your design.
         self._bill(res, choice)
         return res
 
+    # A quota wall is the seat's fault, not the approach's, so the hop happens
+    # here rather than in the callers: the failed invocation never returns, so
+    # no caller can bill it against an attempt budget, and every role -- not
+    # just the implementer -- gets failover for free.
     def _invoke(self, role, choice, cwd, subtask=None, extra=None,
                 session=None, failure=None):
         """Run one turn. With `session`, it continues that agent instead of
         starting a fresh one -- a retry keeps everything the agent already
         learned, which is most of the wall clock on a short task. Returns the
-        session so a caller can continue it again."""
+        session and the channel that actually ran, so a caller that later
+        escalates escalates from the right one."""
         if self.dry_run:
             self.log("  [dry-run] would run %s as %s" % (choice.model, role))
-            return None, None
-        # Reports are matched by mtime after this point: on a rework loop the
-        # previous attempt's report is still on disk, and accepting it would
-        # read a stale success as a fresh one.
-        started = time.time() - 1
-        if session is None:
-            text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
-                                   verify_cfg=self.vcfg)
-            session = self.adapter.start_agent(role, choice.agent_kind, cwd,
-                                               prompts.env_for(self.task))
-            res = self.adapter.prompt(session, text, timeout=3600)
-        else:
-            text = prompts.retry(failure)
-            res = self.adapter.follow_up(session, text, timeout=3600)
-        self._log_transcript(role, text, res)
+            return None, None, choice
+        cooled = []
+        while True:
+            # Reports are matched by mtime after this point: on a rework loop the
+            # previous attempt's report is still on disk, and accepting it would
+            # read a stale success as a fresh one.
+            started = time.time() - 1
+            if session is None:
+                text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
+                                       verify_cfg=self.vcfg)
+                session = self.adapter.start_agent(role, choice.agent_kind, cwd,
+                                                   prompts.env_for(self.task))
+                res = self.adapter.prompt(session, text, timeout=3600)
+            else:
+                text = prompts.retry(failure)
+                res = self.adapter.follow_up(session, text, timeout=3600)
+            self._log_transcript(role, text, res)
+            if res.get("failure") != "quota_exhausted":
+                break
+            at = self._cool(choice, res)
+            self._close(session)
+            cooled.append(choice.channel)
+            self.task.record_delegation({
+                "stage": self.task.state["status"], "role": role,
+                "subtask": subtask.get("id") if subtask else None,
+                "model": choice.model, "channel": choice.channel,
+                "adapter": self.adapter.name, "outcome": "quota_exhausted",
+                "reopens_at": at})
+            # Excluded explicitly as well as through the breaker: if the state
+            # file could not be written, the loop must still terminate.
+            nxt = self._pick(role, exclude=tuple(cooled))
+            self.log("failover: %s %s -> %s (quota, reopens %s)"
+                     % (role, choice.channel, nxt.channel, _stamp(at)))
+            # A fresh session on the new seat, in the *same* worktree: every
+            # checkpoint commit is still there, so the replacement continues
+            # from the last one rather than restarting the subtask (§5.5).
+            extra = self._handover(extra, failure)
+            choice, session, failure = nxt, None, None
+        self._meter(choice)
         self._bill(res, choice)
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
         report, problems = self._collect_report(role, subtask, since=started)
@@ -1039,7 +1076,19 @@ a planner does that next, from your design.
         # Returned, never stashed on self: wave threads share this object, and
         # a sibling overwriting the attribute is how an escalation gets read as
         # a success.
-        return session, report
+        return session, report, choice
+
+    def _handover(self, extra, failure):
+        """What the replacement agent is told. It inherits a worktree that
+        already holds the previous agent's checkpoints, and saying so is the
+        difference between continuing and starting over."""
+        note = ("The agent that started this ran out of its provider's quota "
+                "part-way through. Its committed work is already in this "
+                "worktree — read it first and continue from there. Do not start "
+                "over, and do not revert anything you find.")
+        if failure:
+            note += "\n\nThe checks it left failing:\n\n%s" % failure
+        return "%s\n\n%s" % (extra, note) if extra else note
 
     def _close(self, session):
         if session is not None:
@@ -1148,3 +1197,35 @@ Rules:
         if not self.gate(kind, text):
             raise Halt("needs_human", "%s declined by human" % kind)
         self.task.record_gate(kind, "approved")
+
+    def _quota_park(self, exc):
+        """Park on quota rather than on a generic 'no model available'. The
+        difference matters to the reader: nothing is wrong with the task, and
+        it will run again by itself once the window reopens."""
+        self.task.update(park={"reason": "quota_all_exhausted",
+                               "reopen_at": exc.reopen_at,
+                               "channels": exc.channels,
+                               "role": exc.role})
+        when = _stamp(exc.reopen_at)
+        tid = self.task.state["id"]
+        files = sorted({f for s in self.task.state.get("subtasks") or []
+                        for f in s.get("actual_files", [])})
+        # Deliberately unpolished: the reporter runs on the same seats that just
+        # went dark, and a second failure to render a brief helps nobody.
+        text, problems = brief.write(
+            self.task, "paused",
+            "Every provider seat enrolled for the %s step has hit its usage "
+            "limit, so this task is paused rather than failed. Nothing is wrong "
+            "with the work: %s comes back at %s. Resume then with `delegate "
+            "resume --id %s`, or leave `delegate resume --when-open --id %s` "
+            "running and it will pick itself up."
+            % (exc.role, " and ".join(exc.channels), when, tid, tid),
+            files=files,
+            extra="## Paused seats\n\n"
+                  + "\n".join("- `%s`" % c for c in exc.channels)
+                  + "\n\nOverride with `delegate channels --clear <name>` if you "
+                    "believe a seat is actually available.")
+        for p in problems:
+            self.log("  brief lint: %s" % p)
+        self.task.update(status="needs_human")
+        self.log("\n== PAUSED (quota): %s" % exc)
