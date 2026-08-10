@@ -209,9 +209,13 @@ class HerdrAdapter(LocalAdapter):
 
     name = "herdr"
 
-    def __init__(self, workspace=None):
+    def __init__(self, workspace=None, panes=True):
         self.workspace = workspace or os.environ.get("HERDR_WORKSPACE_ID")
         self.last_error = None
+        # Pane sessions are visible but report no cost: total_cost_usd only
+        # comes back from `claude -p --output-format json`. Turning panes off
+        # trades that visibility back for an enforceable spend cap.
+        self.panes = panes
 
     @staticmethod
     def available():
@@ -281,7 +285,7 @@ class HerdrAdapter(LocalAdapter):
     TEXT_REPLY_ROLES = {"classifier", "intake", "reporter"}
 
     def start_agent(self, role, kind, cwd, env):
-        if role in self.TEXT_REPLY_ROLES:
+        if not self.panes or role in self.TEXT_REPLY_ROLES:
             return LocalAdapter.start_agent(self, role, kind, cwd, env)
         pane = self._cli(["pane", "split", "--current", "--direction", "right",
                           "--cwd", cwd, "--no-focus"], check=False)
@@ -396,6 +400,8 @@ def get(name, **kw):
         if not HerdrAdapter.available():
             return LocalAdapter()
         return HerdrAdapter(**kw)
+    if name == "herdr-quiet":                     # herdr worktrees, no panes
+        return HerdrAdapter(panes=False) if HerdrAdapter.available() else LocalAdapter()
     if name == "local":
         return LocalAdapter()
     if name == "mock":

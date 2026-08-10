@@ -112,13 +112,24 @@ def cmd_run(args):
         task.update(review=args.review)
     print("task %s -> %s" % (task_id, task.path))
 
-    adapter = runtime.get(args.adapter or _default_adapter(reg))
+    adapter = _make_adapter(args, reg)
     from .machine import Orchestrator
     gate = _auto_approve if args.yes else _confirm
     orch = Orchestrator(task, reg, adapter, gate, dry_run=args.dry_run)
     status = orch.run()
     print("\nfinal status: %s" % status)
     sys.exit(0 if status == "done" else 1)
+
+
+def _make_adapter(args, reg):
+    name = args.adapter or _default_adapter(reg)
+    if name == "herdr" and getattr(args, "no_panes", False):
+        name = "herdr-quiet"
+    adapter = runtime.get(name)
+    if getattr(adapter, "panes", False):
+        print("note: agents run in herdr panes, which report no cost — "
+              "max_cost_usd cannot bind. Use --no-panes if you need the cap.")
+    return adapter
 
 
 def _default_adapter(reg):
@@ -143,7 +154,7 @@ def cmd_resume(args):
         task.update(status="implement")
     print("resuming %s from %s%s" % (task.state["id"], task.state["status"],
                                      "" if task.state["status"] == was else " (was %s)" % was))
-    adapter = runtime.get(args.adapter or _default_adapter(reg))
+    adapter = _make_adapter(args, reg)
     from .machine import Orchestrator
     gate = _auto_approve if args.yes else _confirm
     status = Orchestrator(task, reg, adapter, gate, dry_run=args.dry_run).run()
@@ -191,6 +202,10 @@ def main(argv=None):
     r.add_argument("--id", help="task id (default: next T-nnn)")
     r.add_argument("--mode", choices=["attended", "autonomous"], default="attended")
     r.add_argument("--adapter", choices=["herdr", "local", "mock"])
+    r.add_argument("--no-panes", action="store_true",
+                   help="run agents as subprocesses even under herdr: you lose the "
+                        "visible panes and get cost accounting back, so max_cost_usd "
+                        "can actually bind")
     r.add_argument("--max-cost", type=float, help="lower the cost cap for this task")
     r.add_argument("--dry-run", action="store_true", help="drive the machine without agents")
     r.add_argument("--review", choices=["auto", "always", "never"], default="auto",
@@ -204,6 +219,7 @@ def main(argv=None):
     rs.add_argument("--id")
     rs.add_argument("--stage", help="stage to resume at")
     rs.add_argument("--adapter", choices=["herdr", "local", "mock"])
+    rs.add_argument("--no-panes", action="store_true")
     rs.add_argument("--dry-run", action="store_true")
     rs.add_argument("--yes", action="store_true")
     rs.set_defaults(func=cmd_resume)

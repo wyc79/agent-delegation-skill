@@ -712,6 +712,19 @@ class TestRuntimeSurfaces(unittest.TestCase):
         r = h.prompt(sess, "hi", timeout=10)
         self.assertIn("agent_prompt_stalled", r["output"])
 
+    def test_no_panes_restores_cost_accounting(self):
+        # Panes are visible but report no cost, so the spend cap cannot bind.
+        # The choice has to stay available, not be decided for the user.
+        class H(runtime.HerdrAdapter):
+            def _cli(self, args, check=True):
+                raise AssertionError("panes are off; nothing should be split")
+        h = H(workspace="w1", panes=False)
+        s = h.start_agent("implementer", "claude", "/tmp",
+                          {"AGENT_DELEGATION_TASK_DIR": "/x/T-1"})
+        self.assertFalse((s.handle or {}).get("herdr"))
+        self.assertIn("--output-format", " ".join(s.handle["argv"]),
+                      "the subprocess path is what reports total_cost_usd")
+
     def test_herdr_availability_needs_both_env_and_binary(self):
         prev = os.environ.get("HERDR_ENV")
         os.environ.pop("HERDR_ENV", None)

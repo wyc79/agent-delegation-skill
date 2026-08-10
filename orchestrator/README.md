@@ -25,7 +25,9 @@ orchestrator/delegate resume --id T-001         # continue a parked task
 ```
 
 Useful flags: `--dry-run` drives the state machine with no agents, `--adapter
-local|herdr|mock` overrides runtime selection, `--max-cost 5` lowers (never
+local|herdr|mock` overrides runtime selection, `--no-panes` trades herdr's
+visible agent panes back for cost accounting (pane sessions report no cost, so
+`max_cost_usd` cannot bind while they are on), `--max-cost 5` lowers (never
 raises) the cost cap, `--yes` auto-approves gates for unattended runs — merge
 still never happens automatically.
 
