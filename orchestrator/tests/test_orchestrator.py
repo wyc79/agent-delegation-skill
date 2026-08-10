@@ -388,6 +388,117 @@ class TestChannelAvailability(unittest.TestCase):
         self.assertIn("needs", str(cm.exception), "error should name the missing CLI")
 
 
+class TestClosedGaps(unittest.TestCase):
+    """Each of these covers a limit or role that was declared but inert."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        self.t.close()
+
+    # --- cost ------------------------------------------------------------
+    def test_cli_cost_is_recorded_so_the_cap_can_bind(self):
+        from adg import runtime as rt
+        res = rt._result(json.dumps({"result": "done", "total_cost_usd": 0.42}), "", 0)
+        self.assertEqual(res["cost_usd"], 0.42)
+        self.assertEqual(res["output"], "done")
+
+    def test_missing_cost_is_unknown_not_zero(self):
+        from adg import runtime as rt
+        self.assertIsNone(rt._result("plain text", "", 0)["cost_usd"])
+
+    def test_spend_accumulates_and_then_parks_the_run(self):
+        task = store.Task.create(self.t.repo, "T-C1", "# t\n", dict(self.pol, max_cost_usd=0.5))
+
+        class Pricey(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                r = runtime.MockAdapter.prompt(self, session, text, timeout)
+                r["cost_usd"] = 0.6
+                if session.handle["role"] == "classifier":
+                    r["output"] = "VERDICT: SIMPLE -- tiny"
+                return r
+
+        script = {"implementer": lambda env, cwd: None}
+        status = Orchestrator(task, self.reg, Pricey(script), lambda k, t: True,
+                              log=lambda *_: None).run()
+        self.assertEqual(status, "needs_human", "an exhausted budget kept running")
+        self.assertGreater(task.state["spent"]["usd"], 0.0, "cost was never recorded")
+
+    # --- autonomous mode --------------------------------------------------
+    def test_autonomous_mode_pushes_and_never_merges(self):
+        src = os.path.join(self.t.dir, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", src], check=True)
+        sh(["git", "remote", "add", "origin", src], self.t.repo)
+        script, _ = TestEndToEnd._script(self)[0], None
+        task = store.Task.create(self.t.repo, "T-C2", "# t\n\nAdd subtract\n",
+                                 self.pol, mode="autonomous")
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                            lambda k, t: True, log=lambda *_: None)
+        orch.run()
+        branches = subprocess.run(["git", "branch", "-a"], cwd=src,
+                                  capture_output=True, text=True).stdout
+        self.assertIn("adg/T-C2/work", branches, "autonomous mode did not push")
+        head = subprocess.run(["git", "log", "--oneline", "main"], cwd=self.t.repo,
+                              capture_output=True, text=True).stdout
+        self.assertEqual(len(head.strip().splitlines()), 1, "it merged to main")
+
+    # --- test author ------------------------------------------------------
+    def test_simple_tasks_do_not_pay_for_a_test_author(self):
+        task = store.Task.create(self.t.repo, "T-C3", "# t\n\nAdd subtract\n", self.pol)
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "classifier":
+                    return {"settled": "idle", "output": "VERDICT: SIMPLE -- tiny", "code": 0}
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        a = A({"implementer": lambda env, cwd: None})
+        Orchestrator(task, self.reg, a, lambda k, t: True, log=lambda *_: None).run()
+        self.assertNotIn("test-author", [h["role"] for h in task.state["delegation_history"]])
+
+    def test_test_author_is_told_not_to_read_the_implementation(self):
+        seen = {}
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "test-author":
+                    seen["prompt"] = text
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        script, _ = self._e2e_script()
+        task = store.Task.create(self.t.repo, "T-C4", "# t\n\nAdd subtract API\n", self.pol)
+        Orchestrator(task, self.reg, A(script), lambda k, t: True, log=lambda *_: None).run()
+        self.assertIn("do not read any implementation", seen.get("prompt", "").lower())
+
+    def _e2e_script(self):
+        return TestEndToEnd._script(self)
+
+    # --- reporter ---------------------------------------------------------
+    def test_polished_brief_replaces_the_template(self):
+        task = store.Task.create(self.t.repo, "T-C5", "# t\n", self.pol)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        orch._polish = lambda t: "# Plain\n\n" + ("A readable sentence. " * 8)
+        text, problems = brief.write(task, "merge", "Land it?", polish=orch._polish)
+        self.assertIn("A readable sentence", text)
+        self.assertEqual(problems, [])
+
+    def test_jargon_or_empty_rewrite_falls_back_to_the_template(self):
+        task = store.Task.create(self.t.repo, "T-C6", "# t\n", self.pol)
+
+        class A(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                return {"settled": "idle", "output": "AC-2 failed at rung 2", "code": 0}
+
+        orch = Orchestrator(task, self.reg, A(), lambda k, t: True, log=lambda *_: None)
+        original = "# Brief\n\nsomething the human can act on, at length. " * 3
+        self.assertEqual(orch._polish(original), original)
+
+
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
     nothing looks exactly like a clean scan."""
@@ -509,7 +620,7 @@ class TestEndToEnd(unittest.TestCase):
         state = task.state
         # every role actually ran, in order
         roles = [h["role"] for h in state["delegation_history"]]
-        self.assertEqual(roles, ["planner", "implementer", "reviewer"])
+        self.assertEqual(roles, ["planner", "test-author", "implementer", "reviewer"])
         # the plan produced a real subtask, completed, with files from git
         self.assertEqual(state["subtasks"][0]["status"], "complete")
         self.assertEqual(state["subtasks"][0]["actual_files"], ["app.py"])

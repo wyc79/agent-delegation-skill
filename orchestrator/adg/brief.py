@@ -104,10 +104,13 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
     return "\n".join(md)
 
 
-def write(task, kind, decision_text, **kw):
-    """Render, lint, and persist. A brief that fails the lint is still written
-    (the human still needs it) but the problems are surfaced, not swallowed."""
+def write(task, kind, decision_text, polish=None, **kw):
+    """Render, optionally rewrite in plain language, lint, and persist. A brief
+    that fails the lint is still written -- the human still needs it -- but the
+    problems are surfaced rather than swallowed."""
     text = render(task, kind, decision_text, **kw)
+    if polish:
+        text = polish(text)
     problems = lint(text)
     task.write_text("brief.md", text)
     return text, problems

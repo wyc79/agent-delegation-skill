@@ -11,6 +11,7 @@ Author are deliberately deferred (§15).
 
 import os
 import re
+import subprocess
 import time
 
 from . import brief, companions, limits as lim, prompts, router as routing, schema, verify, winnow, yamlite
@@ -155,6 +156,8 @@ class Orchestrator:
             res = self.adapter.prompt(session, prompt, timeout=180)
         finally:
             self.adapter.teardown(session)
+        if res.get("cost_usd"):
+            self.budget.spend(res["cost_usd"])
         out = (res.get("output") or "")
         m = re.search(r"VERDICT:\s*(SIMPLE|COMPLEX)\s*-*\s*(.*)", out, re.I)
         if not m:
@@ -192,10 +195,37 @@ class Orchestrator:
             raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
         self.task.update(subtasks=[dict(s, status="pending", actual_files=[]) for s in subtasks])
         self.log("plan: %d subtask(s)" % len(subtasks))
+        self._author_tests(subtasks)
         if self.budget.requires_approval("plan"):
             self._gate("plan", "Approve this plan? It splits the work into %d step(s)."
                        % len(subtasks))
         self.task.update(status="implement")
+
+    def _author_tests(self, subtasks):
+        """Write tests from the requirements, before any implementation exists.
+        An implementer's own tests confirm what it built; these confirm what was
+        asked, which is the only way a missing requirement shows up (D7)."""
+        if (self.vcfg.get("test_author") or "auto") == "never":
+            return
+        try:
+            choice = self._pick("test-author")
+        except routing.NoModelAvailable as e:
+            self.log("tests: skipped — %s" % e)
+            return
+        base = self._ensure_worktree()
+        self.log("tests: %s via %s" % (choice.model, choice.channel))
+        self._close(self._invoke(
+            "test-author", choice, cwd=base,
+            extra="Write failing tests for the acceptance criteria in task.md now. "
+                  "Do not implement the feature and do not read any implementation. "
+                  "Run them and capture the failure output as evidence."))
+        # Red is the expected state here, so a failing run is not a problem --
+        # but a *passing* one means the tests do not test the new requirement.
+        result = verify.run(self.task, self.repo, base, "fast")
+        if result.ok and result.steps:
+            self.log("  warning: new tests pass before implementation — "
+                     "they may not test the requirement")
+        self._checkpoint(base, "adg %s: tests from requirements" % self.task.state["id"])
 
     def _read_plan_subtasks(self):
         """Parse the fenced YAML block the planner wrote. A plan we cannot
@@ -473,7 +503,8 @@ class Orchestrator:
             self.task, "merge",
             "Land this change? It is complete and its checks pass. In attended mode "
             "the diff is applied to your working tree, uncommitted, for you to commit.",
-            files=files, verify=result, extra="## Review\n\n" + note)
+            files=files, verify=result, extra="## Review\n\n" + note,
+            polish=self._polish)
         for p in problems:
             self.log("  brief lint: %s" % p)
         if self.budget.requires_approval("merge"):
@@ -503,7 +534,39 @@ class Orchestrator:
             self.log("integrate: patch ready at %s" % patch)
             self.log("           apply with: git apply %s" % patch)
         else:
-            self.log("integrate: branch %s is ready to push and open a PR" % branch)
+            self._push_and_open_pr(branch)
+
+    def _push_and_open_pr(self, branch):
+        """Autonomous mode ends at an opened PR. There is deliberately no merge
+        path here (§9.2) -- the credential may even be branch-restricted."""
+        import shutil as _shutil
+        push = subprocess.run(["git", "push", "-u", "origin", branch],
+                              cwd=self.repo, capture_output=True, text=True)
+        if push.returncode != 0:
+            raise Halt("needs_human", "could not push %s: %s"
+                       % (branch, push.stderr.strip()[:200]))
+        self.log("integrate: pushed %s" % branch)
+        if _shutil.which("gh") is None:
+            self.log("           gh not installed — open the PR yourself")
+            return
+        body = self.task.read_text("brief.md", "")
+        pr = subprocess.run(
+            ["gh", "pr", "create", "--head", branch, "--title",
+             "%s: %s" % (self.task.state["id"], self._title()), "--body", body],
+            cwd=self.repo, capture_output=True, text=True)
+        if pr.returncode != 0:
+            self.log("           gh pr create failed: %s" % pr.stderr.strip()[:200])
+            return
+        url = (pr.stdout or "").strip().splitlines()[-1:] or [""]
+        self.log("integrate: opened %s" % url[0])
+        self.task.update(pull_request=url[0])
+
+    def _title(self):
+        for line in self.task.read_text("task.md", "").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and not line.startswith(">"):
+                return line[:70]
+        return "delegated change"
 
     # ---------------------------------------------------------------- infra
     def _pick(self, role, boost=None):
@@ -556,6 +619,8 @@ class Orchestrator:
             text = prompts.retry(failure)
             res = self.adapter.follow_up(session, text, timeout=3600)
         self._log_transcript(role, text, res)
+        if res.get("cost_usd"):
+            self.budget.spend(res["cost_usd"])
         outcome = "complete" if res.get("settled") == "idle" else "blocked"
         report, problems = self._collect_report(role, subtask, since=started)
         if report is None:
@@ -565,6 +630,7 @@ class Orchestrator:
             "subtask": subtask.get("id") if subtask else None,
             "model": choice.model, "channel": choice.channel,
             "adapter": self.adapter.name, "outcome": outcome,
+            "usd": res.get("cost_usd"),
             "report_problems": problems or None,
         })
         if outcome == "blocked" and res.get("settled") == "timeout":
@@ -612,9 +678,49 @@ class Orchestrator:
             return data, None
         return None, ["no fresh report written by %s" % role]
 
+    REPORT_PROMPT = """Rewrite the notes below as a short update for a competent
+programmer who has never seen this repository. Keep the markdown headings.
+
+Rules:
+- Lead with the decision they must make. Do not bury it.
+- Expand every internal id the first time you use it: write "the requirement
+  that old saves still load (AC-2)", never a bare "AC-2". Never use the words
+  rung, REPLAN, REQUEST_CHANGES, test_stuck or scope_overrun.
+- Say what each changed file is for. They do not know this codebase.
+- State plainly anything that was NOT verified.
+- No praise, no filler, no restating the task twice.
+
+--- NOTES ---
+%s
+"""
+
+    def _polish(self, text):
+        """Render the mechanical brief into plain language. Cheap, and the only
+        part of the run a human actually reads -- but a failed or jargon-laden
+        rewrite falls back to the template rather than replacing it."""
+        if self.dry_run:
+            return text
+        try:
+            choice = self._pick("reporter")
+        except routing.NoModelAvailable:
+            return text
+        session = self.adapter.start_agent("reporter", choice.agent_kind, self.repo,
+                                           prompts.env_for(self.task))
+        try:
+            res = self.adapter.prompt(session, self.REPORT_PROMPT % text, timeout=180)
+        finally:
+            self._close(session)
+        if res.get("cost_usd"):
+            self.budget.spend(res["cost_usd"])
+        out = (res.get("output") or "").strip()
+        if len(out) < 80 or brief.lint(out):
+            return text
+        return out
+
     def _gate(self, kind, question):
         files = sorted({f for s in self.task.state["subtasks"] for f in s.get("actual_files", [])})
-        text, problems = brief.write(self.task, kind, question, files=files)
+        text, problems = brief.write(self.task, kind, question, files=files,
+                                     polish=self._polish)
         for p in problems:
             self.log("  brief lint: %s" % p)
         if not self.gate(kind, text):
