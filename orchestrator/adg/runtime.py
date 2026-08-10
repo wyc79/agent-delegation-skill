@@ -88,10 +88,20 @@ class LocalAdapter(Adapter):
         return argv
 
     def create_worktree(self, repo, branch, base, path):
-        if os.path.exists(path):
-            raise RuntimeError_("worktree path already exists: %s" % path)
+        """Idempotent. A leftover branch or checkout from an interrupted run is
+        normal -- resuming must reattach to it, not refuse to start."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        git(["worktree", "add", "-b", branch, path, base], repo)
+        if os.path.isdir(os.path.join(path, ".git")) or os.path.isfile(os.path.join(path, ".git")):
+            return path
+        if os.path.exists(path) and os.listdir(path):
+            raise RuntimeError_("worktree path exists and is not a worktree: %s" % path)
+        git(["worktree", "prune"], repo, check=False)
+        exists = git(["rev-parse", "--verify", "--quiet", "refs/heads/" + branch],
+                     repo, check=False)
+        if exists:
+            git(["worktree", "add", path, branch], repo)
+        else:
+            git(["worktree", "add", "-b", branch, path, base], repo)
         return path
 
     def remove_worktree(self, repo, path):
@@ -188,9 +198,7 @@ class MockAdapter(Adapter):
         self.calls = []
 
     def create_worktree(self, repo, branch, base, path):
-        os.makedirs(path, exist_ok=True)
-        git(["worktree", "add", "-b", branch, path, base], repo)
-        return path
+        return LocalAdapter.create_worktree(self, repo, branch, base, path)
 
     def remove_worktree(self, repo, path):
         return LocalAdapter.remove_worktree(self, repo, path)

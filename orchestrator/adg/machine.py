@@ -66,6 +66,19 @@ class Orchestrator:
             self.task.update(status="needs_human")
             self.log("\n== LIMIT (%s): %s" % (b.limit, b))
             return "needs_human"
+        except KeyboardInterrupt:
+            self.log("\n== interrupted; task is resumable with `delegate resume`")
+            raise
+        except Exception as e:  # noqa: BLE001 -- see below
+            # An unexpected failure must park the task, not crash the process:
+            # all progress so far is on disk and resumable, and a traceback on
+            # stderr is not a state the user can act on (§12).
+            import traceback
+            self.task.write_text("crash.log", traceback.format_exc())
+            self.task.update(status="needs_human")
+            self.log("\n== CRASHED: %s: %s" % (type(e).__name__, e))
+            self.log("   details in %s" % self.task.file("crash.log"))
+            return "needs_human"
 
     # --------------------------------------------------------------- stages
     def _stage_intake(self):
@@ -142,6 +155,16 @@ class Orchestrator:
 
     def _stage_implement(self):
         state = self.task.state
+        if not state.get("subtasks"):
+            # Resuming into implement with a plan already on disk: re-read it
+            # rather than re-running (and re-paying for) the planner.
+            recovered = self._read_plan_subtasks()
+            if recovered:
+                state = self.task.update(
+                    subtasks=[dict(x, status="pending", actual_files=[]) for x in recovered])
+                self.log("implement: recovered %d subtask(s) from plan.md" % len(recovered))
+            else:
+                raise Halt("needs_human", "no subtasks and no parseable plan.md")
         pending = [s for s in state["subtasks"] if s.get("status") != "complete"]
         if not pending:
             self.task.update(status="review")

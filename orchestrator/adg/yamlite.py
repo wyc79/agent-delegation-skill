@@ -98,6 +98,30 @@ def _value(text):
     return _scalar(t)
 
 
+def _key_colon(text):
+    """Index of the colon separating a key from its value, or -1 if the line
+    is a plain scalar. Quotes and brackets are skipped: a naive partition(":")
+    splits `- "def f(a, b)  # see calc.py; note"` in the middle of a string and
+    then fails on the unterminated quote."""
+    depth, quote = 0, None
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        elif ch == ":" and depth == 0:
+            # A key colon is followed by whitespace or ends the line;
+            # "a:b" inside a URL or time is part of the scalar.
+            if i + 1 >= len(text) or text[i + 1] in " \t":
+                return i
+    return -1
+
+
 def _strip_comment(line):
     out, quote = [], None
     for i, ch in enumerate(line):
@@ -138,15 +162,23 @@ class _Lines:
         return item
 
 
-def _folded(lines, parent_indent):
-    """Collect a `>` folded scalar: deeper-indented lines joined by spaces."""
+# Block scalar indicators, with optional chomping (- strip, + keep) and an
+# explicit indent digit. Models emit `>-` and `|` freely, so all of these have
+# to work or a perfectly good plan fails to parse.
+_BLOCK = re.compile(r"^([>|])([+-]?)(\d?)$")
+
+
+def _block_scalar(lines, parent_indent, style):
+    """Collect a block scalar: folded (`>`) joins lines with spaces, literal
+    (`|`) keeps newlines. Chomping only affects trailing blank lines, which
+    this reader has already dropped, so it needs no special handling."""
     parts = []
     while True:
         nxt = lines.peek()
         if nxt is None or nxt[0] <= parent_indent:
             break
         parts.append(lines.next()[1])
-    return " ".join(parts)
+    return ("\n" if style == "|" else " ").join(parts)
 
 
 def _parse_block(lines, indent):
@@ -168,8 +200,9 @@ def _parse_list(lines, indent):
         if not body:
             out.append(_parse_block(lines, cur_indent + 1))
             continue
-        key, sep, rest = body.partition(":")
-        if sep and not key.strip().startswith(("[", "{")):
+        ci = _key_colon(body)
+        key, rest = (body[:ci], body[ci + 1:]) if ci >= 0 else ("", "")
+        if ci >= 0 and not key.strip().startswith(("[", "{", '"', "'")):
             # "- key: value" starts a map whose remaining keys are indented to
             # the column where `key` began.
             item = {str(_scalar(key)): _inline_or_block(lines, rest, cur_indent + 2)}
@@ -181,8 +214,9 @@ def _parse_list(lines, indent):
 
 
 def _inline_or_block(lines, rest, child_indent):
-    if rest.strip() == ">":
-        return _folded(lines, child_indent - 1)
+    marker = _BLOCK.match(rest.strip())
+    if marker:
+        return _block_scalar(lines, child_indent - 1, marker.group(1))
     if rest.strip():
         return _value(rest)
     nxt = lines.peek()
@@ -202,9 +236,10 @@ def _parse_map(lines, indent, initial=False):
                 break
             raise YamlError("line %d: list item where a mapping key was expected" % nxt[2])
         cur_indent, text, lineno = lines.next()
-        key, sep, rest = text.partition(":")
-        if not sep:
+        ci = _key_colon(text)
+        if ci < 0:
             raise YamlError("line %d: expected 'key: value', got %r" % (lineno, text))
+        key, rest = text[:ci], text[ci + 1:]
         out[str(_scalar(key))] = _inline_or_block(lines, rest, cur_indent + 1)
     return out
 

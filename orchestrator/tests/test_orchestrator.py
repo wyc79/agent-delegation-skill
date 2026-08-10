@@ -77,6 +77,50 @@ class TestYamlite(unittest.TestCase):
         self.assertEqual(data[0]["file_scope"], ["src/**"])
         self.assertEqual(data[0]["capability_hint"], {"coding": "high"})
 
+    def test_block_scalars_in_every_chomping_form(self):
+        # A live planner emitted `test_notes: >-` and the whole plan failed to
+        # parse. All block-scalar forms must work.
+        for style in (">", ">-", ">+", "|", "|-", "|+"):
+            d = yamlite.load("a: %s\n  one line\n  two line\nb: 2\n" % style)
+            joiner = "\n" if style.startswith("|") else " "
+            self.assertEqual(d["a"], "one line%stwo line" % joiner, style)
+            self.assertEqual(d["b"], 2, style)
+
+    def test_parses_a_realistic_planner_subtask_block(self):
+        block = (
+            '- id: st-1-subtract\n'
+            '  goal: Add subtract(a, b) to calc.py\n'
+            '  file_scope: ["calc.py", "test_calc.py"]\n'
+            '  frozen_interfaces:\n'
+            '    - "def subtract(a, b) -> a - b  # minuend first"\n'
+            '  capability_hint: {reasoning: low, coding: low}\n'
+            '  acceptance: [AC-1, AC-2]\n'
+            '  test_notes: >-\n'
+            '    Pure stdlib arithmetic. Verify with unittest discover;\n'
+            '    pytest is not installed here.\n')
+        data = yamlite.load(block)
+        self.assertEqual(data[0]["id"], "st-1-subtract")
+        self.assertEqual(data[0]["file_scope"], ["calc.py", "test_calc.py"])
+        self.assertIn("pytest is not installed", data[0]["test_notes"])
+        self.assertEqual(data[0]["acceptance"], ["AC-1", "AC-2"])
+
+    def test_quoted_list_item_containing_a_colon(self):
+        # A live planner wrote frozen_interfaces entries with prose containing
+        # "calc.py; importable as ..." -- a naive colon split broke the quote.
+        data = yamlite.load(
+            '- id: st-1\n'
+            '  frozen_interfaces:\n'
+            '    - "def subtract(a, b) -> a - b  # module-level in calc.py; minuend first"\n'
+            '  estimated_loc: 10\n')
+        self.assertEqual(data[0]["id"], "st-1")
+        self.assertIn("minuend first", data[0]["frozen_interfaces"][0])
+        self.assertEqual(data[0]["estimated_loc"], 10)
+
+    def test_colon_without_space_stays_in_the_scalar(self):
+        d = yamlite.load("url: https://example.com/x\ntime: 10:30 sharp\n")
+        self.assertEqual(d["url"], "https://example.com/x")
+        self.assertEqual(d["time"], "10:30 sharp")
+
     def test_refuses_garbage_rather_than_guessing(self):
         with self.assertRaises(yamlite.YamlError):
             yamlite.load("just a bare line\n")
