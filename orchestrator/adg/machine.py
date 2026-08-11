@@ -13,6 +13,7 @@ escalates by raising a capability floor, which has no same-tier expression.
 import os
 import re
 import subprocess
+import threading
 import time
 
 from . import (brief, cooldown, limits as lim, prompts, quota,
@@ -117,12 +118,42 @@ class Orchestrator:
         # The agent session currently in flight, so a failure between starting
         # one and handing it back can still tear it down. See `_invoke`.
         self._session = None
+        # And every session alive right now, across threads. `_session` is a
+        # single slot and a wave runs several agents at once, so it cannot be
+        # the accounting -- this can. `run()` empties it on the way out
+        # whatever happened, which is what makes a SIGTERM or an unhandled
+        # crash mid-wave leave no process behind.
+        self._live = set()
+        self._live_lock = threading.Lock()
         self.budget = lim.Budget(task)
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
 
     # ------------------------------------------------------------------ run
     def run(self):
+        try:
+            return self._run()
+        finally:
+            # The backstop. Every ordinary path already tears its own session
+            # down; this catches the ones that are not ordinary -- a SIGTERM
+            # turned into KeyboardInterrupt by the CLI, a crash inside the wave
+            # loop, a bug in a `finally` above. Agents are subprocesses that
+            # keep costing money after the run that started them has stopped,
+            # so the accounting must not depend on every path remembering.
+            with self._live_lock:
+                stranded = list(self._live)
+                self._live.clear()
+            for session in stranded:
+                try:
+                    self.adapter.teardown(session)
+                except Exception as e:          # noqa: BLE001 -- best effort
+                    self.log("  warning: could not tear down %s: %s"
+                             % (getattr(session, "name", session), e))
+            if stranded:
+                self.log("  closed %d agent session(s) still running at exit"
+                         % len(stranded))
+
+    def _run(self):
         try:
             while True:
                 status = self.task.state["status"]
@@ -1458,6 +1489,8 @@ admits only one sensible reading.
                                        verify_cfg=self.vcfg)
                 session = self._session = self.adapter.start_agent(
                     role, choice.agent_kind, cwd, prompts.env_for(self.task, role))
+                with self._live_lock:
+                    self._live.add(session)
                 res = self.adapter.prompt(session, text, timeout=3600)
             else:
                 text = prompts.retry(failure)
@@ -1610,6 +1643,8 @@ admits only one sensible reading.
 
     def _close(self, session):
         if session is not None:
+            with self._live_lock:
+                self._live.discard(session)
             try:
                 self.adapter.teardown(session)
             except Exception as e:

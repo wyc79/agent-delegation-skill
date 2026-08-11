@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import signal
 import sys
 import time
 
@@ -453,7 +454,26 @@ def cmd_show(args):
     print(json.dumps(task.state, indent=2))
 
 
+def _die_like_ctrl_c(signum, frame):
+    """Turn a SIGTERM into the interrupt the machine already handles.
+
+    `run()` drains every live agent session in a `finally`, and a `finally` runs
+    for KeyboardInterrupt but not for a signal Python installs no handler for --
+    the default SIGTERM disposition kills the interpreter outright and leaves
+    the agent subprocesses to be reparented. Raising here means `kill <pid>` and
+    Ctrl-C take the same path: sessions torn down, task left resumable.
+    """
+    raise KeyboardInterrupt("terminated (signal %s)" % signum)
+
+
 def main(argv=None):
+    try:
+        signal.signal(signal.SIGTERM, _die_like_ctrl_c)
+    except (ValueError, OSError, AttributeError):
+        # Not the main thread, or a platform without SIGTERM. The drain in
+        # `run()` still covers every in-process path; only the signal shortcut
+        # is unavailable, and refusing to start over it would be absurd.
+        pass
     p = argparse.ArgumentParser("delegate", description="Multi-agent task delegation.")
     p.add_argument("--repo", default=".", help="repository (default: cwd)")
     p.add_argument("--registry", default=None, help="path to registry.default.yaml")
