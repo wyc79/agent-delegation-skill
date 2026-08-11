@@ -152,7 +152,7 @@ class TestStore(unittest.TestCase):
         # property true of every directory. It would have passed with atomic
         # writes removed.
         task = store.Task.create(self.t.repo, "T-001", "# t\n", {"max_cost_usd": 1})
-        task.update(status="planning")
+        before = task.update(status="planning")
         boom = RuntimeError("killed mid-write")
 
         def explode(state):
@@ -163,7 +163,10 @@ class TestStore(unittest.TestCase):
             task.mutate(explode)
         reread = store.Task(task.path).state
         self.assertEqual(reread["status"], "planning", "a partial write was visible")
-        self.assertEqual(len(json.dumps(reread)) > 0, True)
+        # Not `len(json.dumps(reread)) > 0`, which is true of every dict ever
+        # written: the property is that the whole previous state survived, not
+        # that something did.
+        self.assertEqual(reread, before, "the failed write cost part of the state")
 
 
 class TestLimits(unittest.TestCase):
@@ -621,6 +624,30 @@ class TestClosedGaps(unittest.TestCase):
         self.assertIn("A readable sentence", text)
         self.assertEqual(problems, [])
 
+    def test_deviations_written_from_the_shipped_template_reach_the_brief(self):
+        """The gate brief must say when the plan was departed from.
+
+        The section was guarded on the whole file not starting with `#`, and
+        `templates/deviations.md` -- the file agents are told to start from --
+        opens with `# Deviations — Task <id>`. Every task that used the template
+        therefore hid every deviation from every brief, which is the one line in
+        it a human reads to decide whether to look closer.
+        """
+        task = store.Task.create(self.t.repo, "T-C7", "# t\n", self.pol)
+        with open(os.path.join(wf.default_dir(), "templates", "deviations.md")) as fh:
+            template = fh.read()
+        self.assertTrue(template.lstrip().startswith("#"),
+                        "the template no longer opens with a heading")
+        task.write_text("deviations.md", template)
+        self.assertNotIn("What didn't go to plan", brief.render(task, "merge", "Land it?"),
+                         "an untouched template claimed the plan was departed from")
+
+        task.write_text("deviations.md", template + "\ndev-st-1-1 | implementer:st-1 | "
+                        "plan said add to calc.py\n        | did instead: added a module\n"
+                        "        | why: calc.py is generated\n        | severity: major\n")
+        self.assertIn("What didn't go to plan", brief.render(task, "merge", "Land it?"),
+                      "a logged deviation never reached the human")
+
     def test_jargon_or_empty_rewrite_falls_back_to_the_template(self):
         task = store.Task.create(self.t.repo, "T-C6", "# t\n", self.pol)
 
@@ -699,6 +726,30 @@ class TestParallelism(unittest.TestCase):
             {"id": "st-2", "status": "pending"},
         ])
         self.assertEqual(len(orch._wave(orch.task.state["subtasks"])), 1)
+
+    def test_a_plan_whose_dependencies_can_never_be_met_parks_and_says_why(self):
+        """The planner writes `depends_on`, so a dependency on an id it never
+        defined -- or a cycle -- is an ordinary bad plan, not a bug in here.
+
+        Nothing is ready, so the wave is empty, and indexing it crashed the run:
+        the user got `IndexError: list index out of range` in crash.log for a
+        one-line typo in plan.md, with nothing naming the subtask or the
+        dependency.
+        """
+        orch, task = self._orch([
+            {"id": "st-1", "status": "pending", "planned_scope": ["a/**"],
+             "depends_on": ["st-typo"]},
+            {"id": "st-2", "status": "pending", "planned_scope": ["b/**"],
+             "depends_on": ["st-1"]},
+        ])
+        self.assertEqual(orch._wave(task.state["subtasks"]), [])
+        with self.assertRaises(Halt) as cm:
+            orch._stage_implement()
+        self.assertEqual(cm.exception.status, "needs_human")
+        said = str(cm.exception)
+        self.assertIn("st-1 waits on st-typo (no such subtask)", said)
+        self.assertIn("st-2 waits on st-1", said)
+        self.assertIn("plan.md", said, "it does not say where to fix it")
 
 
 class TestParallelEndToEnd(unittest.TestCase):
@@ -1389,9 +1440,16 @@ class TestRuntimeSurfaces(unittest.TestCase):
                 os.environ["HERDR_ENV"] = prev
 
     def test_case_insensitive_filesystems_treat_one_file_as_one_file(self):
-        # The Windows/macOS rule, asserted directly rather than by platform.
-        self.assertTrue(verify.scopes_overlap(["src/Foo.cs"], ["src/foo.cs"])
-                        or sys.platform.startswith("linux"))
+        # `... or sys.platform.startswith("linux")` stood here, which is not an
+        # assertion on Linux at all: `scopes_overlap` could return False
+        # unconditionally and pass. Two functions decide the same case rule from
+        # the same platform predicate, and what must hold on EVERY platform is
+        # that they agree: `_wave` asks scopes_overlap whether two agents may
+        # run at once, and scope_violations rules afterwards on whether a file
+        # was theirs. Disagree, and one file was handed to two agents.
+        one_file = not verify.scope_violations(["src/Foo.cs"], ["src/foo.cs"])
+        self.assertEqual(verify.scopes_overlap(["src/Foo.cs"], ["src/foo.cs"]), one_file,
+                         "the two case rules have drifted apart on this platform")
         self.assertEqual(
             verify.scope_violations(["src/Foo.cs"], ["src/foo.cs"], case_insensitive=True), [])
         self.assertEqual(
@@ -2619,7 +2677,12 @@ class TestEndToEnd(unittest.TestCase):
         status, task, adapter, logs = self._run_simple(script)
         self.assertEqual(status, "done", "\n".join(logs))
         self.assertFalse(task.state["review_outcome"]["reviewed"])
-        self.assertNotIn("reviewer", [c[1] for c in adapter.calls if c[0] != "notify"])
+        # `c[0]`, the role. `c[1]` is the whole prompt body for a prompt() call
+        # (MockAdapter.calls holds (role, text)), so the old form asked whether
+        # any element of a list of multi-KB prompts was exactly "reviewer" --
+        # which nothing can be. Dispatching a reviewer on every simple task
+        # passed it.
+        self.assertNotIn("reviewer", [c[0] for c in adapter.calls])
         self.assertIn("checks green", task.state["review_outcome"]["why"])
 
     def test_brief_says_plainly_that_no_review_ran(self):
@@ -3090,6 +3153,57 @@ stages:
     def test_a_manifest_with_no_stages_is_refused(self):
         with self.assertRaises(wf.WorkflowError):
             self._manifest("name: empty\n")
+
+    def test_two_stages_may_not_give_one_role_different_cards(self):
+        """`brainstorm` and `plan` both dispatch the planner, and the lookup
+        answers with the first match — so a second declaration was silently
+        dead and repointing `plan.card` alone changed nothing."""
+        w = self._manifest("""name: clash
+stages:
+  brainstorm: {role: planner, card: roles/planner.md}
+  plan: {role: planner, card: roles/reviewer.md}
+""")
+        with self.assertRaises(wf.WorkflowError) as cm:
+            w.card("planner")
+        self.assertIn("planner", str(cm.exception))
+        self.assertIn("brainstorm", str(cm.exception), "the error does not say which stages")
+
+    def test_the_schemas_do_not_move_with_the_workflow(self):
+        """The report envelope is how the RUNTIME reads a result, so it is the
+        runtime's contract: a hosted workflow must not have to ship a copy.
+
+        It was also frozen at import time, so a workflow with no `schemas/`
+        validated fine in-process and would have raised FileNotFoundError into
+        the generic handler under the real CLI.
+        """
+        bundled = schema.schemas_dir()
+        self._manifest("name: cardless\nstages:\n  implement: {role: implementer}\n")
+        self.assertEqual(schema.schemas_dir(), bundled,
+                         "--workflow moved the runtime's own contract")
+        self.assertNotIn(self.dir, bundled)
+        # and validation still works under that workflow
+        schema.validate_report({"stage": "implement", "role": "implementer",
+                                "status": "complete", "summary": "did it",
+                                "evidence": {"tests": "ok"}})
+
+    def test_a_design_report_is_a_legal_report(self):
+        """`_stage_brainstorm` dispatches a planner and `compose` tells it to
+        write a report, but `brainstorm` was not in the stage enum — so a design
+        stage that succeeded was recorded as blocked."""
+        schema.validate_report({"stage": "brainstorm", "role": "planner",
+                                "status": "complete", "summary": "designed it",
+                                "evidence": {"not_verified": ["nothing is built yet"]}})
+
+    def test_a_finding_against_st_11_does_not_reopen_st_1(self):
+        """`"st-1" in "st-11"` is true, so a finding against one subtask sent a
+        different, already-green one back to be rebuilt."""
+        owns = Orchestrator._owned_by
+        self.assertFalse(owns("st-11", "st-1"))
+        self.assertTrue(owns("st-1", "st-1"))
+        # both forms the schema documents ("e.g. impl:st-2")
+        self.assertTrue(owns("impl:st-2", "st-2"))
+        self.assertFalse(owns("impl:st-2", "st-2x"))
+        self.assertFalse(owns("", "st-1"))
 
 
 if __name__ == "__main__":

@@ -262,12 +262,15 @@ tool: 4}` — and the router picks from the seats that clear the floor. Swapping
 providers is an edit to that file and nowhere else.
 
 On the shipped two-seat registry that produces a genuine split as the quota
-drains. At zero draw everything runs on the claude seat, because a subscription
-with headroom is ~free; once that seat is around 30% drawn the implementer and
-test-author move to the cursor seat, while the planner and reviewer stay — they
-require a capability only the claude seat exposes, and they are in its
-`reserve_for` list. Nobody configured that split; it falls out of the shadow
-price and the capability floors.
+drains. At zero draw the two seats price identically and everything runs on the
+claude seat; from its first recorded invocation the implementer and test-author
+price out to the cursor seat, because a subscription's marginal cost rises with
+how drawn it is and the emptier seat is then strictly cheaper. Past 70% drawn
+(`1 − reserve_fraction`) the reservation withholds the claude seat from them
+outright. The planner and reviewer stay on it either way: the only model
+enrolled for those two roles is exposed by that seat alone, and they are the
+roles in its `reserve_for` list. Nobody configured that split; it falls out of
+the shadow price, the reservation and the capability floors.
 
 ## Design choices worth knowing before you adopt it
 
@@ -331,8 +334,8 @@ checks.
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 184 tests, no tokens spent
-python3 orchestrator/tests/test_failover.py      # 103 more, same
+python3 orchestrator/tests/test_orchestrator.py  # 192 tests, no tokens spent
+python3 orchestrator/tests/test_failover.py      # 104 more, same
 ```
 
 They drive the real state machine over a real git repository with a scripted

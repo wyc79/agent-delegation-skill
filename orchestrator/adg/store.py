@@ -183,9 +183,6 @@ class Task:
     def update(self, **changes):
         return self.mutate(lambda s: s.update(changes))
 
-    def id(self):
-        return self.state["id"]
-
     def repo_path(self):
         return self.state["repo"]["path"]
 

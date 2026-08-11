@@ -10,7 +10,7 @@ Deliberately absent: any model name, any routing logic, any provider detail.
 
 import os
 
-from . import workflow
+from . import schema, workflow
 
 # The protocol dispatched agents follow, relative to `orchestrator/`. It lives
 # here rather than at the repo root because it is orchestrator-internal: it is
@@ -133,7 +133,11 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
         "",
         "Finish by writing your report to:",
         "  %s/reports/" % task.path,
-        "It must validate against %s/schemas/report.schema.json." % skill,
+        # The runtime's schemas directory, not the workflow's: the report
+        # envelope is how this program reads a result, so it does not move
+        # with --workflow and a hosted workflow need not ship a copy.
+        "It must validate against %s." % os.path.join(
+            schema.schemas_dir(), "report.schema.json"),
     ]
     found = {k: v for k, v in (state.get("companions") or {}).items() if v}
     if found:

@@ -157,7 +157,11 @@ def cmd_init(args):
     r = routing.Router(reg)
     print("\nrole assignments within the ceiling %s:" %
           reg["policy"].get("escalation_ceiling", {}).get("max_tier"))
-    for role in ("planner", "implementer", "test-author", "reviewer"):
+    # Every role this program dispatches from a card, integrator included: it is
+    # picked by `_reconcile` on a merge conflict, and a deployment that enrolled
+    # nobody for it learns that mid-wave, when the run halts for a human, rather
+    # than here where the fix is one registry line.
+    for role in ("planner", "implementer", "test-author", "reviewer", "integrator"):
         try:
             c = r.select(role)
             print("  %-12s %s via %s (%s)" % (role, c.model, c.channel, c.adapter))

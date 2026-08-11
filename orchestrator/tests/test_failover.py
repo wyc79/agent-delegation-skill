@@ -845,6 +845,48 @@ class TestFailoverEndToEnd(unittest.TestCase):
         self.assertTrue(companions.PROJECT_ROOTS,
                         "companions cannot see a project-local install at all")
 
+    def test_both_searches_find_a_plain_skill_in_a_skills_directory(self):
+        """The list check above compares strings; this one compares answers.
+
+        `winnow.SEARCH` reads `<root>/.claude/skills/code-winnow/...`, so a plain
+        skill dropped into a skills directory is the layout both modules are
+        pointed at. `companions.KNOWN` carried fragments that began with
+        `skills/` while every root already ended in one, so that layout probed
+        `.claude/skills/skills/brainstorming/SKILL.md` and could not match: only
+        plugin-nested installs were ever detected. The two modules answered
+        differently about the same tree, which is exactly what the sibling test
+        above claims to prevent and cannot see.
+        """
+        import shutil
+        import tempfile
+        from adg import companions, winnow
+        repo = tempfile.mkdtemp(prefix="skills-")
+        for rel in ("brainstorming/SKILL.md", "karpathy-guidelines/SKILL.md",
+                    "code-winnow/scripts/scan.py"):
+            path = os.path.join(repo, ".claude", "skills", rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write("x")
+        # A home install of either companion would answer for this repo, and the
+        # machine running the suite may well have one.
+        saved = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+        os.environ["HOME"] = os.environ["USERPROFILE"] = tempfile.mkdtemp(prefix="nohome-")
+        try:
+            found = companions.detect(repo)
+            self.assertTrue(winnow.find(repo), "winnow cannot see the flat layout")
+            self.assertEqual(found, {"karpathy-guidelines": True, "superpowers": True},
+                             "winnow found this tree and companions did not: %s" % found)
+            self.assertEqual(companions.detect(tempfile.mkdtemp(prefix="bare-")),
+                             {"karpathy-guidelines": False, "superpowers": False},
+                             "an empty tree reports skills as installed")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            shutil.rmtree(repo, ignore_errors=True)
+
     def test_a_timeout_on_every_seat_is_not_reported_as_a_quota_wall(self):
         """The failure the split introduced, and that no test drove.
 
@@ -979,7 +1021,13 @@ class TestFailoverEndToEnd(unittest.TestCase):
         task, _, _ = self._run(script)
         text = task.read_text("brief.md", "")
         self.assertIn("usage limit", text.lower())
-        self.assertIn("claude-seat", text)
+        # Scoped to the paused-seats section, as the cost-table test below is.
+        # A bare `assertIn("claude-seat", text)` was answered by the cost table,
+        # which names every seat that ran a step -- so dropping the seat list
+        # from the park brief entirely still passed.
+        self.assertIn("## Paused seats", text, "the park brief lost its seat list")
+        self.assertIn("claude-seat", text.split("## Paused seats")[1],
+                      "the brief never names the seat that walled")
         # The name said "and the reopen time" while asserting only the seat.
         import time as _time
         when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(T0 + 2 * 3600))

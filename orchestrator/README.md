@@ -134,7 +134,9 @@ provider gave.
 
 | File | Role |
 |---|---|
+| `adg/cli.py` | The commands themselves. `orchestrator/delegate` is six lines that call its `main`. |
 | `adg/machine.py` | The state machine. Every transition lives here. |
+| `adg/workflow.py` | The manifest in force: which stages are enabled, which card a role reads, which discipline a stage borrows from an installed skill. |
 | `adg/store.py` | Task state outside the repo; project key from the git common dir. |
 | `adg/router.py` | Capability scoring, enrollment, escalation ceiling, quota shadow price. |
 | `adg/quota.py` | Quota-exhaustion classification per agent kind; reset and window parsing. |

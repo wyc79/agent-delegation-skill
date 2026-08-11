@@ -115,13 +115,12 @@ class Budget:
                 "already replanned %d time(s)" % used,
                 "park")
 
-    def check_parallel(self, running):
-        cap = int(self.limits["max_parallel_agents"])
-        if running >= cap:
-            raise LimitBreach(
-                "max_parallel_agents",
-                "%d agents already running" % running,
-                "queue")
+    # No `check_parallel` here. `max_parallel_agents` is not a
+    # check-before-the-action limit like the others: nothing queues, so there is
+    # nothing to raise about. `machine._wave` reads the same
+    # `limits["max_parallel_agents"]` and simply stops forming the wave at the
+    # cap, which is the enforcement. A second, never-called checker beside it
+    # read as the enforcement and was not.
 
     def requires_approval(self, stage):
         return stage in (self.limits.get("human_approval_required") or [])

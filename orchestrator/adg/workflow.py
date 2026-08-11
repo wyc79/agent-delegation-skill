@@ -113,9 +113,26 @@ class Workflow:
         foreign skill has no card of its own, and inventing a path to a file
         that does not exist would send the agent hunting for it.
         """
-        for spec in self.stages.values():
+        # First match wins, and two stages CAN share a role -- `brainstorm` and
+        # `plan` both dispatch the planner. That made a second declaration
+        # silently dead: repointing `plan.card` alone changed nothing, because
+        # `brainstorm` is declared first and answers for the role. Rather than
+        # pick one quietly, disagreement is refused. A manifest that means two
+        # different cards for one role is asking for something this lookup
+        # cannot express, and finding that out at load time beats finding out
+        # from an agent that read the wrong instructions.
+        found = {}
+        for stage, spec in self.stages.items():
             if spec.get("role") == role and spec.get("card"):
-                return os.path.join(self.path, spec["card"])
+                found.setdefault(spec["card"], []).append(stage)
+        if len(found) > 1:
+            raise WorkflowError(
+                "%s: role %r is given different cards by different stages (%s). "
+                "One role reads one card; split the role or unify the card."
+                % (self.path, role,
+                   "; ".join("%s -> %s" % (", ".join(v), k) for k, v in found.items())))
+        if found:
+            return os.path.join(self.path, next(iter(found)))
         # Roles a stage dispatches alongside its own. `test-author` is the one
         # that exists: it runs inside `plan`, before any implementation exists,
         # which is the property that lets it encode what was ASKED rather than
@@ -136,9 +153,6 @@ class Workflow:
     def enabled(self, stage):
         spec = self.stages.get(stage)
         return bool(spec) and spec.get("enabled", True) is not False
-
-    def role_for(self, stage):
-        return (self.stages.get(stage) or {}).get("role")
 
     def next_enabled(self, after, terminal="done"):
         """The next stage that will actually run, skipping disabled ones.
@@ -179,6 +193,11 @@ class Workflow:
         return (spec.get("text") or spec.get("fallback") or "").strip()
 
     def wants_skill(self, stage):
-        """Which companion a stage would use if it were installed -- so `init`
-        can report what this workflow would gain from an install."""
+        """Which companion a stage would use if it were installed.
+
+        Nothing in the runtime calls this yet: `delegate init` reports which
+        companions ARE installed (`companions.detect`) and not which ones this
+        workflow would take up if they were. The docstring used to say `init`
+        did, which is the kind of claim that reads as a feature.
+        """
         return ((self.stages.get(stage) or {}).get("discipline") or {}).get("skill")

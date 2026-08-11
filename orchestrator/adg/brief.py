@@ -115,6 +115,24 @@ def _cost_section(state):
     return md
 
 
+# An entry, not just bytes in the file. The log opens with a heading, prose and
+# a fenced example -- `templates/deviations.md` is what agents are told to start
+# from -- so "the file is non-empty" says nothing about whether anything was
+# logged. The old guard asked whether the file failed to start with `#`, which
+# the template always does: every task that used the template hid every
+# deviation from every brief, however many were appended below.
+#
+# The entry shape is the one `references/deviations.md` documents and the report
+# schema's id pattern agrees with: `dev-<subtask-or-role>-<n> | ...` at the start
+# of a line. The template's own example carries `<placeholders>` inside the
+# angle brackets, so it cannot be mistaken for a real entry.
+_DEVIATION = re.compile(r"(?m)^\s*(?:[-*]\s*)?dev-[a-z0-9][a-z0-9-]*\s*\|")
+
+
+def _has_deviation_entry(text):
+    return bool(_DEVIATION.search(text or ""))
+
+
 def render(task, kind, decision_text, files=(), verify=None, extra=None):
     """Build a gate brief. Decision first: it is what the reader must act on."""
     state = task.state
@@ -150,8 +168,7 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
             md.append("- Failed: `%s`" % f["cmd"])
         md.append("")
 
-    deviations = task.read_text("deviations.md", "").strip()
-    if deviations and not deviations.startswith("#"):
+    if _has_deviation_entry(task.read_text("deviations.md", "")):
         md += ["## What didn't go to plan", "", "See the deviations log for details.", ""]
 
     md += _cost_section(state)

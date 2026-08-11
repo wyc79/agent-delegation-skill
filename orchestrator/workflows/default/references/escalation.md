@@ -66,9 +66,9 @@ does **not** cancel a threshold above. Three failures is three failures.
 
 ## What happens next (so you can stop cleanly)
 
-The orchestrator walks a ladder: retry with your context → a different model at
-the same tier → a stronger model within the deployment's ceiling → back to the
-planner → a human. You do not choose the rung and you do not know the ceiling.
+The orchestrator walks a ladder: retry with your context → a stronger model
+within the deployment's ceiling → back to the planner → a human. You do not
+choose the rung and you do not know the ceiling.
 
 **Not every replacement is a rung.** If you were started to continue work another
 agent left part-way — because its capacity ran out, not because its approach

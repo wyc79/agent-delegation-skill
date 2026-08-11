@@ -31,10 +31,13 @@ missing-requirement check:
 |---|---|---|
 | AC-1 | met | `test_poison_ticks_each_turn` passes |
 | AC-2 | unmet | no code path refreshes duration — finding f-1 |
-| AC-3 | met, untested | implemented in `health_bar.gd`; no automated coverage |
+| AC-3 | met_untested | implemented in `health_bar.gd`; no automated coverage |
 
-"Met, untested" is a distinct and important verdict. Say it rather than rounding
-up to met or down to unmet.
+`met_untested` is a distinct and important verdict. Say it rather than rounding
+up to met or down to unmet — and spell it exactly like that, with the
+underscore: the status field takes one of `met`, `met_untested`, `partial`,
+`unmet`, `not_applicable`, and anything else fails validation and stops the run
+for a human instead of delivering your review.
 
 ## Step 3 — Trace every hunk back to authority
 

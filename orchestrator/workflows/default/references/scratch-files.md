@@ -25,9 +25,11 @@ that path would show up in `git status`, in the diff, and in the PR.
 
 - **Do not edit `.gitignore`.** Adding an entry is a change to the project, it
   lands in the diff, and it is exactly the pollution this convention prevents.
-  If the repo has no suitable ignored location, that is an orchestrator concern
-  (it can add a task-local entry to `.git/info/exclude`, which is uncommitted and
-  shared by every worktree). Raise it as a `blocked_command` signal and stop.
+  If the repo has no suitable ignored location, raise it as a `blocked_command`
+  signal and stop. That signal stops the run for a human, who can add an entry
+  to `.git/info/exclude` — uncommitted, and shared by every worktree. Nothing
+  in the orchestrator does it for you, so do not stop expecting it to be fixed
+  underneath you.
 - **Do not use `git add -f`** on anything under an ignored path, ever.
 - **Do not repurpose a meaningful ignored directory.** `Library/`, `.godot/`,
   `node_modules/`, and `target/` belong to their tools; dropping files in them
