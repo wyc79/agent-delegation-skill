@@ -15,7 +15,7 @@ import re
 import subprocess
 import time
 
-from . import (brief, companions, cooldown, limits as lim, prompts, quota,
+from . import (brief, cooldown, limits as lim, prompts, quota,
                router as routing, schema, verify, winnow, workflow as wf,
                yamlite)
 from .store import git
@@ -1115,7 +1115,7 @@ admits only one sensible reading.
         # Before anything expensive. Unlike the other two gates this one sits
         # MID-stage -- `_land()` follows it -- so an approved run re-enters here,
         # and re-entry must not re-run the verification or rebuild a brief
-        # through `_polish` to ask a question that is already answered.
+        # to ask a question that is already answered.
         decided = self._decision_already_made("merge")
         if decided is False:
             raise Halt("needs_human", "merge declined by human")
@@ -1154,8 +1154,7 @@ admits only one sensible reading.
             "Land this change? It is complete and its checks pass. Nothing has been "
             "committed: attended mode leaves a patch file for you to apply and commit "
             "yourself.",
-            files=files, verify=result, extra="## Review\n\n" + note,
-            polish=self._polish)
+            files=files, verify=result, extra="## Review\n\n" + note)
         for p in problems:
             self.log("  brief lint: %s" % p)
         if self.budget.requires_approval("merge"):
@@ -1839,43 +1838,12 @@ admits only one sensible reading.
             return data, None
         return None, ["no fresh report written by %s" % role]
 
-    REPORT_PROMPT = """Rewrite the notes below as a short update for a competent
-programmer who has never seen this repository. Keep the markdown headings.
-
-Rules:
-- Lead with the decision they must make. Do not bury it.
-- Expand every internal id the first time you use it: write "the requirement
-  that old saves still load (AC-2)", never a bare "AC-2". Never use the words
-  rung, REPLAN, REQUEST_CHANGES, test_stuck or scope_overrun.
-- Say what each changed file is for. They do not know this codebase.
-- State plainly anything that was NOT verified.
-- No praise, no filler, no restating the task twice.
-- Reproduce any markdown table exactly as given. Those are facts, not prose.
-
---- NOTES ---
-%s
-"""
-
-    def _polish(self, text):
-        """Render the mechanical brief into plain language. Cheap, and the only
-        part of the run a human actually reads -- but a failed or jargon-laden
-        rewrite falls back to the template rather than replacing it."""
-        if self.dry_run:
-            return text
-        res = self._optional("reporter", self.REPORT_PROMPT % text)
-        if res is None:
-            return text
-        out = (res.get("output") or "").strip()
-        if len(out) < 80 or brief.lint(out):
-            return text
-        return out
-
     def _decision_already_made(self, kind):
         """Consume a decision written by `delegate approve` / `reject`.
 
         True, False, or None when nobody has answered yet. Consumed *before* any
         brief is built, which is what keeps re-entry cheap: a brief goes through
-        `_polish`, an LLM call, and rebuilding one to ask a question that has
+        an LLM call, and rebuilding one to ask a question that has
         already been answered would spend a model call on nothing.
 
         The decision is NOT written to the gate history here. `delegate
