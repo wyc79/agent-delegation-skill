@@ -503,6 +503,46 @@ class TestClosedGaps(unittest.TestCase):
         from adg import runtime as rt
         self.assertIsNone(rt._result("plain text", "", 0)["cost_usd"])
 
+    def test_tokens_and_elapsed_survive_both_cli_shapes(self):
+        """Not every CLI reports money. Where one does not, `usd` is our own
+        price table applied to these counts, so the counts have to be on the
+        record too -- otherwise a run compares a measurement against an
+        estimate with nothing saying which is which."""
+        from adg import runtime as rt
+        claude = rt._result(json.dumps(
+            {"result": "ok", "total_cost_usd": 0.09, "duration_ms": 1789,
+             "usage": {"input_tokens": 2, "output_tokens": 4,
+                       "cache_read_input_tokens": 15953}}), "", 0)
+        self.assertEqual(claude["cost_usd"], 0.09)
+        self.assertEqual(claude["usage"], {"in": 15955, "out": 4})
+        self.assertEqual(claude["elapsed_ms"], 1789)
+
+        cursor = rt._result(json.dumps(
+            {"result": "ok", "duration_ms": 14298,
+             "usage": {"inputTokens": 12179, "outputTokens": 30,
+                       "cacheReadTokens": 5248}}), "", 0)
+        self.assertIsNone(cursor["cost_usd"], "cursor reports no cost today")
+        self.assertEqual(cursor["usage"], {"in": 17427, "out": 30})
+        self.assertEqual(cursor["elapsed_ms"], 14298)
+
+    def test_the_delegation_record_keeps_tokens_and_time(self):
+        task = store.Task.create(self.t.repo, "T-C5", "# t\n", self.pol)
+
+        class Metered(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                r = runtime.MockAdapter.prompt(self, session, text, timeout)
+                r["usage"], r["elapsed_ms"] = {"in": 100, "out": 20}, 4242
+                if session.handle["role"] == "classifier":
+                    r["output"] = "VERDICT: SIMPLE -- tiny"
+                return r
+
+        Orchestrator(task, self.reg, Metered({"implementer": lambda e, c: None}),
+                     lambda k, t: True, log=lambda *_: None).run()
+        history = task.state["delegation_history"]
+        self.assertTrue(history, "nothing was delegated")
+        self.assertEqual(history[0]["tokens"], {"in": 100, "out": 20})
+        self.assertEqual(history[0]["elapsed_ms"], 4242)
+
     def test_spend_accumulates_and_then_parks_the_run(self):
         task = store.Task.create(self.t.repo, "T-C1", "# t\n", dict(self.pol, max_cost_usd=0.5))
 
@@ -2631,6 +2671,16 @@ class TestEndToEnd(unittest.TestCase):
         status, task, _, _ = self._run(script, gate=lambda k, t: k != "merge")
         self.assertEqual(status, "needs_human")
         self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+    def test_a_declined_gate_is_recorded_not_only_the_approvals(self):
+        """A decline is the one moment the machine was about to be wrong. It
+        used to raise Halt without writing anything, so `gates` held approvals
+        only and nothing counting interventions could see a rejection."""
+        script, _ = self._script()
+        _, task, _, _ = self._run(script, gate=lambda k, t: k != "merge")
+        states = [(g["kind"], g["state"]) for g in task.state["gates"]]
+        self.assertIn(("merge", "declined"), states,
+                      "the rejection left no trace: %s" % states)
 
     def test_unparseable_plan_parks_rather_than_guessing(self):
         script, _ = self._script()

@@ -38,7 +38,7 @@ def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
         data = json.loads(stdout or "")
     except ValueError:
         data = None
-    usage = None
+    usage, elapsed_ms = None, None
     if isinstance(data, dict):
         text = data.get("result") or data.get("output") or raw
         for key in ("total_cost_usd", "cost_usd"):
@@ -46,11 +46,17 @@ def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
                 cost = float(data[key])
                 break
         usage = _tokens(data.get("usage"))
+        # The CLI times its own call. Measured here because it is the only
+        # honest source of AGENT time: differencing our own record stamps also
+        # counts however long a human sat on an approval gate, and the stamps
+        # are one-second resolution, so two quick steps look simultaneous.
+        if isinstance(data.get("duration_ms"), (int, float)):
+            elapsed_ms = int(data["duration_ms"])
         if isinstance(data.get("error"), dict):
             error_code = error_code or data["error"].get("code")
     res = {"settled": "idle" if code == 0 else "blocked",
            "output": text, "code": code, "cost_usd": cost, "usage": usage,
-           "error_code": error_code}
+           "elapsed_ms": elapsed_ms, "error_code": error_code}
     return classify(res, kind, now, raw)
 
 

@@ -286,9 +286,16 @@ admits only one sensible reading.
             # Unparseable: fail safe. Over-planning a small task wastes time;
             # under-planning a large one wastes the whole run.
             return "complex", "classifier gave no usable verdict", "fallback"
+        # Carries what it spent, like every other step. The classifier is a real
+        # billed call on a real seat; recording it without its cost made the
+        # cheapest-looking step in the run the one nothing could account for.
         self.task.record_delegation({"stage": "classify", "role": "classifier",
                                      "model": res.get("model"), "channel": res.get("channel"),
-                                     "adapter": self.adapter.name, "outcome": "complete"})
+                                     "adapter": self.adapter.name, "outcome": "complete",
+                                     "usd": res.get("cost_usd"),
+                                     "usd_estimated": bool(res.get("cost_estimated")) or None,
+                                     "tokens": res.get("usage"),
+                                     "elapsed_ms": res.get("elapsed_ms")})
         return (m.group(1).lower(),
                 m.group(2).strip()[:200] or "no reason given", res.get("model"))
 
@@ -1140,7 +1147,13 @@ a planner does that next, from your design.
         for p in problems:
             self.log("  brief lint: %s" % p)
         if self.budget.requires_approval("merge"):
-            if not self.gate("merge", text):
+            # Recorded here rather than through _gate(), which this path has
+            # never used: the merge gate carries a brief the others do not. Both
+            # outcomes are written, so `gates` is a complete account of what a
+            # human decided rather than a list of the times they said yes.
+            approved = self.gate("merge", text)
+            self.task.record_gate("merge", "approved" if approved else "declined")
+            if not approved:
                 raise Halt("needs_human", "merge declined by human")
         self._land()
         self.task.update(status="done")
@@ -1439,6 +1452,10 @@ a planner does that next, from your design.
                 "subtask": subtask.get("id") if subtask else None,
                 "model": choice.model, "channel": choice.channel,
                 "adapter": self.adapter.name, "outcome": "quota_exhausted",
+                # A wall still costs wall-clock, and that time is exactly what
+                # the failover path exists to shorten -- so it has to be on the
+                # record even though the call bought nothing.
+                "tokens": res.get("usage"), "elapsed_ms": res.get("elapsed_ms"),
                 "reopens_at": at})
             # Excluded explicitly as well as through the breaker: if the state
             # file could not be written, the loop must still terminate.
@@ -1467,6 +1484,14 @@ a planner does that next, from your design.
             "adapter": self.adapter.name, "outcome": outcome,
             "usd": res.get("cost_usd"),
             "usd_estimated": bool(res.get("cost_estimated")) or None,
+            # Tokens and elapsed time are kept beside the money, not derived
+            # from it. Only some CLIs report a cost at all -- where one does
+            # not, `usd` is this program's own price table applied to these
+            # token counts, so a run that stored only the money would be
+            # comparing a measurement against an estimate with nothing on the
+            # record to say which was which.
+            "tokens": res.get("usage"),
+            "elapsed_ms": res.get("elapsed_ms"),
             "report_problems": problems or None,
         })
         if outcome == "blocked" and res.get("settled") == "timeout":
@@ -1681,6 +1706,11 @@ Rules:
         for p in problems:
             self.log("  brief lint: %s" % p)
         if not self.gate(kind, text):
+            # Recorded before the raise. A decline is the most informative thing
+            # a human does to a run -- it is the one place the machine was about
+            # to be wrong -- and logging only approvals left every rejection
+            # missing from the history that exists to count them.
+            self.task.record_gate(kind, "declined")
             raise Halt("needs_human", "%s declined by human" % kind)
         self.task.record_gate(kind, "approved")
 
