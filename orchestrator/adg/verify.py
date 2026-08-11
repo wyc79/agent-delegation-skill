@@ -1,8 +1,9 @@
 """Deterministic verification.
 
-Runs the project's own commands. No LLM: this is the ground truth every agent
-and reviewer argues from, and it runs before any review so we never pay
-reviewer tokens to discover a compile error.
+Runs the project's own commands, which are the caller's: nothing here decides
+what a passing change looks like. No LLM either -- this is the ground truth an
+agent argues from and the only evidence in the merge brief that came from
+running something rather than from an agent's own account of itself.
 
 Commands are split fast/slow because on a game engine a five-minute boot inside
 a tight fix loop destroys the economics -- fast runs every iteration, slow at

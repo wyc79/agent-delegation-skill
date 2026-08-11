@@ -75,7 +75,7 @@ that costs real time to run down.
 
 A design document, an ADR, or a README update that will matter after this task is
 finished is **project documentation, not scratch**. It belongs in the repo's
-normal docs location, committed like any other change — but only if the plan
-called for it or you log it as a deviation. Do not smuggle documentation into an
-ignored directory to avoid review, and do not commit run bookkeeping as if it
-were documentation.
+normal docs location, committed like any other change — but only if your job
+called for it, or you say in your report that you wrote it and why. Do not
+smuggle documentation into an ignored directory, and do not commit run
+bookkeeping as if it were documentation.

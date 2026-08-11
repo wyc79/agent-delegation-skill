@@ -5,10 +5,12 @@ different times** — different providers, different models — each in an isola
 git worktree, metering the quota on each and moving work when one hits a wall.
 
 It is a **wrapper, not a workflow**. There is no planner, no reviewer, no
-classifier. A skill or agent that has already decided what the work is hands it
-a decomposition; it decides which seat serves each job, runs them, and merges
-what comes back. Judging the result is the caller's, and so is deciding what to
-do about a job that got stuck.
+classifier, and no quality pass of its own. A skill or agent that has already
+decided what the work is hands it a decomposition; it decides which seat serves
+each job, runs them, and merges what comes back. Judging the result is the
+caller's, and so is deciding what to do about a job that got stuck. A clean run
+dispatches one kind of agent — the one doing a job you wrote — and a test
+fails if any other appears.
 
 It is a command line program, not a model and not a prompt. It spawns agent CLIs
 (`claude`, `codex`, `cursor-agent`, `gemini` today) as subprocesses, hands each
@@ -29,6 +31,13 @@ Two pieces ship here:
 
 [`orchestrator/README.md`](orchestrator/README.md) is the reference for what is
 actually built and why each decision went the way it did.
+
+**The relationship to run in your head is which way the call goes.** A skill
+like superpowers or code-winnow does not get *processed* by this. It calls this,
+when it has jobs that would run in parallel and more than one provider to run
+them on, and gets back the work plus a record of what each seat did. Anything
+that looks like this program deciding what the work is, or whether it is any
+good, is a bug in the boundary rather than a feature.
 
 ## Why this is a wrapper and not a workflow
 
@@ -82,14 +91,15 @@ you  →  your agent    "implement the four driver stages"
 ```
 
 **The first question is whether there are two seats.** `delegate init` prints the
-tier-to-provider table. If everything resolves to one provider, delegating buys
-subprocess indirection and nothing else — do the work with your own subagents
-instead. The skill says so in as many words.
+tier-to-provider table and then answers it outright. If everything resolves to
+one provider, delegating buys subprocess indirection and nothing else — do the
+work with your own subagents instead.
 
 **Nothing reviews the work.** The merge-gate brief says that plainly rather than
 letting "complete, checks pass" read as "something looked at this". What you get
-is which files each job touched, which fell outside its declared scope, the
-output of the checks you configured, and what each seat cost.
+is a row per job — which files it touched and which of them fell outside the
+scope it was given — plus the output of the checks you configured and what each
+seat cost. Files outside scope are recorded, never reverted.
 
 **Exit code 1 does not mean it failed.** `run` and `resume` exit 0 only when the
 task reached `done`; parked, waiting on quota, declined and crashed all exit 1.
@@ -112,11 +122,13 @@ $ADG init                      # what's detected, and which seat serves which ti
 $ADG run "add the endpoints" --plan jobs.md
 ```
 
-`init` prints the project key, the state directory, which agent CLIs are usable,
-and the tier-to-provider table. Read that table first: **if every tier resolves
-to one provider, do not delegate** — you would be paying for subprocess
-indirection and nothing else. It writes nothing without `--write`. (`--repo`
-overrides the default of the current directory.)
+`init` prints the project key, the state directory, the tier-to-provider table
+and whether each seat's agent CLI is actually installed. Read that table first:
+**if every tier resolves to one provider, do not delegate** — you would be
+paying for subprocess indirection and nothing else. It writes nothing at all;
+`registry.default.yaml` and `.adg.yaml` are the whole of the configuration, and
+both are edited by hand. (`--repo` overrides the default of the current
+directory.)
 
 **2. The front door.** Copy `agent-delegation/` into your agent's skills
 directory, so the agent you talk to knows when delegating is worth it, how to
@@ -135,7 +147,7 @@ from `git rev-parse --git-common-dir`, so the working directory matters.
 
 | Command | Does |
 |---|---|
-| `init [--write] [--force]` | Detected seats, role assignments, companion skills, verify config. |
+| `init` | Detected seats, which one serves each tier, verify config. Writes nothing. |
 | `run <request> --plan FILE` | Create a task from the jobs in `FILE` and run them. |
 | `resume [--id] [--stage] [--when-open]` | Continue a parked task. `--when-open` sleeps out a quota window first. |
 | `approve [--id] --note "…"` | Answer a waiting gate yes, then continue the run. |
@@ -193,11 +205,9 @@ is no handoff, and multi-provider delegation stops being a thing that can happen
 
 | File | Holds | Authority |
 |---|---|---|
-| `task.md` | The request and its numbered acceptance criteria | **What was asked** — outranks everything |
+| `task.md` | The request, as the caller wrote it | **What was asked** — outranks everything |
 | `plan.md` | One YAML block per job — supplied by the caller with `--plan` | **What was asked for** |
-| `spec.md` | The approved design, when there was a design stage | Settled approach |
 | `brief.md` | The last gate brief, written for a human | — |
-| `deviations.md` | Append-only log of departures from the plan | Amends `plan.md` |
 | `reports/*.json` | One schema-validated handoff per agent per stage | Evidence |
 | `verify/` | Build, test and lint output by run id | Evidence |
 | `agent-logs/*.log` | Each agent's prompt and its output | Evidence |
@@ -219,23 +229,21 @@ orchestrator/
 ├── adg/                  the runtime: state machine, router, quota, cooldowns,
 │                         adapters, verification, prompts  (see its README)
 ├── tests/                two suites, no tokens spent
-├── winnow-passes.md      a worked design for routing a FOREIGN pipeline's
-│                         stages onto the existing router — deliberately unwired
-└── workflows/default/    the bundled default workflow: the protocol DISPATCHED
-                          agents follow. Orchestrator-internal, not installed.
+└── workflows/default/    the contract DISPATCHED agents follow — what a
+                          worktree is, what the scope boundary means, what to
+                          write on the way out. Orchestrator-internal, not
+                          installed, and repointable with `--workflow`.
     ├── PROTOCOL.md       entry point, read before any role card. No
     │                     frontmatter: it is read by absolute path rather than
     │                     installed, and two files claiming the same skill name
     │                     is a collision a loader resolves arbitrarily
-    ├── workflow.yaml     the stage manifest (in progress — see Status)
+    ├── workflow.yaml     the stage manifest
     ├── roles/            one card per role; an agent reads exactly one
     ├── references/       depth loaded only when its trigger fires: task-dir,
-    │                     escalation, deviations, parallelism, handover,
-    │                     companions, scratch-files
-    ├── schemas/          JSON Schema for reports and job blocks
-    └── templates/        starting points for task/plan/deviations
+    │                     parallelism, handover, scratch-files
+    └── schemas/          JSON Schema for reports and job blocks
 
-registry.default.yaml     model capability scores, role→capability profiles,
+registry.default.yaml     model capability scores, the one job profile,
                           channels (seats), and policy — the only file that
                           names models
 ```
@@ -248,12 +256,12 @@ Merged, every implementer was handed a document telling it to call `delegate` �
 the wrong document, and an invitation to recurse.
 
 **Progressive disclosure is a hard constraint on the protocol, not a style**, and
-the budget that matters is per role rather than per repo. `PROTOCOL.md` is read
-by all five roles, so a line there costs five times a line in a card, and a
-reference loads only when its stated trigger fires ("tests failed 3 times → read
-`references/scratch-files.md`"). A worker never loads the conflict rules,
-because it never writes code or shares a worktree. Moving those rows out of the
-shared entry point lengthened the cards and made every individual role cheaper.
+the budget that matters is per agent rather than per repo. `PROTOCOL.md` is read
+by every dispatched agent, so a line there costs once per job in the wave, and a
+reference loads only when its stated trigger fires ("a previous agent held this
+job and stopped part-way → read `references/handover.md`"). Moving those rows out
+of the shared entry point lengthened the cards and made every individual job
+cheaper.
 
 ## The graph, and how a job finds a seat
 
@@ -290,6 +298,12 @@ the shadow price keeps working: a subscription with headroom costs ~0, the same
 seat at 90% drawn prices itself above a metered key, and `reserve_for` withholds
 a declared share — unless that would leave a job with nowhere to go, in which
 case it gets the seat anyway and the demotion is logged.
+
+The shipped registry reserves 30% of the strong seat for the **integrator**,
+which is the call that arrives last and cannot be deferred: a wave that draws
+the seat down and then cannot pay for its own merge conflict strands finished
+work on unmerged branches. A role named there that nothing dispatches reserves
+headroom nobody can claim, so a test refuses one.
 
 ## Design choices worth knowing before you adopt it
 
@@ -337,10 +351,16 @@ judgement:
   stuck (`subagent-driven-development`, which already says never to "force the
   same model to retry without changes"). `delegate` is what it can call when
   more than one provider is enrolled and the jobs are genuinely independent.
-- **[code-winnow](https://github.com/wyc79/code-winnow)** runs as a
-  deterministic chaff scan over the diff at the merge gate, if installed. No
-  model reads it and nothing routes on it — it is a pass over the change whose
-  output the brief prints.
+- **[code-winnow](https://github.com/wyc79/code-winnow)** decides what counts as
+  chaff and which passes read a change. It runs over the patch a delegated run
+  produces, or — the interesting direction — dispatches its own passes *through*
+  `delegate` as jobs, so N readers over one diff land on N seats instead of
+  queueing on one provider's quota.
+
+  `delegate` used to run winnow's scanner itself at the merge gate. That was
+  backwards: it made a quality pass a property of the dispatcher, chose one
+  package on the caller's behalf, and put a judgement in the brief that the
+  caller had not asked for.
 
 The line is: anything about *how to do software work well* belongs to the
 caller. What belongs here is what only this can do — placing work on seats and
@@ -351,8 +371,8 @@ keeping it moving when one empties.
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 170 tests, no tokens spent
-python3 orchestrator/tests/test_failover.py      # 100 more, same
+python3 orchestrator/tests/test_orchestrator.py  # 161 tests, no tokens spent
+python3 orchestrator/tests/test_failover.py      # 99 more, same
 ```
 
 They drive the real state machine over a real git repository with a scripted

@@ -1,28 +1,25 @@
 """The workflow, declared instead of hardcoded.
 
-`machine.STAGES` and `prompts.compose` between them decided three things no
-deployment could change: which stages exist, which role each dispatches, and
-that every role's instructions live at `roles/<role>.md` inside this repo. That
-last one is what made this project a *workflow* rather than a runtime that hosts
-one -- there was no way to point a stage at somebody else's method.
+`machine.STAGES` and `prompts.compose` between them decided two things no
+deployment could change: which stages run, and that the instructions every
+dispatched agent reads live inside this repo. The second is what made this a
+*workflow* rather than a runtime that hosts one -- there was no way to point an
+agent at somebody else's contract.
 
 What is declarative here, and what is deliberately not:
 
-**Declared** -- the workflow's content. Which stages are enabled, which role
-each dispatches, where that role's instructions come from, and which discipline
-a stage borrows from an installed skill. These are the things that differ
-between "the bundled role protocol", "superpowers", and something a user wrote.
+**Declared** -- what a dispatched agent reads. Which stages are enabled, which
+role each dispatches, and where that role's instructions come from. A caller
+with its own agent-facing protocol points `--workflow` at it and keeps the
+placement, isolation and failover underneath.
 
-**Still code** -- the state machine. `implement` runs worktrees, waves, an
-escalation ladder and a rework loop; `classify` is one line of text this program
-parses. They are not interchangeable, and a manifest that listed them as if they
-were would be a lie that fails on the first non-default workflow. The graph and
-its guards stay authored and versioned, which is the property that makes a run
-replayable.
+**Still code** -- the state machine. `implement` runs worktrees, waves and a
+bounded retry loop against the caller's checks; `integrate` merges and verifies
+at each step. The graph and its guards stay authored and versioned, which is the
+property that makes a run replayable.
 
-So a manifest cannot invent a stage. It can enable one, disable one, point it at
-different instructions, and hand its discipline to a foreign skill -- which is
-exactly what hosting superpowers requires.
+So a manifest cannot invent a stage. It can enable one, disable one, and point
+it at different instructions.
 """
 
 import os
@@ -80,10 +77,10 @@ class Workflow:
         if not isinstance(stages, dict) or not stages:
             raise WorkflowError("%s declares no stages" % path)
         for stage, spec in stages.items():
-            # `review:` with nothing under it parses as None, and every
-            # accessor below then reads it differently -- `enabled` called it
-            # off, `discipline` called it empty. A stage with no body is a
-            # manifest mistake, and refusing it here is the same trade
+            # `integrate:` with nothing under it parses as None, and the
+            # accessors below then disagree about what it means -- `enabled`
+            # reads it as off, everything else as empty. A stage with no body is
+            # a manifest mistake, and refusing it here is the same trade
             # `yamlite` makes: a config that silently parses to the wrong shape
             # is worse than one that will not load.
             if not isinstance(spec, dict):
@@ -128,12 +125,12 @@ class Workflow:
     def _resolve_cards(self):
         """role -> the one card it reads, for every role this manifest names.
 
-        Two stages CAN share a role -- `brainstorm` and `plan` both dispatch the
-        planner -- which made a second declaration silently dead: repointing
-        `plan.card` alone changed nothing, because a first-match lookup let
-        whichever stage came first answer for the role. Rather than pick one
-        quietly, disagreement is refused. A manifest that means two different
-        cards for one role is asking for something this lookup cannot express.
+        Two stages MAY name the same role, and a first-match lookup then made
+        the second declaration silently dead: repointing the later stage's
+        `card` changed nothing, because whichever stage came first answered for
+        the role. Rather than pick one quietly, disagreement is refused. A
+        manifest that means two different cards for one role is asking for
+        something this lookup cannot express.
         """
         seen = {}
         for stage, spec in self.stages.items():
@@ -151,14 +148,11 @@ class Workflow:
                        "; ".join("%s -> %s" % (", ".join(v), k)
                                  for k, v in cards.items())))
             out[role] = next(iter(cards))
-        # Roles a stage dispatches alongside its own. `test-author` is the one
-        # that exists: it runs inside `plan`, before any implementation exists,
-        # which is the property that lets it encode what was ASKED rather than
-        # what was built. It is not a stage, so it is not in `stages` --
-        # and a stage's own card wins over one declared here.
-        for role, spec in (self.data.get("extra_roles") or {}).items():
-            if isinstance(spec, dict) and spec.get("card"):
-                out.setdefault(role, spec["card"])
+        # No `extra_roles` key. It let a manifest declare a card for a role that
+        # was not a stage's own -- `test-author`, which ran inside `plan` -- and
+        # both are gone. It could not be revived by a manifest either: the
+        # machine dispatches exactly the roles its two stages name, so a card
+        # for anything else would be read by nobody.
         return out
 
     def card(self, role):
@@ -186,9 +180,8 @@ class Workflow:
         the graph; a manifest switches a stage off by saying so, and saying
         nothing about one leaves it as the machine has it. This answered False
         for an undeclared stage while `machine.run` only ever asked about
-        declared ones -- two answers to one question, and the disagreement
-        would have surfaced the first time somebody wrote a manifest with no
-        `review:` block and got a review anyway.
+        declared ones -- two answers to one question, which surfaces the first
+        time somebody writes a manifest that omits a stage and gets it anyway.
         """
         spec = self.stages.get(stage)
         if spec is None:
@@ -198,26 +191,24 @@ class Workflow:
     def next_enabled(self, after, terminal="done", order=None):
         """The next stage that will actually run, skipping disabled ones.
 
-        A stage is skipped, never removed: the handlers set their own successor
-        (`_stage_classify` can send the run to `brainstorm` or straight to
-        `plan`), so the machine still decides where it goes and this only says
-        which of those destinations is switched on. Falling off the end is
-        `done` rather than an error, because disabling the tail of a workflow is
-        a legitimate thing to declare.
+        A stage is skipped, never removed: a handler names its own successor, so
+        the machine still decides where a run goes and this only says which of
+        those destinations is switched on. Falling off the end is `done` rather
+        than an error, because disabling the tail of a workflow is a legitimate
+        thing to declare.
 
         `order` is the caller's own stage sequence, and `machine.run` passes
         `STAGES`. Walking the manifest's declared stages alone contradicted
         `enabled()`, which treats an undeclared stage as on: a manifest that
-        declared `review: {enabled: false}` and never mentioned `integrate`
-        skipped review straight to `done`, so the run ended without the stage
-        that writes the patch. The machine owns the graph, so the machine's
-        order is the one to walk.
+        disabled one stage and never mentioned `integrate` skipped straight to
+        `done`, so the run ended without the stage that writes the patch. The
+        machine owns the graph, so the machine's order is the one to walk.
         """
         order = list(order or self.order())
         if after not in order:
             # An id this sequence does not contain has no position in it, so it
             # has no "next". Falling back to the whole list returned the FIRST
-            # stage, which would send a run back to `intake` and around again.
+            # stage, which sends a run back to the beginning and around again.
             return terminal
         rest = order[order.index(after) + 1:]
         for stage in rest:
@@ -225,49 +216,11 @@ class Workflow:
                 return stage
         return terminal
 
-    def discipline(self, stage, companions=None):
-        """The method text for a stage, chosen by what is installed.
-
-        `skill` names a companion; when it is present the `text` is used, and
-        when it is not the `fallback` is. That pair is the whole compatibility
-        story in one place: pointing a stage at `superpowers:brainstorming` is a
-        manifest edit, not a patch to `machine._stage_brainstorm`, which is
-        where this decision used to be hardcoded for exactly one skill.
-        """
-        spec = (self.stages.get(stage) or {}).get("discipline") or {}
-        if not spec:
-            return ""
-        wanted = spec.get("skill")
-        have = bool((companions or {}).get((wanted or "").split(":")[0]))
-        if wanted and not have:
-            return (spec.get("fallback") or "").strip()
-        return (spec.get("text") or spec.get("fallback") or "").strip()
-
-    def criteria(self, stage):
-        """A stage's judgement text, when the manifest supplies one.
-
-        Distinct from `discipline`, which is *method* -- how a role should go
-        about its work -- and is injected beside that role's card. This is the
-        substance of a one-shot question the program asks and parses itself:
-        `classify` has no card to carry it, so the criteria used to be a string
-        constant in `machine.py` that opened "Classify this software task",
-        which is domain policy hardcoded into the machine and exactly what a
-        manifest is for.
-
-        What stays code is the frame around it. `_classified` routes on the two
-        tiers by name, so the vocabulary and the VERDICT line the parser reads
-        are not a manifest's to change -- a workflow that invented a third tier
-        would parse as neither and fall through to the safe default. A manifest
-        moves the judgement, not the question.
-        """
-        return ((self.stages.get(stage) or {}).get("criteria") or "").strip()
-
-    def wants_skill(self, stage):
-        """Which companion a stage would use if it were installed.
-
-        Nothing in the runtime calls this yet: `delegate init` reports which
-        companions ARE installed (`companions.detect`) and not which ones this
-        workflow would take up if they were. The docstring used to say `init`
-        did, which is the kind of claim that reads as a feature.
-        """
-        return ((self.stages.get(stage) or {}).get("discipline") or {}).get("skill")
+    # No `discipline()`, `criteria()` or `wants_skill()`. A manifest could
+    # declare method text for a stage -- borrowed from an installed companion
+    # skill, with a fallback when it was absent -- and the machine never asked
+    # for any of it. That is the right outcome rather than a missing call:
+    # choosing HOW to work is the caller's, and a manifest key that injects
+    # method into an agent's prompt is this program having an opinion about the
+    # caller's craft. What a manifest still moves is which protocol and which
+    # card an agent reads, which is location, not method.

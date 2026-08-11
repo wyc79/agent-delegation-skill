@@ -17,7 +17,7 @@ from . import workflow
 
 
 def schemas_dir():
-    """Where the report and verdict schemas live.
+    """Where the report and subtask schemas live.
 
     The BUNDLED directory, deliberately, and not the workflow in force. The
     report envelope is how this program reads an agent's result -- it is the
@@ -98,6 +98,6 @@ def validate(data, schema):
 def validate_report(data):
     return validate(data, load("report.schema.json"))
 
-
-def validate_verdict(data):
-    return validate(data, load("verdict.schema.json"))
+# No `validate_verdict`. It loaded `verdict.schema.json`, which went with the
+# reviewer that wrote verdicts -- so the function survived its own schema and
+# would have raised FileNotFoundError for anything that called it.

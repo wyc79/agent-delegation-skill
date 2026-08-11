@@ -17,10 +17,16 @@
 # for jobs when the task has none.
 #
 # A manifest cannot invent a stage: the state machine owns the graph
-# (`machine.STAGES`), and this file only says which parts of it run, where a
-# role's instructions live, and what a stage's method is. Naming a stage the
-# machine does not have would read like policy and route nothing, so the two
-# stages below are the two there are.
+# (`machine.STAGES`), and this file only says which parts of it run and where
+# the instructions its agent reads live. Naming a stage the machine does not
+# have would read like policy and route nothing, so the two stages below are
+# the two there are.
+#
+# Nor can it declare METHOD. A `discipline:` key used to let a stage borrow a
+# working style from an installed companion skill; nothing ever read it, and
+# telling a dispatched agent how to work is the caller's business. Point
+# `--workflow` at your own directory to change what an agent READS -- that is
+# location, and it is supported.
 
 name: default
 description: >

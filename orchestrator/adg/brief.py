@@ -4,23 +4,24 @@ Humans never see raw internal artifacts. Everything at a gate is rendered into
 plain language for a competent programmer who has never seen this repo.
 
 The jargon lint is the part with teeth: a brief containing bare protocol tokens
-(AC-2, st-3, dev-1, rung 2, REQUEST_CHANGES) is rejected. Cheap to enforce, and
-it catches the failure mode where a summary is technically accurate and
-completely unreadable.
+(AC-2, st-3, NEEDS_HUMAN) is rejected. Cheap to enforce, and it catches the
+failure mode where a summary is technically accurate and completely unreadable.
 """
 
 import re
 
 # Bare ids that must be expanded on first use, e.g. "the requirement that old
 # saves still load (AC-2)" rather than a naked "AC-2".
+#
+# The list is shorter than it was: `dev-<n>`, `f-<n>`, `rung <n>`,
+# REQUEST_CHANGES and the signal-type names were vocabulary of the role
+# protocol, and a lint for words nothing can emit is a rule that never fires.
+# `AC-<n>` stays because a caller's own acceptance ids reach the brief through
+# the job blocks, and `st-<n>` because job ids do.
 _BARE = [
     (re.compile(r"(?<![\w(])AC-\d+"), "acceptance-criterion id"),
-    (re.compile(r"(?<![\w(])st-\d[\w-]*"), "subtask id"),
-    (re.compile(r"(?<![\w(])dev-\d+"), "deviation id"),
-    (re.compile(r"(?<![\w(])f-\d+"), "finding id"),
-    (re.compile(r"\brung \d+", re.I), "escalation-ladder jargon"),
-    (re.compile(r"\b(REQUEST_CHANGES|ESCALATE_TO_HUMAN|REPLAN|NEEDS_HUMAN)\b"), "verdict enum"),
-    (re.compile(r"\b(test_stuck|scope_overrun|edit_churn|plan_conflict)\b"), "signal name"),
+    (re.compile(r"(?<![\w(])st-\d[\w-]*"), "job id"),
+    (re.compile(r"\b(ESCALATE_TO_HUMAN|NEEDS_HUMAN)\b"), "status enum"),
 ]
 
 
@@ -35,8 +36,23 @@ def lint(text):
             before = text[max(0, m.start() - 1):m.start()]
             if before == "(":
                 continue
+            # And allowed as a table cell of its own. The rule is about PROSE
+            # that leans on an id the reader has never been told the meaning
+            # of; an identifier column is the one place a bare id is the
+            # clearest thing to write, and there is nothing to expand it into.
+            if _is_own_cell(text, m.start(), m.end()):
+                continue
             problems.append("%s used bare: %r -- explain it in words first" % (label, token))
     return problems
+
+
+def _is_own_cell(text, start, end):
+    """Is this match the entire contents of a markdown table cell?"""
+    left = text.rfind("|", 0, start)
+    right = text.find("|", end)
+    if left < 0 or right < 0 or "\n" in text[left:start] or "\n" in text[end:right]:
+        return False
+    return not text[left + 1:start].strip() and not text[end:right].strip()
 
 
 def _files_by_area(files, limit=12):
@@ -52,6 +68,46 @@ def _files_by_area(files, limit=12):
         more = "" if len(names) <= 4 else " (+%d more)" % (len(names) - 4)
         lines.append("- **%s** — %s%s" % (area, shown, more))
     return lines
+
+
+def _by_job(state, limit=8):
+    """What each job touched, and what it touched outside the boundary it was
+    given.
+
+    This is the whole of what `delegate` measures. `_finish_subtask` computes
+    `scope_violations` per job and writes it into task.json, and it reached the
+    run's stdout and nothing else -- so the brief listed every changed file
+    flattened into one alphabetical heap, with no way to tell which job wrote
+    what or whether any of it was out of bounds. Meanwhile the paragraph the
+    merge gate prints beside it points at "the scope column above" as the
+    evidence a human is supposed to weigh.
+
+    A caller reading a brief is deciding whether to land a change built by
+    agents it never saw. "st-2 also wrote build.gradle" is the single most
+    useful sentence in that decision, and it was being computed and thrown away.
+    """
+    subs = [s for s in (state.get("subtasks") or []) if s.get("actual_files")]
+    if not subs:
+        return []
+    rows = ["| Job | Files | Outside its scope |", "|---|---|---|"]
+    for sub in subs[:limit]:
+        files = sub.get("actual_files") or []
+        out = set(sub.get("scope_violations") or [])
+        shown = ", ".join("`%s`" % f for f in files[:6])
+        if len(files) > 6:
+            shown += " (+%d more)" % (len(files) - 6)
+        rows.append("| %s | %s | %s |" % (
+            sub.get("id", "?"), shown,
+            ", ".join("**`%s`**" % f for f in sorted(out)) if out else "—"))
+    if len(subs) > limit:
+        rows.append("| … | %d more jobs | |" % (len(subs) - limit))
+    flagged = sorted({f for s in subs for f in (s.get("scope_violations") or [])})
+    if flagged:
+        rows += ["",
+                 "%d file(s) were written outside the scope their job declared. "
+                 "Nothing was reverted — this is a measurement, and what to do "
+                 "about it is yours." % len(flagged)]
+    return rows
 
 
 def _cost_section(state):
@@ -115,24 +171,6 @@ def _cost_section(state):
     return md
 
 
-# An entry, not just bytes in the file. The log opens with a heading, prose and
-# a fenced example -- `templates/deviations.md` is what agents are told to start
-# from -- so "the file is non-empty" says nothing about whether anything was
-# logged. The old guard asked whether the file failed to start with `#`, which
-# the template always does: every task that used the template hid every
-# deviation from every brief, however many were appended below.
-#
-# The entry shape is the one `references/deviations.md` documents and the report
-# schema's id pattern agrees with: `dev-<subtask-or-role>-<n> | ...` at the start
-# of a line. The template's own example carries `<placeholders>` inside the
-# angle brackets, so it cannot be mistaken for a real entry.
-_DEVIATION = re.compile(r"(?m)^\s*(?:[-*]\s*)?dev-[a-z0-9][a-z0-9-]*\s*\|")
-
-
-def _has_deviation_entry(text):
-    return bool(_DEVIATION.search(text or ""))
-
-
 def render(task, kind, decision_text, files=(), verify=None, extra=None):
     """Build a gate brief. Decision first: it is what the reader must act on."""
     state = task.state
@@ -156,7 +194,14 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
             md.append("- The %s step %s." % (h.get("role", "agent"), outcome))
         md.append("")
 
-    if files:
+    # Per job when the run got that far, by area otherwise. The paused brief is
+    # the "otherwise": it is written from `_quota_park` with the union of what
+    # anything managed before the seats went dark, and a scope column there
+    # would be reporting a boundary against work that is not finished.
+    per_job = _by_job(state) if kind == "merge" else []
+    if per_job:
+        md += ["## What changed", ""] + per_job + [""]
+    elif files:
         md += ["## What changed", ""] + _files_by_area(list(files)) + [""]
 
     if verify is not None:
@@ -168,8 +213,11 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
             md.append("- Failed: `%s`" % f["cmd"])
         md.append("")
 
-    if _has_deviation_entry(task.read_text("deviations.md", "")):
-        md += ["## What didn't go to plan", "", "See the deviations log for details.", ""]
+    # No "what didn't go to plan" section. It rendered when `deviations.md`
+    # held an entry, and the protocol that told agents to append one -- with the
+    # template and the reference describing the format -- is gone. A departure
+    # from the plan now lands where the caller reads it: the job's own report,
+    # in `summary` and `signals`.
 
     md += _cost_section(state)
 
@@ -182,13 +230,17 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
     return "\n".join(md)
 
 
-def write(task, kind, decision_text, polish=None, **kw):
-    """Render, optionally rewrite in plain language, lint, and persist. A brief
-    that fails the lint is still written -- the human still needs it -- but the
-    problems are surfaced rather than swallowed."""
+def write(task, kind, decision_text, **kw):
+    """Render, lint, and persist. A brief that fails the lint is still written
+    -- the human still needs it -- but the problems are surfaced rather than
+    swallowed.
+
+    There is no rewrite step. A `polish` callable used to run the rendered text
+    through a model before linting it, and nothing has passed one since the
+    reporter role was removed: a brief is assembled from the record, and paying
+    a model to restate the record is the kind of step this program leaves to
+    whoever is reading."""
     text = render(task, kind, decision_text, **kw)
-    if polish:
-        text = polish(text)
     problems = lint(text)
     task.write_text("brief.md", text)
     return text, problems

@@ -20,7 +20,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from adg import (brief, cli, cooldown, limits, prompts, router, runtime, schema,
-                 store, verify, winnow, workflow as wf, yamlite)
+                 store, verify, workflow as wf, yamlite)
 from adg.machine import STAGES, Halt, Orchestrator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -148,7 +148,7 @@ class TestLimits(unittest.TestCase):
     def setUp(self):
         self.t = TempRepo()
         self.full = {"max_cost_usd": 10, "max_attempts_per_subtask": 3,
-                     "max_review_loops": 2, "max_replans": 1, "max_parallel_agents": 2}
+                     "max_parallel_agents": 2}
 
     def tearDown(self):
         self.t.close()
@@ -314,9 +314,9 @@ class TestChannelPreference(unittest.TestCase):
         p = os.path.join(d, "r.yaml")
         with open(p, "w") as fh:
             fh.write("""models:
-  worker: {tier: t2, coding: 5, tool: 5, enrolled_roles: [implementer]}
+  worker: {tier: t2, coding: 5, tool: 5, enrolled: true}
 profiles:
-  implementer: {require: {}, weights: {coding: 3}}
+  worker: {require: {}, weights: {coding: 3}}
 channels:
   a-seat:
     type: subscription
@@ -335,14 +335,15 @@ class TestRouter(unittest.TestCase):
         self.r = router.Router(self.reg)
 
     def test_ultra_tier_unreachable_by_default(self):
-        for role in ("planner", "implementer", "reviewer"):
+        for role in ("implementer", "integrator"):
             for c in self.r.candidates(role):
                 self.assertNotEqual(c.model, "ultra-reasoner")
 
     def test_enrollment_alone_does_not_unlock_ultra(self):
-        self.reg["models"]["ultra-reasoner"]["enrolled_roles"] = ["planner"]
+        self.reg["models"]["ultra-reasoner"]["enrolled"] = True
         self.reg["channels"]["claude-seat"]["exposes"].append("ultra-reasoner")
-        picked = [c.model for c in self.r.candidates("planner")]
+        picked = [c.model for c in self.r.candidates("implementer",
+                                                     ceiling={"max_tier": "t2"})]
         self.assertNotIn("ultra-reasoner", picked, "ceiling must still block it")
 
     def test_both_switches_unlock_ultra(self):
@@ -368,9 +369,9 @@ class TestRouter(unittest.TestCase):
 
     def test_bad_ceiling_refuses_rather_than_defaulting_open(self):
         with self.assertRaises(router.RoutingError):
-            self.r.candidates("planner", ceiling={"max_tier": "unlimited"})
+            self.r.candidates("implementer", ceiling={"max_tier": "unlimited"})
 
-    def test_the_implementer_rung_survives_a_drawn_down_seat(self):
+    def test_the_workhorse_survives_a_drawn_down_seat(self):
         # The cheap model has a second seat and the strong one does not, so a
         # filling window widens the gap rather than closing it.
         for u in (0.5, 0.9):
@@ -387,7 +388,7 @@ class TestRouter(unittest.TestCase):
 
     def test_boosting_a_declared_requirement_still_takes_the_higher_floor(self):
         # The original behaviour, which must survive: require 4, boost 5 -> 5.
-        picked = [c.model for c in self.r.candidates("reviewer", boost={"reasoning": 5})]
+        picked = [c.model for c in self.r.candidates("implementer", boost={"reasoning": 5})]
         self.assertEqual(picked, ["opus-class-strong"])
 
 
@@ -416,7 +417,7 @@ class TestSchema(unittest.TestCase):
 
 class TestBriefLint(unittest.TestCase):
     def test_bare_jargon_is_caught(self):
-        problems = brief.lint("We satisfied AC-2 and st-3 escalated to rung 2.")
+        problems = brief.lint("We satisfied AC-2 and st-3 ended NEEDS_HUMAN.")
         self.assertGreaterEqual(len(problems), 3)
 
     def test_expanded_ids_are_allowed(self):
@@ -424,9 +425,65 @@ class TestBriefLint(unittest.TestCase):
                  "save-migration step (st-3).")
         self.assertEqual(brief.lint(clean), [])
 
+    def test_an_id_column_is_not_jargon(self):
+        """The rule is about prose leaning on an id the reader was never told
+        the meaning of. An identifier column has nothing to expand it into, and
+        linting it would mean the scope table could not name its own jobs."""
+        self.assertEqual(brief.lint("| Job | Files |\n|---|---|\n| st-3 | `a.py` |"), [])
+
+    def test_the_exemption_does_not_cover_prose_inside_a_row(self):
+        problems = brief.lint("| Job | Note |\n|---|---|\n| st-3 | blocked on st-4 |")
+        self.assertTrue(problems, "a bare id in a sentence escaped through a table")
+
+
+class TestBriefCarriesTheScopeMeasurement(unittest.TestCase):
+    """Scope is the whole of what `delegate` measures, and it has to reach the
+    human. It was computed per job into task.json, logged to the run's stdout,
+    and then dropped: the brief flattened every changed file into one
+    alphabetical list with no job column and no way to see that a file was
+    written outside the boundary its job declared — while the paragraph printed
+    beside it pointed at "the scope column above" as the evidence to weigh.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def _brief(self, subtasks):
+        task = _task(self.t.repo, "T-SC", "# t\n\ndo it\n",
+                     self.reg["policy"]["limits"])
+        task.update(subtasks=subtasks)
+        return brief.render(task, "merge", "Land it?")
+
+    def test_a_violation_is_named_against_the_job_that_wrote_it(self):
+        out = self._brief([
+            {"id": "st-1-a", "actual_files": ["a.py", "build.gradle"],
+             "scope_violations": ["build.gradle"]},
+            {"id": "st-2-b", "actual_files": ["b.py"], "scope_violations": []},
+        ])
+        self.assertIn("Outside its scope", out, "no scope column")
+        row = [l for l in out.splitlines() if l.startswith("| st-1-a")][0]
+        self.assertIn("build.gradle", row.split("|")[3],
+                      "the violation is not attributed to the job that wrote it")
+        clean = [l for l in out.splitlines() if l.startswith("| st-2-b")][0]
+        self.assertIn("—", clean.split("|")[3],
+                      "a job that stayed in scope is not shown as clean")
+        self.assertIn("Nothing was reverted", out,
+                      "the brief implies the violation was undone")
+
+    def test_a_clean_run_says_so_without_a_warning(self):
+        out = self._brief([{"id": "st-1-a", "actual_files": ["a.py"],
+                            "scope_violations": []}])
+        self.assertIn("| st-1-a", out)
+        self.assertNotIn("were written outside", out,
+                         "a clean run is reported as if something escaped")
+
 
 # ---------------------------------------------------------------------------
-# End to end: plan -> isolated implementation -> verify -> review -> integrate
+# End to end: supplied jobs -> isolated implementation -> verify -> integrate
 # ---------------------------------------------------------------------------
 
 PLAN_MD = """# Plan
@@ -571,8 +628,6 @@ class TestClosedGaps(unittest.TestCase):
             def prompt(self, session, text, timeout):
                 r = runtime.MockAdapter.prompt(self, session, text, timeout)
                 r["usage"], r["elapsed_ms"] = {"in": 100, "out": 20}, 4242
-                if session.handle["role"] == "classifier":
-                    r["output"] = "VERDICT: SIMPLE -- tiny"
                 return r
 
         Orchestrator(task, self.reg, Metered({"implementer": lambda e, c: None}),
@@ -589,8 +644,6 @@ class TestClosedGaps(unittest.TestCase):
             def prompt(self, session, text, timeout):
                 r = runtime.MockAdapter.prompt(self, session, text, timeout)
                 r["cost_usd"] = 0.6
-                if session.handle["role"] == "classifier":
-                    r["output"] = "VERDICT: SIMPLE -- tiny"
                 return r
 
         script = {"implementer": lambda env, cwd: None}
@@ -617,19 +670,20 @@ class TestClosedGaps(unittest.TestCase):
                               capture_output=True, text=True).stdout
         self.assertEqual(len(head.strip().splitlines()), 1, "it merged to main")
 
-    # --- test author ------------------------------------------------------
-    def test_simple_tasks_do_not_pay_for_a_test_author(self):
+    # --- what a run is allowed to pay for ---------------------------------
+    def test_a_run_dispatches_nothing_but_the_work(self):
+        """The wrapper property, asserted where it can regress: an agent call
+        is money, and every role this once had -- planner, test-author,
+        classifier, reviewer, reporter -- was a call the caller did not ask
+        for. A clean run buys implementer turns and nothing else."""
+        script, _ = TestEndToEnd._script(self)[0], None
         task = _task(self.t.repo, "T-C3", "# t\n\nAdd subtract\n", self.pol)
-
-        class A(runtime.MockAdapter):
-            def prompt(self, session, text, timeout):
-                if session.handle["role"] == "classifier":
-                    return {"settled": "idle", "output": "VERDICT: SIMPLE -- tiny", "code": 0}
-                return runtime.MockAdapter.prompt(self, session, text, timeout)
-
-        a = A({"implementer": lambda env, cwd: None})
-        Orchestrator(task, self.reg, a, lambda k, t: True, log=lambda *_: None).run()
-        self.assertNotIn("test-author", [h["role"] for h in task.state["delegation_history"]])
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=lambda *_: None).run()
+        self.assertEqual(status, "done")
+        roles = {h["role"] for h in task.state["delegation_history"]}
+        self.assertEqual(roles, {"implementer"},
+                         "a run bought turns nobody asked for: %s" % sorted(roles))
 
     def _e2e_script(self):
         return TestEndToEnd._script(self)
@@ -703,7 +757,7 @@ class TestParallelism(unittest.TestCase):
         self.assertEqual(len(orch._wave(orch.task.state["subtasks"])), 1)
 
     def test_a_plan_whose_dependencies_can_never_be_met_parks_and_says_why(self):
-        """The planner writes `depends_on`, so a dependency on an id it never
+        """The caller writes `depends_on`, so a dependency on an id it never
         defined -- or a cycle -- is an ordinary bad plan, not a bug in here.
 
         Nothing is ready, so the wave is empty, and indexing it crashed the run:
@@ -761,10 +815,6 @@ class TestParallelEndToEnd(unittest.TestCase):
         import threading
         seen_cwds, lock = set(), threading.Lock()
 
-        def planner(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
-                fh.write(self.PLAN)
-
         def implementer(env, cwd):
             with lock:
                 seen_cwds.add(cwd)
@@ -773,16 +823,7 @@ class TestParallelEndToEnd(unittest.TestCase):
             with open(os.path.join(cwd, "%s.py" % name), "w") as fh:
                 fh.write("VALUE = %r\n" % name)
 
-        def reviewer(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
-                                   "reports", "review-reviewer.json"), "w") as fh:
-                json.dump({"verdict": "APPROVE",
-                           "ac_table": [{"ac": "AC-1", "status": "met"},
-                                        {"ac": "AC-2", "status": "met"}],
-                           "findings": []}, fh)
-
-        script = {"planner": planner, "implementer": implementer,
-                  "test-author": lambda e, c: None, "reviewer": reviewer}
+        script = {"implementer": implementer}
         # A parallel test pins its own concurrency rather than inheriting the
         # registry's: when the registry shipped max_parallel_agents: 1, every
         # one of these silently became a sequential run that still passed, and
@@ -809,18 +850,13 @@ class TestParallelEndToEnd(unittest.TestCase):
         self.assertIn("beta.py", patch)
 
     def test_a_failing_subtask_does_not_silently_land_its_sibling(self):
-        def planner(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
-                fh.write(self.PLAN)
-
         def implementer(env, cwd):
             if "st-2" in _tree_name(cwd):
                 raise RuntimeError("beta agent exploded")
             with open(os.path.join(cwd, "alpha.py"), "w") as fh:
                 fh.write("VALUE = 1\n")
 
-        script = {"planner": planner, "implementer": implementer,
-                  "test-author": lambda e, c: None}
+        script = {"implementer": implementer}
         # A parallel test pins its own concurrency rather than inheriting the
         # registry's: when the registry shipped max_parallel_agents: 1, this
         # silently became a sequential run that still passed, and a future
@@ -920,21 +956,6 @@ class TestSubtaskContinuity(unittest.TestCase):
                     escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
                     max_parallel_agents=cap)
 
-    def _planner(self, plan):
-        def planner(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
-                fh.write(plan)
-        return planner
-
-    @staticmethod
-    def _approve(env, cwd):
-        _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
-            "stage": "review", "role": "reviewer", "status": "complete",
-            "summary": "ok", "evidence": {"tests": "ok"},
-            "role_data": {"verdict": {"verdict": "APPROVE",
-                                      "ac_table": [{"ac": "AC-1", "status": "met"}],
-                                      "findings": []}}})
-
     def _log(self, repo_branch):
         return subprocess.run(["git", "log", "--oneline", repo_branch],
                               cwd=self.t.repo, capture_output=True, text=True).stdout
@@ -968,9 +989,7 @@ class TestSubtaskContinuity(unittest.TestCase):
                 "subtask": "st-2-beta", "status": "complete",
                 "summary": "did beta", "evidence": {"tests": "ok"}})
 
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "reviewer": self._approve}
+        script = {"implementer": implementer}
         task = _task(self.t.repo, "T-SC1", "# t\n\nAdd two things\n",
                                  self._pol(2), plan=self.INDEPENDENT)
         logs = []
@@ -1032,9 +1051,7 @@ class TestSubtaskContinuity(unittest.TestCase):
                 "status": "complete", "summary": "used lib",
                 "evidence": {"tests": "ok"}})
 
-        script = {"planner": self._planner(self.CHAINED),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "reviewer": self._approve}
+        script = {"implementer": implementer}
         task = _task(self.t.repo, "T-SC2", "# t\n\nAdd three things\n",
                                  self._pol(3), plan=self.CHAINED)
         logs = []
@@ -1054,15 +1071,11 @@ class TestSubtaskContinuity(unittest.TestCase):
 
     def test_the_second_sequential_subtask_is_credited_only_with_its_own_files(self):
         """A subtask working in the integration worktree measured its diff
-        against the *task* base, which still holds the Test Author's commit and
-        every earlier subtask's — so the second one in a sequential run was
-        credited with its predecessors' files and reported them as scope
-        violations it never committed. Waves of one are not exotic: any
-        dependency chain or overlapping scope produces them at any cap."""
-        def test_author(env, cwd):
-            with open(os.path.join(cwd, "test_requirements.py"), "w") as fh:
-                fh.write("def test_it():\n    pass\n")
-
+        against the *task* base, which still holds every earlier subtask's
+        commit — so the second one in a sequential run was credited with its
+        predecessors' files and reported them as scope violations it never
+        committed. Waves of one are not exotic: any dependency chain or
+        overlapping scope produces them at any cap."""
         def implementer(env, cwd):
             # Cap 1, so both run in the same integration worktree: which subtask
             # this is comes from the prompt, not the directory name.
@@ -1075,9 +1088,7 @@ class TestSubtaskContinuity(unittest.TestCase):
                 "status": "complete", "summary": "did %s" % sub,
                 "evidence": {"tests": "ok"}})
 
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": test_author,
-                  "reviewer": self._approve}
+        script = {"implementer": implementer}
         task = _task(self.t.repo, "T-SC5", "# t\n\nAdd two things\n",
                                  self._pol(1), plan=self.INDEPENDENT)
         logs = []
@@ -1112,9 +1123,7 @@ class TestSubtaskContinuity(unittest.TestCase):
                 "subtask": "st-2-beta", "status": "complete",
                 "summary": "nothing to do", "evidence": {"tests": "ok"}})
 
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "reviewer": self._approve}
+        script = {"implementer": implementer}
         task = _task(self.t.repo, "T-SC6", "# t\n\nAdd two things\n",
                                  self._pol(1), plan=self.INDEPENDENT)
         logs = []
@@ -1127,7 +1136,7 @@ class TestSubtaskContinuity(unittest.TestCase):
         self.assertFalse(os.path.exists(task.file("integrate.patch")))
 
     def test_a_reused_worktree_is_brought_up_to_the_integration_branch(self):
-        """`_catch_up`, tested directly now that no reviewer exists to drive a
+        """`_catch_up`, tested directly now that nothing drives a
         rework. The mechanism still matters: a job re-dispatched into a worktree
         it already owns — a resume, or a second wave — would otherwise run
         against a snapshot from before its siblings landed, so its checks would
@@ -1183,9 +1192,8 @@ class TestSubtaskContinuity(unittest.TestCase):
                 "status": "complete", "summary": "did %s" % sub,
                 "evidence": {"tests": "ok"}})
 
-        script = {"planner": self._planner(self.CONFLICTING),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "integrator": lambda e, c: None, "reviewer": self._approve}
+        script = {"implementer": implementer,
+                  "integrator": lambda e, c: None}
         task = _task(self.t.repo, "T-SCD", "# t\n\nAdd three things\n",
                                  self._pol(3), plan=self.CONFLICTING)
         logs = []
@@ -1250,9 +1258,8 @@ class TestSubtaskContinuity(unittest.TestCase):
         sh(["git", "add", "-A"], self.t.repo)
         sh(["git", "commit", "-qm", "combination check"], self.t.repo)
 
-        script = {"planner": self._planner(self.CONFLICTING),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "integrator": lambda e, c: None, "reviewer": self._approve}
+        script = {"implementer": implementer,
+                  "integrator": lambda e, c: None}
         task = _task(self.t.repo, "T-SCE", "# t\n\nAdd three things\n",
                                  self._pol(3), plan=self.CONFLICTING)
         logs = []
@@ -1614,14 +1621,13 @@ class TestSecondColdRead(unittest.TestCase):
 
 
 class TestDispatchWorkflow(unittest.TestCase):
-    """delegate as a general wrapper: the caller brings the decomposition.
+    """delegate as a wrapper: the caller brings the decomposition.
 
-    The full protocol is one use. The other is execution only — a skill that
-    has already designed the work wants N jobs placed on N seats, in isolated
-    worktrees, with metering and failover underneath, and does not want a
-    planner second-guessing it or a reviewer it will not read. `--plan` plus
-    `workflows/dispatch` is that, and it needed no new stage: the machine
-    already recovers subtasks from plan.md when the state has none.
+    A skill that has already designed the work wants N jobs placed on N seats,
+    in isolated worktrees, with metering and failover underneath — and nothing
+    second-guessing the decomposition or reviewing a result it will not read.
+    `--plan` is that, and it needed no new stage: the machine already recovers
+    jobs from plan.md when the state has none.
     """
 
     PLAN = """# Supplied by the caller
@@ -1669,7 +1675,7 @@ class TestDispatchWorkflow(unittest.TestCase):
         # the run with the work stranded on branches nobody merges.
         self.assertEqual(w.next_enabled("implement", order=STAGES), "integrate")
 
-    def test_a_supplied_plan_is_executed_with_no_planner_or_reviewer(self):
+    def test_a_supplied_plan_is_executed_and_nothing_else_is_dispatched(self):
         wf.use(self.dispatch)
         dispatched = []
 
@@ -1686,7 +1692,8 @@ class TestDispatchWorkflow(unittest.TestCase):
 
         def refuse(role):
             def fn(env, cwd):
-                raise AssertionError("%s ran under the dispatch workflow" % role)
+                raise AssertionError("%s was dispatched; the caller asked for "
+                                     "jobs, not a workflow" % role)
             return fn
 
         task = _task(self.t.repo, "T-DIS", "# t\n\ntwo things\n",
@@ -1697,8 +1704,10 @@ class TestDispatchWorkflow(unittest.TestCase):
             task, self.reg,
             runtime.MockAdapter({"implementer": implementer,
                                  "planner": refuse("planner"),
+                                 "test-author": refuse("test-author"),
                                  "reviewer": refuse("reviewer"),
-                                 "classifier": refuse("classifier")}),
+                                 "classifier": refuse("classifier"),
+                                 "reporter": refuse("reporter")}),
             lambda k, t: True, log=logs.append).run()
 
         self.assertEqual(status, "done", "\n".join(logs))
@@ -1710,7 +1719,7 @@ class TestDispatchWorkflow(unittest.TestCase):
         patch = task.read_text("integrate.patch", "")
         self.assertIn("alpha.py", patch)
         self.assertIn("beta.py", patch)
-        # And the work is accounted for exactly as under the full protocol.
+        # And the work is accounted for per job.
         by_id = {s["id"]: s for s in task.state["subtasks"]}
         self.assertEqual(by_id["st-1-alpha"]["actual_files"], ["alpha.py"])
         self.assertEqual(by_id["st-2-beta"]["scope_violations"], [])
@@ -1805,24 +1814,9 @@ class TestWaveRaces(unittest.TestCase):
         self.t.close()
 
     def _run(self, implementer, task_id="T-W", plan=None):
-        def planner(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
-                fh.write(self.PLAN)
-
-        def reviewer(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
-                                   "reports", "review-reviewer.json"), "w") as fh:
-                json.dump({"stage": "review", "role": "reviewer", "status": "complete",
-                           "summary": "ok", "evidence": {"tests": "ok"},
-                           "role_data": {"verdict": {"verdict": "APPROVE",
-                                                     "ac_table": [{"ac": "AC-1",
-                                                                   "status": "met"}],
-                                                     "findings": []}}}, fh)
-
         task = _task(self.t.repo, task_id, "# t\n\nAdd three things\n",
                                  self.pol, plan=plan or self.PLAN)
-        script = {"planner": planner, "implementer": implementer,
-                  "test-author": lambda e, c: None, "reviewer": reviewer}
+        script = {"implementer": implementer}
         logs = []
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=logs.append).run()
@@ -1875,10 +1869,9 @@ class TestWaveRaces(unittest.TestCase):
 
         task = _task(self.t.repo, "T-W1", "# t\n\nAdd things\n", self.pol, plan=self.PLAN)
         logs = []
-        status = Interleaved(task, self.reg, runtime.MockAdapter(
-            {"planner": planner, "implementer": implementer,
-             "test-author": lambda e, c: None}),
-            lambda k, t: True, log=logs.append).run()
+        status = Interleaved(task, self.reg,
+                             runtime.MockAdapter({"implementer": implementer}),
+                             lambda k, t: True, log=logs.append).run()
 
         self.assertEqual(status, "needs_human",
                          "an escalating subtask was absorbed by its sibling\n"
@@ -2005,10 +1998,9 @@ class TestWaveRaces(unittest.TestCase):
 
         task = _task(self.t.repo, "T-W11", "# t\n\nAdd things\n", self.pol, plan=PLAN)
         logs = []
-        status = Orchestrator(task, self.reg, runtime.MockAdapter(
-            {"planner": planner, "implementer": implementer,
-             "test-author": lambda e, c: None}),
-            lambda k, t: True, log=logs.append).run()
+        status = Orchestrator(task, self.reg,
+                              runtime.MockAdapter({"implementer": implementer}),
+                              lambda k, t: True, log=logs.append).run()
 
         joined = "\n".join(logs)
         self.assertEqual(status, "needs_human", joined)
@@ -2045,14 +2037,9 @@ class TestWaveRaces(unittest.TestCase):
         self.assertEqual(len(orch._wave(task.state["subtasks"])), 1)
 
     def test_scope_is_measured_against_the_base_not_the_checkpoint(self):
-        # base_commit was unset on the wave path whenever the test author did
-        # not run, so every diff was taken against a HEAD that already
-        # contained the work: nothing ever looked changed.
-        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
-            fh.write('fast:\n  - "python3 -c \'print(1)\'"\ntest_author: never\n')
-        sh(["git", "add", "-A"], self.t.repo)
-        sh(["git", "commit", "-qm", "no test author"], self.t.repo)
-
+        # base_commit was unset on the wave path, so every diff was taken
+        # against a HEAD that already contained the work: nothing ever looked
+        # changed. `setUp` already committed the checks this needs.
         def implementer(env, cwd):
             sub = os.path.basename(cwd.rstrip("/")).split("-", 2)[-1]   # st-N-name
             name = sub.split("-")[-1]
@@ -2063,8 +2050,6 @@ class TestWaveRaces(unittest.TestCase):
                 "status": "complete", "summary": "ok", "evidence": {"tests": "ok"}})
 
         status, task, logs = self._run(implementer, task_id="T-W5")
-        self.assertNotIn("test-author",
-                         [h["role"] for h in task.state["delegation_history"]])
         # Per subtask, not the union: with the defect the *wave* members record
         # nothing while a later sequential subtask records everything, so a
         # union assertion passes while the guarantee is broken.
@@ -2091,17 +2076,19 @@ class TestRuntimeSurfaces(unittest.TestCase):
         h.notify("merge", "land it?")
         self.assertIn("notification", calls)
 
-    def test_text_reply_roles_bypass_panes(self):
-        # A pane renders on the alternate screen, so reading it back gives TUI
-        # chrome instead of the "VERDICT: ..." line the orchestrator parses.
+    def test_panes_off_bypasses_herdr_entirely(self):
+        """`--no-panes` is what trades the visible agents back for cost
+        accounting, so it has to reach the adapter rather than only the label:
+        a pane session reports no cost and `max_cost_usd` cannot bind while one
+        is open."""
         class H(runtime.HerdrAdapter):
             def _cli(self, args, check=True):
-                raise AssertionError("classifier must not open a pane")
+                raise AssertionError("panes are off; herdr must not be called")
 
             def can_run(self, kind):
                 return True        # routing is the subject; no vendor CLI needed
-        h = H(workspace="w1")
-        s = h.start_agent("classifier", "claude", "/tmp", {})
+        s = H(workspace="w1", panes=False).start_agent(
+            "implementer", "claude", "/tmp", {})
         self.assertFalse((s.handle or {}).get("herdr"))
 
     def test_working_roles_do_get_a_pane(self):
@@ -2400,6 +2387,104 @@ class TestResume(unittest.TestCase):
                          "the bad stage was written before it was checked")
 
 
+# One provider exposing every band -- the deployment `init` has to tell a
+# caller not to delegate on.
+ONE_SEAT = """version: 1
+models:
+  fast-cheap: {tier: t1, reasoning: 2, coding: 3, adherence: 3, tool: 3, speed: 5, ctx: 1000000, cost_out: 1.5, enrolled: true}
+  balanced-coder: {tier: t2, reasoning: 4, coding: 5, adherence: 4, tool: 5, speed: 4, ctx: 200000, cost_out: 15, enrolled: true}
+  opus-class-strong: {tier: t3, reasoning: 5, coding: 5, adherence: 4, tool: 5, speed: 2, ctx: 200000, cost_out: 75, enrolled: true}
+profiles:
+  worker:
+    require: {coding: 3, tool: 3}
+    weights: {coding: 3, adherence: 2, speed: 1}
+    cost_sensitivity: high
+channels:
+  claude-seat:
+    type: subscription
+    adapter: local
+    agent_kind: claude
+    exposes: [opus-class-strong, balanced-coder, fast-cheap]
+    quota: {window: 5h, est_capacity: 40}
+policy:
+  escalation_ceiling: {max_tier: t3}
+  limits:
+    max_cost_usd: 15
+    max_attempts_per_subtask: 8
+    max_parallel_agents: 3
+    human_approval_required: [merge]
+"""
+
+
+class TestInit(unittest.TestCase):
+    """`init` is the front door, and the skill sends callers here to make one
+    decision: is there more than one seat? Nothing tested it, and it drifted
+    into answering a different question wrongly — it printed a per-ROLE table
+    naming planner, test-author and reviewer, which no stage dispatches, and
+    every row resolved to the same seat because roles stopped choosing models.
+    A caller reading it would conclude one provider and stop delegating on a
+    deployment with two.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def _init(self, registry=REGISTRY):
+        import io
+        import contextlib
+        args = argparse.Namespace(repo=self.t.repo, registry=registry)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_init(args)
+        return buf.getvalue()
+
+    def test_it_prints_the_tier_table_the_docs_promise(self):
+        out = self._init()
+        for tier in router.TIERS:
+            self.assertIn(tier, out, "no row for %s" % tier)
+        for model in ("fast-cheap", "balanced-coder", "opus-class-strong"):
+            self.assertIn(model, out, "%s serves a band and is not named" % model)
+        for gone in ("planner", "test-author", "reviewer"):
+            self.assertNotIn(gone, out,
+                             "%r is offered a seat and is never dispatched" % gone)
+
+    def test_it_says_outright_whether_delegating_is_worth_it(self):
+        """The decision, not the raw table. A caller that has to derive it from
+        three rows is a caller that gets it wrong."""
+        self.assertIn("2 seats serve these tiers", self._init())
+
+        one = os.path.join(self.t.dir, "one-seat.yaml")
+        with open(one, "w", encoding="utf-8") as fh:
+            fh.write(ONE_SEAT)
+        out = self._init(one)
+        self.assertIn("Every tier resolves to claude-seat", out)
+        self.assertIn("nowhere to fail over", out)
+
+    def test_the_unenrolled_list_reads_the_key_the_registry_writes(self):
+        """It read `enrolled_roles`, which the registry stopped having when
+        roles stopped choosing models — so every model, including the three
+        that serve the three bands printed directly above, was reported as
+        deliberately not enrolled."""
+        out = self._init()
+        self.assertIn("ultra-reasoner", out.split("not enrolled:")[1],
+                      "the one model that really is off is not listed")
+        for on in ("fast-cheap", "balanced-coder", "opus-class-strong"):
+            self.assertNotIn(on, out.split("not enrolled:")[1],
+                             "%s is enrolled and reported as not" % on)
+
+    def test_it_writes_nothing(self):
+        """There is no state for it to save. It used to write a `config.json`
+        holding the detected companion skills and chaff scanner beside a
+        registry path, and nothing ever read the file back."""
+        self._init()
+        self.assertFalse(os.path.exists(
+            os.path.join(store.project_dir(self.t.repo), "config.json")))
+
+
 class TestStatusReadsTheBreaker(unittest.TestCase):
     """`park` records why a run stopped; the breaker file records whether the
     seat is still out. `_quota_guard` was taught the difference and `status`
@@ -2518,195 +2603,6 @@ class TestRoundVersioning(unittest.TestCase):
 
     def tearDown(self):
         self.t.close()
-
-class TestWinnow(unittest.TestCase):
-    """code-winnow is referenced, never vendored: a stale copy that reports
-    nothing looks exactly like a clean scan."""
-
-    def test_absent_scanner_degrades_loudly_not_silently(self):
-        import tempfile
-        empty = tempfile.mkdtemp()          # a machine with no skills installed
-        prev = os.environ.get("HOME")
-        os.environ["HOME"] = empty
-        try:
-            self.assertIsNone(winnow.find(empty, configured="/nope/scan.py"))
-        finally:
-            if prev is not None:
-                os.environ["HOME"] = prev
-            shutil.rmtree(empty, ignore_errors=True)
-
-    def test_explicit_path_and_env_override_win(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        fake = os.path.join(d, "scan.py")
-        open(fake, "w").close()
-        self.assertEqual(winnow.find("/nonexistent", configured=fake), fake)
-        os.environ[winnow.ENV_OVERRIDE] = fake
-        try:
-            self.assertEqual(winnow.find("/nonexistent"), fake)
-        finally:
-            del os.environ[winnow.ENV_OVERRIDE]
-        shutil.rmtree(d, ignore_errors=True)
-
-    def test_a_plugin_install_is_found_rather_than_reported_missing(self):
-        """code-winnow can be delivered as a plugin, which nests the same
-        `skills/<name>/` tail under a marketplace and a plugin directory.
-        `companions.py` already walked those roots; this module was written
-        against the flat layout and answered "not installed"."""
-        home = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, home, True)
-        nested = os.path.join(home, ".claude", "plugins", "cache", "some-market",
-                              "winnow-plugin", "skills", "code-winnow", "scripts")
-        os.makedirs(nested)
-        open(os.path.join(nested, "scan.py"), "w").close()
-        prev = os.environ.get("HOME")
-        os.environ["HOME"] = home
-        try:
-            found = winnow.find(tempfile.mkdtemp())
-        finally:
-            if prev is not None:
-                os.environ["HOME"] = prev
-        self.assertEqual(found, os.path.join(nested, "scan.py"))
-
-    def test_files_in_scope_but_none_opened_is_not_a_clean_scan(self):
-        """scan.py answers this with files>0, scanned_files=0 and complete:false.
-        Summarised as a run that found nothing, the whole fact lived in a caveat
-        under a zero -- and a zero is what a clean branch looks like."""
-        out = winnow.summarize({"files": 4, "scanned_files": 0, "findings": [],
-                                "complete": False, "errors": [{"path": "a.min.js"}]},
-                               "v-1")
-        self.assertFalse(out["ran"])
-        self.assertIn("nothing was scanned", out["why"])
-        self.assertIn("did not run", winnow.as_text(out))
-
-    def test_a_configured_path_that_is_wrong_says_so(self):
-        # Otherwise a typo in winnow_scan is indistinguishable from a machine
-        # that never installed code-winnow.
-        why = winnow.misconfigured("/nope/scan.py")
-        self.assertIn("winnow_scan", why)
-        self.assertIn("/nope/scan.py", why)
-
-        os.environ[winnow.ENV_OVERRIDE] = "/also/nope.py"
-        try:
-            self.assertIn(winnow.ENV_OVERRIDE, winnow.misconfigured())
-        finally:
-            del os.environ[winnow.ENV_OVERRIDE]
-
-        self.assertIsNone(winnow.misconfigured(), "unset is not misconfigured")
-
-    def test_summary_keeps_only_significant_findings(self):
-        s = winnow.summarize({"findings": [
-            {"severity": "P1", "path": "a.py", "line": 3, "message": "except/pass"},
-            {"severity": "P3", "path": "b.py", "line": 9, "message": "em dash"},
-            {"severity": "P2", "path": "a.py", "line": 1, "message": "no assertion"},
-        ]})
-        self.assertEqual(s["total"], 3)
-        self.assertEqual([n["severity"] for n in s["notable"]], ["P1", "P2"])
-
-    def test_foreign_schema_changes_degrade_instead_of_crashing(self):
-        # Another project's JSON: a moved key must shrink the summary, not
-        # break the pipeline.
-        s = winnow.summarize({"findings": [{"sev": "P1"}, "not-a-dict", {}]})
-        self.assertTrue(s["ran"])
-        self.assertEqual(s["notable"], [])
-
-    def test_text_never_implies_a_scan_that_did_not_happen(self):
-        t = winnow.as_text({"ran": False, "why": "code-winnow not installed"})
-        self.assertIn("did not run", t)
-        self.assertIn("not installed", t)
-
-    def test_findings_are_labelled_advisory(self):
-        t = winnow.as_text(winnow.summarize({"findings": [
-            {"severity": "P1", "path": "a.py", "line": 3, "message": "except/pass"}]}))
-        self.assertIn("advisory", t)
-        self.assertIn("not requirement failures", t)
-
-    def test_an_empty_scope_is_not_a_clean_scan(self):
-        # scan.py answers "no diff found" with exit 0, findings [] and files 0 --
-        # identical to a reviewed change that came back clean. Reporting that as
-        # "nothing significant" is the fabricated clean this module refuses.
-        s = winnow.summarize({"files": 0, "findings": [], "complete": True,
-                              "warnings": ["No diff found in scope 'branch'."]})
-        self.assertFalse(s["ran"])
-        self.assertIn("nothing was scanned", winnow.as_text(s))
-
-    def test_a_scope_emptied_by_skips_says_which(self):
-        s = winnow.summarize({"files": 0, "findings": [],
-                              "errors": [{"path": "v.js", "error": "looks minified"}]})
-        self.assertFalse(s["ran"])
-        self.assertIn("skipped", s["why"])
-
-    def test_a_real_clean_scan_still_reports_clean(self):
-        s = winnow.summarize({"files": 4, "findings": [], "complete": True})
-        self.assertTrue(s["ran"])
-        self.assertIn("nothing significant", winnow.as_text(s))
-
-    def test_partial_coverage_is_stated_not_swallowed(self):
-        # complete:false means a file in scope was binary, minified or
-        # unreadable. The findings that landed are still true; the coverage
-        # behind them is not, and silence there reads as absence.
-        t = winnow.as_text(winnow.summarize({
-            "files": 2, "complete": False,
-            "findings": [{"severity": "P1", "path": "a.py", "line": 1,
-                          "message": "secret"}]}))
-        self.assertIn("INCOMPLETE", t)
-        self.assertIn("a.py", t)
-
-    def test_a_missing_file_count_is_not_assumed_clean(self):
-        # If the key is renamed upstream we cannot tell a clean tree from an
-        # unexamined one. Say that, rather than pick the flattering reading.
-        s = winnow.summarize({"findings": []})
-        self.assertFalse(s["ran"])
-
-    def test_a_moved_key_still_summarises_when_findings_exist(self):
-        # The other half of that: findings prove files were opened, so a schema
-        # drift must shrink the summary, never convert it into "did not run".
-        s = winnow.summarize({"findings": [{"sev": "P1"}, "not-a-dict", {}]})
-        self.assertTrue(s["ran"])
-
-    def test_exit_two_carries_findings_and_must_not_be_discarded(self):
-        # scan.py's contract is 0 = complete, 2 = incomplete. Exit 2 still
-        # prints a valid report: one unreadable file must not throw away a P1
-        # found in a different one.
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        fake = os.path.join(d, "scan.py")
-        with open(fake, "w") as fh:
-            fh.write("import json, sys\n"
-                     "print(json.dumps({'files': 2, 'complete': False,\n"
-                     "  'errors': [{'path': 'v.js', 'error': 'looks minified'}],\n"
-                     "  'findings': [{'severity': 'P1', 'path': 'a.py',\n"
-                     "                'line': 7, 'message': 'committed secret'}]}))\n"
-                     "sys.exit(2)\n")
-        written = {}
-
-        class _Task:
-            def write_text(self, path, text):
-                written[path] = text
-
-        s = winnow.run(_Task(), fake, d, "HEAD", "run-1")
-        self.assertTrue(s["ran"], "a partial scan was reported as no scan")
-        self.assertEqual(len(s["notable"]), 1)
-        self.assertFalse(s["complete"])
-        self.assertTrue(written, "the raw report was not persisted")
-
-    def test_an_unexpected_exit_code_is_still_refused(self):
-        import tempfile
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        fake = os.path.join(d, "scan.py")
-        with open(fake, "w") as fh:
-            fh.write("import sys\nsys.stderr.write('boom\\n')\nsys.exit(3)\n")
-
-        class _Task:
-            def write_text(self, path, text):
-                raise AssertionError("nothing should be persisted for a failed run")
-
-        s = winnow.run(_Task(), fake, d, "HEAD", "run-1")
-        self.assertFalse(s["ran"])
-        self.assertIn("boom", s["why"])
-
 
 class TestReportFreshness(unittest.TestCase):
     """A report already on disk when the turn began is not this turn's report.
@@ -3251,11 +3147,16 @@ class TestEndToEnd(unittest.TestCase):
 class TestWorkflowManifest(unittest.TestCase):
     """The workflow is declared, not hardcoded.
 
-    What these pin is the boundary: a manifest may enable, disable, repoint and
-    re-discipline a stage, and may NOT invent one. The state machine stays code
-    -- `implement` runs worktrees, waves and an escalation ladder while
-    `classify` is one parsed line -- so a manifest that could add stages would
-    be promising something the machine cannot deliver.
+    What these pin is the boundary: a manifest may enable, disable and repoint a
+    stage, and may NOT invent one. The state machine stays code -- `implement`
+    runs worktrees, waves and a bounded retry loop -- so a manifest that could
+    add stages would be promising something the machine cannot deliver.
+
+    What a manifest may no longer do is inject METHOD. `discipline:` let it hand
+    a stage's working style to an installed companion skill, with a fallback
+    when that skill was absent; nothing in the machine ever read it, and telling
+    a dispatched agent how to work is the caller's business rather than this
+    program's.
     """
 
     def setUp(self):
@@ -3282,10 +3183,6 @@ stages:
   implement:
     role: implementer
     card: roles/worker.md
-    discipline:
-      skill: superpowers:brainstorming
-      text: Borrowed discipline.
-      fallback: Do it yourself.
   integrate: {role: integrator, card: roles/integrator.md%s}
 """
 
@@ -3298,17 +3195,26 @@ stages:
                             "%s's card is declared but not on disk" % role)
         self.assertTrue(os.path.exists(w.protocol()))
 
-    def test_a_stage_borrows_its_method_from_an_installed_skill(self):
-        """The compatibility primitive. This used to be an `if superpowers` with
-        both texts inline in `_stage_brainstorm`, so hosting any other design
-        discipline meant patching the machine."""
-        w = self._manifest(self.BASE % "")
-        self.assertEqual(w.discipline("implement", {"superpowers": True}),
-                         "Borrowed discipline.")
-        self.assertEqual(w.discipline("implement", {}), "Do it yourself.")
-        self.assertEqual(w.discipline("implement", {"superpowers": False}),
-                         "Do it yourself.")
-        self.assertEqual(w.wants_skill("implement"), "superpowers:brainstorming")
+    def test_a_manifest_cannot_inject_method_into_a_prompt(self):
+        """The boundary, from the other side. A manifest moves WHERE an agent's
+        instructions live; it has no key that puts working style into a prompt,
+        and a key that looked like one but reached nothing is worse than none.
+        """
+        w = self._manifest("""name: opinionated
+protocol: PROTOCOL.md
+stages:
+  implement:
+    role: implementer
+    card: roles/worker.md
+    discipline: {skill: superpowers:brainstorming, text: Work my way.}
+""")
+        self.assertFalse(hasattr(w, "discipline"),
+                         "the manifest can still declare method for a stage")
+        task = _task(self.t.repo, "T-WF3", "# t\n\nx\n",
+                     self.reg["policy"]["limits"])
+        text = prompts.compose("implementer", task, subtask={"id": "s", "goal": "g"})
+        self.assertNotIn("Work my way", text,
+                         "a manifest key reached the agent's prompt")
 
     def test_a_disabled_stage_is_skipped_and_the_run_still_finishes(self):
         self._manifest(self.BASE % ", enabled: false")
@@ -3527,13 +3433,23 @@ stages:
                                 "status": "complete", "summary": "did it",
                                 "evidence": {"tests": "ok"}})
 
-    def test_a_design_report_is_a_legal_report(self):
-        """`_stage_brainstorm` dispatches a planner and `compose` tells it to
-        write a report, but `brainstorm` was not in the stage enum — so a design
-        stage that succeeded was recorded as blocked."""
-        schema.validate_report({"stage": "brainstorm", "role": "planner",
-                                "status": "complete", "summary": "designed it",
-                                "evidence": {"not_verified": ["nothing is built yet"]}})
+    def test_the_report_schema_admits_exactly_the_roles_that_are_dispatched(self):
+        """A stage that succeeds must be able to say so. The enums drifted the
+        other way once -- `brainstorm` dispatched an agent and was not in the
+        stage enum, so a stage that worked was recorded as blocked -- and they
+        can drift back by keeping names for stages that no longer run."""
+        for stage, role in (("implement", "implementer"),
+                            ("integrate", "integrator")):
+            schema.validate_report({"stage": stage, "role": role,
+                                    "status": "complete", "summary": "did it",
+                                    "evidence": {"tests": "1 passed"}})
+        for stage, role in (("plan", "planner"), ("review", "reviewer"),
+                            ("test", "test-author")):
+            with self.assertRaises(schema.Invalid,
+                                   msg="%s/%s is still a legal report" % (stage, role)):
+                schema.validate_report({"stage": stage, "role": role,
+                                        "status": "complete", "summary": "did it",
+                                        "evidence": {"tests": "1 passed"}})
 
 
 

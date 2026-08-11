@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/report.schema.json",
   "title": "Agent handoff report",
-  "description": "Written by every agent before it exits, to $TASK_DIR/reports/<stage>-<role|subtask>.json. This is the only report envelope: role-specific output goes under role_data (the reviewer's verdict object there must match verdict.schema.json). Absence of a valid report means the agent crashed.",
+  "description": "Written by every agent before it exits, to $TASK_DIR/reports/<stage>-<role|subtask>.json. This is the only report envelope, and it is what leaves your worktree besides your commits. Absence of a valid report means the agent crashed.",
   "type": "object",
   "required": [
     "stage",
@@ -15,27 +15,19 @@
   "properties": {
     "stage": {
       "enum": [
-        "brainstorm",
-        "classify",
-        "plan",
-        "test",
         "implement",
-        "review",
         "integrate"
       ]
     },
     "role": {
       "enum": [
-        "planner",
-        "test-author",
         "implementer",
-        "reviewer",
         "integrator"
       ]
     },
     "subtask": {
       "type": "string",
-      "description": "Subtask id from plan.md, e.g. st-2-combat-hooks. Required for implement stage."
+      "description": "Job id from plan.md, e.g. st-2-combat-hooks. Required for the implement stage."
     },
     "status": {
       "enum": [
@@ -43,12 +35,12 @@
         "blocked",
         "escalate"
       ],
-      "description": "complete = did the job and verified it. blocked = cannot proceed, nothing further to try. escalate = needs a stronger model, a re-plan, or a human."
+      "description": "complete = did the job and verified it. blocked = cannot proceed, nothing further to try. escalate = stuck, and whoever dispatched you should decide what to do. Both blocked and escalate end the job and hand this report back whole; nothing downstream retries you on a stronger model or rewrites your job."
     },
     "summary": {
       "type": "string",
       "minLength": 1,
-      "description": "One paragraph written FOR THE NEXT AGENT: what changed, what surprised you, what they must know. Not for humans, not a restatement of the task."
+      "description": "One paragraph for whoever reads this next: what changed, what surprised you, what they must know. Not a restatement of the task."
     },
     "artifacts_written": {
       "type": "array",
@@ -57,24 +49,9 @@
       },
       "description": "Paths of every file created or modified: repo-relative for code, absolute (or $TASK_DIR-relative) for task artifacts."
     },
-    "deviations": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "pattern": "^dev-[a-z0-9]+-[a-z0-9]+(-[a-z0-9]+)*$"
-      },
-      "description": "Ids of entries appended to deviations.md this session. Namespaced by the writer (dev-<subtask-or-role>-<n>) so parallel agents cannot collide."
-    },
-    "decisions": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "pattern": "^D-[a-z0-9]+-[a-z0-9]+(-[a-z0-9]+)*$"
-      }
-    },
     "signals": {
       "type": "array",
-      "description": "Escalation signals. See references/escalation.md.",
+      "description": "Why you stopped, when you stopped. Read whole by whoever dispatched you and summarised away by nothing in between, so this is where the detail belongs.",
       "items": {
         "type": "object",
         "required": [
@@ -158,11 +135,11 @@
         "medium",
         "low"
       ],
-      "description": "Advisory only. Never triggers escalation on its own, and never cancels an objective threshold."
+      "description": "Advisory only. Nothing routes on it."
     },
     "role_data": {
       "type": "object",
-      "description": "Role-specific output named by your role card: planner subtask_ids and estimated_total_loc, test-author ac_coverage, reviewer verdict (matching verdict.schema.json). Anything a card asks for that is not a field above belongs here.",
+      "description": "Anything your role card asks for that is not a field above.",
       "additionalProperties": true
     }
   }

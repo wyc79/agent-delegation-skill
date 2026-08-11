@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/subtask.schema.json",
-  "title": "Subtask block",
-  "description": "Schema for each entry in the YAML `## Subtasks` block of plan.md. Written by the planner; read by the orchestrator (for scheduling and scope enforcement) and by implementers (as their assignment).",
+  "title": "Job block",
+  "description": "Schema for each entry in the fenced YAML block of plan.md. Written by the CALLER — nothing here decomposes work — and read by the orchestrator (for wave scheduling and scope accounting) and by the agent that runs the job (as its whole assignment).",
   "type": "object",
   "required": [
     "id",
@@ -18,7 +18,7 @@
     },
     "goal": {
       "type": "string",
-      "description": "One sentence an implementer can act on without reading the rest of the plan."
+      "description": "The whole brief. The agent that runs this job gets no plan and no context beyond what is in this block, so a goal it cannot act on alone is a job that will come back wrong."
     },
     "file_scope": {
       "type": "array",
@@ -26,7 +26,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Write scope: globs this subtask may modify. Enforced \u2014 out-of-scope hunks are flagged at review. Be precise; an over-broad scope defeats parallel safety."
+      "description": "Write scope: globs this job may modify. MEASURED, not enforced \u2014 files touched outside it are recorded and reported back, never reverted. It is also what buys parallelism: two jobs with overlapping scopes are serialized, and an unscoped job claims everything."
     },
     "reads": {
       "type": "array",
@@ -40,39 +40,34 @@
       "items": {
         "type": "string"
       },
-      "description": "Subtask ids that must complete first. Empty means it can start immediately."
+      "description": "Job ids that must complete first. Ordering only — parallel safety comes from file_scope. Empty means it can start immediately."
     },
     "hotspots": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "Unmergeable or high-coupling files this subtask must touch (engine scenes, project settings, central modules). Taken as exclusive locks."
+      "description": "Unmergeable or high-coupling files this job must touch (engine scenes, project settings, central modules). Taken as exclusive locks, so no two jobs holding one ever run in the same wave."
     },
     "frozen_interfaces": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "Exact signatures/signals this subtask must expose for others to code against. Changing one later is a major deviation."
+      "description": "Exact signatures or signals this job must expose for other jobs to code against. Carried into its prompt as a contract it may not change quietly."
     },
     "estimated_loc": {
       "type": "integer",
       "minimum": 1,
-      "description": "Rough changed-line estimate. It is the baseline the implementer measures its own scope_overrun signal against (references/escalation.md), so an honest number matters more than a flattering one. Nothing else is computed from it."
+      "description": "Rough changed-line estimate. Recorded so a run shows what was asked for; nothing is computed from it and nothing enforces it."
     },
     "acceptance": {
       "type": "array",
       "minItems": 1,
       "items": {
-        "type": "string",
-        "pattern": "^AC-[0-9]+$"
+        "type": "string"
       },
-      "description": "Acceptance criteria from task.md this subtask satisfies. Every AC in task.md must be claimed by at least one subtask."
-    },
-    "test_notes": {
-      "type": "string",
-      "description": "How this should be verified, and whether the checks are fast (engine-free) or slow."
+      "description": "What this job has to satisfy, in the caller's own words. Carried into its prompt verbatim. It used to require this protocol's `AC-<n>` ids, which only meant something while an intake stage minted them here."
     },
     "tier": {
       "type": "string",

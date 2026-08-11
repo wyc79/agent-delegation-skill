@@ -121,7 +121,10 @@ class Task:
             "project_key": project_key(repo),
             "repo": {"path": os.path.abspath(repo), "common_dir": common_dir(repo)},
             "limits": limits,
-            "spent": {"usd": 0.0, "attempts": {}, "review_loops": 0, "replans": 0},
+            # Two counters, because there are two things to spend: money, and
+            # attempts on a job. `review_loops` and `replans` sat here at 0 for
+            # every task long after anything incremented them.
+            "spent": {"usd": 0.0, "attempts": {}},
             "subtasks": [],
             "delegation_history": [],
             "gates": [],

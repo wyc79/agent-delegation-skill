@@ -39,10 +39,12 @@ caller's attempt budget allows. `integrate` merges each branch into the task
 branch, verifying after each so the branch is green at every step, and writes the
 patch.
 
-A manifest (`workflows/default/workflow.yaml`) says which of those run, which
-role card an agent reads, and what a stage's method is. **It cannot invent a
-stage** — the machine owns the graph, and a manifest naming a stage the machine
-does not have would read like policy and route nothing.
+A manifest (`workflows/default/workflow.yaml`) says which of those run and which
+instructions the agent it dispatches reads. **It cannot invent a stage** — the
+machine owns the graph, and a manifest naming a stage the machine does not have
+would read like policy and route nothing. It also cannot declare *method*: a
+caller with its own protocol repoints `--workflow` at it, but nothing in a
+manifest injects working style into a prompt.
 
 ## Jobs
 
@@ -92,19 +94,28 @@ Each of these was built, measured and removed. They are the caller's, and the
 caller has skills for them:
 
 - **Plan.** No planner. `--plan` is how a decomposition arrives.
-- **Review.** No reviewer, no verdicts, no findings hand-off. The merge brief
-  says plainly that nothing reviewed the work.
+- **Review.** No reviewer, no verdicts, no findings hand-off, and no quality
+  pass of any other kind. The merge brief says plainly that nothing reviewed
+  the work. A code-winnow chaff scan ran at the merge gate until it went the
+  same way: choosing which pass runs over a change is the caller's, and a
+  caller that wants one runs it over the patch — or dispatches its passes
+  *through* here as jobs, which is the relationship this is built for.
 - **Escalate.** No ladder. A job reporting `escalate` halts and hands back its
   `signals` whole — type, detail, evidence, what it already tried — because the
   caller wrote the decomposition and is the only thing that can revise it.
   `superpowers:subagent-driven-development` already has that procedure, and is
   explicit that you must never "force the same model to retry without changes".
-- **Choose method.** No companion-skill injection. Picking how to work is the
-  caller's.
+- **Choose method.** No companion-skill detection, no method injected into any
+  prompt. Picking how to work is the caller's.
 
 What it keeps is what only it can do: worktree isolation, scope measurement,
 dependency waves, quota metering, breakers, cross-provider failover, checkpoint
 salvage, integration, and the merge gate.
+
+The test that holds this is `test_a_run_dispatches_nothing_but_the_work`: a
+clean run's `delegation_history` contains implementer turns and nothing else.
+An agent call is money, so a role that creeps back in is a bill the caller did
+not ask for.
 
 ## Quota failover
 
@@ -174,16 +185,14 @@ provider gave.
 |---|---|
 | `adg/cli.py` | The commands themselves. `orchestrator/delegate` is six lines that call its `main`. |
 | `adg/machine.py` | The state machine. Every transition lives here. |
-| `adg/workflow.py` | The manifest in force: which stages are enabled, which card a role reads, which discipline a stage borrows from an installed skill. |
+| `adg/workflow.py` | The manifest in force: which stages are enabled, and which card the role each dispatches reads. |
 | `adg/store.py` | Task state outside the repo; project key from the git common dir. |
 | `adg/router.py` | Capability scoring, enrollment, escalation ceiling, quota shadow price. |
 | `adg/quota.py` | Quota-exhaustion classification per agent kind; reset and window parsing. |
 | `adg/cooldown.py` | Per-channel breakers and the invocation meter, shared across projects. |
 | `adg/limits.py` | Hard limits, checked before the action, failing closed. |
 | `adg/runtime.py` | The nine-operation adapter: `local`, `herdr` (agents run in visible panes), `mock`. |
-| `adg/verify.py` | Deterministic checks and mechanical scope comparison. |
-| `adg/winnow.py` | Optional [code-winnow](https://github.com/wyc79/code-winnow-skill) scanner — referenced, never vendored. Its six *judgment passes* and their merge are a separate, unwired thing: see [`winnow-passes.md`](winnow-passes.md). |
-| `adg/companions.py` | Detects karpathy-guidelines and superpowers once, and declares them in `task.json`. |
+| `adg/verify.py` | The caller's checks, run and recorded; mechanical scope comparison. |
 | `adg/brief.py` | Human-facing gate briefs, plus the jargon lint. |
 | `adg/schema.py` | Report validation against the bundled schemas. |
 | `adg/prompts.py` | Injects role, paths, scope, budget — and nothing else. |
@@ -193,9 +202,7 @@ provider gave.
 
 - **None of this system's state is written into the working repository.** Task
   state lives in `$XDG_STATE_HOME/agent-delegation/`; the project key comes from
-  `git rev-parse --git-common-dir`, which is identical from every worktree. An
-  enrolled package that writes its own excluded directory is not an exception to
-  this — see [`winnow-passes.md`](winnow-passes.md).
+  `git rev-parse --git-common-dir`, which is identical from every worktree.
 - **Attended mode never commits to your branch**, and no mode merges. The
   terminal state is a patch file or a pushed branch. There is no commit path to
   the user's branch in this codebase — checkpoint commits happen only inside
@@ -239,7 +246,7 @@ python3 orchestrator/tests/test_orchestrator.py
 python3 orchestrator/tests/test_failover.py
 ```
 
-270 tests, none of which spend a token: the end-to-end ones drive the real state
+260 tests, none of which spend a token: the end-to-end ones drive the real state
 machine over a real git repository with a scripted adapter, so dispatch,
 isolated worktrees, waves, verify, failover and integration are all exercised
 for real.
@@ -255,7 +262,7 @@ usable, rather than depending on a vendor binary being on PATH.
 ## Use
 
 ```bash
-orchestrator/delegate init                          # seats, tiers, providers
+orchestrator/delegate init                          # which seat serves which tier
 orchestrator/delegate run "add subtract" --plan jobs.md
 orchestrator/delegate status                        # tasks for this project
 orchestrator/delegate show --brief                  # the merge-gate brief
@@ -282,10 +289,9 @@ fast: ["python3 -m pytest -q"]        # after every attempt on a job
 slow: ["python3 -m pytest -q --slow"] # stage boundaries only
 ignore: ["build/*", "*.o"]            # generated paths, excluded from scope accounting
 hotspots: ["src/schema.sql"]          # files no two jobs may hold at once
-winnow: auto                          # auto (default) | never — deterministic chaff scan
-winnow_scan: ~/.claude/skills/code-winnow/scripts/scan.py   # only if autodetect misses
 ```
 
-No config is legal — checks are then reported as *not run* rather than faked. A
-check that cannot fail is not a check: `slow` commands that always exit 0 will
-report every job as passing.
+These are the caller's checks, and they are the only thing here that decides
+whether a job's work is acceptable. No config is legal — checks are then
+reported as *not run* rather than faked. A check that cannot fail is not a
+check: `slow` commands that always exit 0 will report every job as passing.

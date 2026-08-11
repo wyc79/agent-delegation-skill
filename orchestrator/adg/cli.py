@@ -8,8 +8,8 @@ import time
 
 import json
 
-from . import (companions, cooldown, limits as lim, quota, router as routing,
-               runtime, store, verify, winnow, workflow as wf, yamlite)
+from . import (cooldown, limits as lim, quota, router as routing,
+               runtime, store, verify, workflow as wf, yamlite)
 
 
 def _repo(path):
@@ -155,41 +155,83 @@ def cmd_init(args):
                                  "checks will be skipped and reported as not run"))
     print("herdr       : %s" % ("available" if runtime.HerdrAdapter.available()
                                 else "not detected — using the local adapter"))
-    r = routing.Router(reg)
-    print("\nrole assignments within the ceiling %s:" %
+    # Resolved once and read twice -- the table below and the verdict under it
+    # are two readings of one routing decision, and asking the router twice is
+    # how they come to disagree.
+    #
+    # The adapter is built directly rather than through `_make_adapter`: that
+    # one prints the pane/cost note and reads flags `init` does not define.
+    choices = _tier_choices(reg)
+    seats = _tier_table(choices, runtime.get(_default_adapter(reg)))
+    print("\ntier assignments within the ceiling %s:" %
           reg["policy"].get("escalation_ceiling", {}).get("max_tier"))
-    # Every role this program dispatches from a card, integrator included: it is
-    # picked by `_reconcile` on a merge conflict, and a deployment that enrolled
-    # nobody for it learns that mid-wave, when the run halts for a human, rather
-    # than here where the fix is one registry line.
-    for role in ("planner", "implementer", "test-author", "reviewer", "integrator"):
-        try:
-            c = r.select(role)
-            print("  %-12s %s via %s (%s)" % (role, c.model, c.channel, c.adapter))
-        except routing.NoModelAvailable as e:
-            print("  %-12s UNAVAILABLE — %s" % (role, e))
-    unused = [m for m, s in reg["models"].items() if not s.get("enrolled_roles")]
+    # The tier table, not a role table. A job names a tier and the registry
+    # decides the seat; roles stopped naming models when the protocol came out,
+    # so a per-role listing showed five rows of the same answer -- three of them
+    # for roles (planner, test-author, reviewer) this program no longer
+    # dispatches at all.
+    for tier, line in seats:
+        print("  %-4s %s" % (tier, line))
+    unused = [m for m, s in reg["models"].items() if not s.get("enrolled")]
     if unused:
         print("\npresent but deliberately not enrolled: %s" % ", ".join(unused))
 
-    installed = companions.detect(repo)
-    print("\ncompanion skills: %s" % (", ".join(k for k, v in installed.items() if v)
-                                       or "none detected"))
-    print("chaff scanner  : %s" % (winnow.find(repo) or "not installed"))
+    # The one question the caller is told to answer here, answered rather than
+    # left to be read out of the table. Delegating onto a single seat buys
+    # subprocess indirection and worktree isolation the caller's own subagents
+    # already provide, more slowly; the skill says to stop, so this says which
+    # case the deployment is in.
+    providers = {c.channel for _, c in choices if c}
+    if len(providers) > 1:
+        print("\n%d seats serve these tiers (%s) — work can move between them."
+              % (len(providers), ", ".join(sorted(providers))))
+    else:
+        print("\nEvery tier resolves to %s. There is nowhere to fail over to, so "
+              "delegating buys isolation your own subagents already give you — "
+              "enroll a second provider first."
+              % (", ".join(providers) or "nothing"))
 
-    dest = os.path.join(store.project_dir(repo), "config.json")
-    if os.path.exists(dest) and not args.force:
-        print("\nconfig already at %s (pass --force to rewrite)" % dest)
-        return
-    if not args.write:
-        print("\nnothing written. Re-run with --write to save this to\n  %s" % dest)
-        return
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    with open(dest, "w", encoding="utf-8") as fh:
-        json.dump({"registry": os.path.abspath(args.registry) if args.registry else None,
-                   "companions": installed,
-                   "winnow_scan": winnow.find(repo)}, fh, indent=2)
-    print("\nwrote %s" % dest)
+    # `init` writes nothing, and there is no state for it to write. It used to
+    # save a `config.json` holding the detected companion skills and chaff
+    # scanner, both of which are gone, beside a registry path -- and nothing
+    # ever read the file back. Configuration lives in `registry.default.yaml`
+    # and `.adg.yaml`, which are edited by hand on purpose.
+    print("\nRead the table above before delegating. Nothing was written: "
+          "`registry.default.yaml` and `.adg.yaml` are this program's whole "
+          "configuration.")
+
+
+def _tier_choices(reg):
+    """(tier, Choice or None) for every band, in order."""
+    r = routing.Router(reg)
+    out = []
+    for tier in routing.TIERS:
+        try:
+            out.append((tier, r.select(tier=tier)))
+        except routing.NoModelAvailable:
+            out.append((tier, None))
+    return out
+
+
+def _tier_table(choices, adapter):
+    """One printable line per band: which model serves it, on which seat, and
+    whether that seat's agent CLI is actually installed.
+
+    The installed check is the router's own blind spot -- it scores what the
+    registry declares, and `machine._pick` is what filters by what is on PATH.
+    A table that omitted it would name a seat every run then skips, which is the
+    same lie in a quieter register.
+    """
+    out = []
+    for tier, c in choices:
+        if c is None:
+            out.append((tier, "nothing enrolled serves this band"))
+            continue
+        usable = "" if adapter.can_run(c.agent_kind) else \
+            "  [%s is not installed — this band falls back]" % c.agent_kind
+        out.append((tier, "%-18s via %-12s (%s)%s"
+                    % (c.model, c.channel, c.adapter, usable)))
+    return out
 
 
 def cmd_run(args):
@@ -215,12 +257,10 @@ def cmd_run(args):
         "# Task %s\n\n## Request (verbatim)\n\n%s\n" % (task_id, request.strip())
     task = store.Task.create(repo, task_id, body, merged, mode=args.mode)
     if getattr(args, "plan", None):
-        # The caller brought its own decomposition, so there is nothing for a
-        # planner to decide. Written where the planner would have written it,
-        # because `_stage_implement` already recovers subtasks from `plan.md`
-        # when the state has none -- the path that exists so a resumed run does
-        # not re-pay for planning. Supplying the file is the same situation
-        # arriving earlier, and it needs no new code in the machine.
+        # `plan.md` is where `_stage_implement` looks for jobs when the state
+        # has none -- the path a resumed run already takes to recover its
+        # decomposition from disk. A caller supplying one is that same
+        # situation arriving earlier, so it needs no new code in the machine.
         #
         # Not validated here beyond existing: `_read_plan_subtasks` is the one
         # parser, it already refuses a block it cannot read rather than guessing,
@@ -281,16 +321,15 @@ def cmd_approve(args):
         sys.exit("the %s gate was already answered %r" % (pend["kind"], pend["decision"]))
 
     decision = "approved" if args.decision == "approve" else "declined"
-    # Recorded HERE, and only here. This is the moment the human decided, and
-    # it is the only site every gate passes through: the design and plan gates
-    # resume past the stage that asked them, so a machine-side recording would
-    # silently lose those approvals entirely.
+    # Recorded HERE, and only here. This is the moment the human decided, and it
+    # is the site every gate passes through whether or not the machine is ever
+    # re-entered to consume the pending decision below.
     task.record_gate(pend["kind"], decision, args.note)
     if decision == "approved":
-        # Carried into the prompts of the planner, implementers and reviewer.
-        # A qualified yes approves something other than what was proposed, and
-        # the agents that build and check it have to be told -- otherwise the
-        # note is a record of an instruction nobody ever followed.
+        # Carried into the prompts of the agents that run after it. A qualified
+        # yes approves something other than what was proposed, and whoever
+        # builds it has to be told -- otherwise the note is a record of an
+        # instruction nobody ever followed.
         #
         # Written even when empty, which CLEARS a previous one. Guarding this on
         # a non-empty note meant an unqualified approval at a later gate left the
@@ -299,9 +338,9 @@ def cmd_approve(args):
         # next approval".
         task.update(gate_note={"kind": pend["kind"], "note": args.note.strip()})
     # The merge gate keeps its pending decision because `_stage_integrate` is
-    # re-entered and consumes it. The design and plan gates resume PAST the
-    # stage that asked, so nothing would ever consume theirs -- and a stale
-    # `pending_gate` makes the next `approve` refuse as already-answered.
+    # re-entered and consumes it. A gate whose stage does not re-enter would
+    # never have its consumed, and a stale `pending_gate` makes the next
+    # `approve` refuse as already-answered.
     #
     # Only an APPROVAL is kept. A declined merge gate left the decision behind
     # forever: the human's agent fixed what was wrong, called `approve`, and got
@@ -450,7 +489,6 @@ def cmd_show(args):
     if args.brief:
         print(task.read_text("brief.md", "(no brief yet)"))
         return
-    import json
     print(json.dumps(task.state, indent=2))
 
 
@@ -483,9 +521,8 @@ def main(argv=None):
                         "$AGENT_DELEGATION_WORKFLOW)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    i = sub.add_parser("init", help="show detected setup and role assignments")
-    i.add_argument("--write", action="store_true", help="save the detected setup")
-    i.add_argument("--force", action="store_true", help="overwrite an existing config")
+    i = sub.add_parser("init", help="show the detected setup and which seat "
+                                    "serves which tier")
     i.set_defaults(func=cmd_init)
 
     r = sub.add_parser("run", help="run a new task")
@@ -500,10 +537,9 @@ def main(argv=None):
     r.add_argument("--max-cost", type=float, help="lower the cost cap for this task")
     r.add_argument("--dry-run", action="store_true", help="drive the machine without agents")
     r.add_argument("--plan", metavar="FILE",
-                   help="a decomposition you already have, in plan.md's subtask "
-                        "format. Pair with `--workflow orchestrator/workflows/"
-                        "dispatch` to use delegate purely as a dispatcher: your "
-                        "subtasks, run across your seats, no planner or reviewer")
+                   help="the jobs to run, in plan.md's format. Not optional in "
+                        "practice: nothing here decomposes work, so a task with "
+                        "no jobs does nothing")
     r.add_argument("--yes", action="store_true",
                    help="auto-approve gates (unattended runs; merge still never happens)")
     r.set_defaults(func=cmd_run)

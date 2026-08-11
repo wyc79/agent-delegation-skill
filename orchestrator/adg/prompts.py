@@ -25,11 +25,6 @@ from . import schema, workflow
 # `delegate`, which is the wrong document and an invitation to recurse.
 WORKFLOW_DIR = os.path.join("workflows", "default")
 
-# Roles whose whole answer is a line of text this program parses. They have no
-# role card, write no report, and are handed no task id -- so they are not
-# playing a role in this protocol, and `env_for` must not tell them they are.
-TEXT_REPLY_ROLES = frozenset({"classifier", "intake", "reporter"})
-
 
 def skill_path():
     """Where the workflow in force lives.
@@ -49,7 +44,6 @@ def skill_path():
 
 def compose(role, task, subtask=None, extra=None, verify_cfg=None):
     wf = workflow.current()
-    skill = wf.path
     lines = ["You are the **%s** in a delegated development workflow." % role.upper(), ""]
     # Both are asked of the manifest rather than assembled from a naming
     # convention. A workflow whose stages are foreign skills has no protocol of
@@ -79,17 +73,18 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
             "Goal: %s" % subtask.get("goal", ""),
         ]
         # What the scope line says is what actually happens, not what sounds
-        # strictest. Nothing in this program reverts a hunk:
-        # `verify.scope_violations` records the files and `_skip_review` turns a
-        # simple task's skipped review back on. A prompt that threatens an
-        # automatic revert is asking to be found out by the one agent that
-        # tests it.
+        # strictest. Nothing in this program reverts a hunk and nothing reviews
+        # the result: `verify.scope_violations` records the files, and the merge
+        # brief prints them for the caller. The line used to promise a reviewer
+        # that was removed with the rest of the protocol -- a prompt that
+        # threatens a consequence this program cannot deliver is asking to be
+        # found out by the one agent that tests it.
         #
         # `planned_scope` first, and it is the only key a stored subtask has.
-        # The planner writes `file_scope` in plan.md and `_read_plan_subtasks`
-        # renames it on the way into task.json (machine.py:516), so reading
-        # `file_scope` here printed the header above with an EMPTY list under
-        # it, on every implementer prompt ever composed. Meanwhile
+        # The caller writes `file_scope` in plan.md and `_read_plan_subtasks`
+        # renames it on the way into task.json, so reading `file_scope` here
+        # printed the header above with an EMPTY list under it, on every
+        # implementer prompt ever composed. Meanwhile
         # `verify.scope_violations` checked against `planned_scope` and recorded
         # violations of a boundary the agent was never shown. `file_scope`
         # stays as a fallback for a raw plan dict that has not been through the
@@ -98,7 +93,7 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
         if scope:
             lines += [
                 "Write scope (a hard boundary — every file you touch outside it "
-                "is recorded and sent to a reviewer):",
+                "is recorded and reported back to whoever dispatched you):",
             ]
             lines += ["  %s" % g for g in scope]
         else:
@@ -106,7 +101,7 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
             # defaults to `**`. Saying nothing would read as "unspecified"; this
             # says "unrestricted", which is the truth.
             lines.append("Write scope: not restricted for this subtask — but "
-                         "every file you touch is still recorded and reviewed.")
+                         "every file you touch is still recorded and reported.")
         if subtask.get("reads"):
             lines.append("May read (do not modify): %s" % ", ".join(subtask["reads"]))
         if subtask.get("acceptance"):
@@ -121,9 +116,9 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
     state = task.state
     lims = state.get("limits", {})
     if subtask:
-        # Only the implementer loop counts attempts, and only against a subtask.
-        # Telling a reviewer it has "8 attempts on this subtask" names a budget
-        # it cannot spend for a subtask it was not given.
+        # Only against a subtask. The integrator is dispatched without one, and
+        # telling it "8 attempts on this subtask" names a budget it cannot spend
+        # for a job it was not given.
         lines += [
             "",
             "Budget for this session: at most %s attempts on this subtask. "
@@ -139,11 +134,12 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
         "It must validate against %s." % os.path.join(
             schema.schemas_dir(), "report.schema.json"),
     ]
-    found = {k: v for k, v in (state.get("companions") or {}).items() if v}
-    if found:
-        lines += ["", "Companion skills installed here: %s. See %s/references/"
-                      "companions.md for which apply to your role and their limits."
-                  % (", ".join(sorted(found)), skill)]
+    # Nothing about METHOD is injected here. There was a paragraph naming the
+    # companion skills detected on the box and pointing at a
+    # `references/companions.md` that had already been deleted with the rest of
+    # the protocol, so it sent every dispatched agent hunting for a file that
+    # was not there. Picking how to work is the caller's, and an agent that
+    # wants a skill it has installed can reach for it without being told.
     if extra:
         lines += ["", extra.strip()]
     return "\n".join(lines)
@@ -165,22 +161,15 @@ def env_for(task, role):
     now be handed to a foreign agent as a plain scratch location without
     conscripting it.
 
-    Which is why the text-reply roles do not get it either. `classifier`,
-    `intake` and `reporter` are this program's own names for one-shot questions;
-    none has a card in `roles/`, none is in the report schema's role enum, and
-    none is handed a task id. Setting the mandate for them conscripted an agent
-    that then read the protocol, found no row for itself in the Step 2 table and no
-    task id in its prompt, and was told by Step 1 to write a `blocked` report
-    rather than answer the question -- degrading silently into "classifier gave
-    no usable verdict" and a task planned as COMPLEX for no reason. The rule
-    stated in orchestrator/winnow-passes.md for foreign passes binds this
-    dispatcher's own roles first.
+    **A dispatcher must not set the mandate for an agent that is not playing one
+    of the workflow's roles.** That is the rule that lets this runtime host
+    somebody else's pass: give it the scratch path, its own prompt, and no role,
+    and it does its own job instead of loading a protocol that tells it to write
+    a report it was never asked for.
     """
-    env = {"AGENT_DELEGATION_TASK_DIR": task.path,
-           "AGENT_DELEGATION_SKILL_DIR": skill_path()}
-    if role not in TEXT_REPLY_ROLES:
-        env["AGENT_DELEGATION_ROLE"] = role
-    return env
+    return {"AGENT_DELEGATION_TASK_DIR": task.path,
+            "AGENT_DELEGATION_SKILL_DIR": skill_path(),
+            "AGENT_DELEGATION_ROLE": role}
 
 
 def retry(failure):
