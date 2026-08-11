@@ -92,7 +92,8 @@ Shared triggers; your card carries its own, and nobody carries another's.
 Write `$TASK_DIR/reports/<stage>-<subtask-id>.json`, or `<stage>-<role>.json`
 with no subtask. **The id is not optional when you have one** — siblings share
 your role name, so a role-named file cannot be attributed and counts as no
-report. Match `schemas/report.schema.json`: status (`complete` / `blocked` /
+report. The name is matched exactly, id filling everything after the stage
+word: decoration like `implement-st-1-final.json` also counts as no report. Match `schemas/report.schema.json`: status (`complete` / `blocked` /
 `escalate`), a summary **for the next agent** (what changed, what surprised you,
 what they must know), artifacts, deviations, signals, and real command output.
 

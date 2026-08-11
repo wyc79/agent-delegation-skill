@@ -214,7 +214,7 @@ Everything else reaches the ladder through the agent, in `report.signals`, and
 guessing on the agent's behalf spends real money on a guess. `low_confidence` is
 not routable on its own, which is D4 enforced rather than restated.
 
-## The wave defect — root cause found, and what is still open
+## The wave defect — every cause found, and none of them a race
 
 The symptom was an implementer's `escalate` failing to reach the halt check, so
 a wave subtask completed that should have parked. It was chased for a while as a
@@ -239,26 +239,49 @@ leaving a file behind — which it normally has, since it checkpoints — the ru
 did not merely mis-mark a subtask: it reached `done` and emitted a patch built
 on work whose own report said nothing had been verified.
 
-**A second failure mode is still live, and it is not this one.** The substring
-defect is fixed and pinned deterministically, but it did not account for the
-intermittent failure, and saying it did was getting ahead of the evidence.
-`test_one_subtask_escalating_stops_the_run_even_as_a_sibling_succeeds` still
-fails at roughly 1 run in 19 of the full suite, and about 1 round in 10 with two
-suites running concurrently — contention raises the rate, which is what a real
-race looks like and what an ordering bug does not.
+**A second failure mode outlived that fix, and it was never in the
+orchestrator.** The substring defect did not account for the intermittent
+failure: the suite kept failing at roughly 1 run in 19, with a report on disk
+that the log showed `_collect_report` never crediting. The cause was the same
+defect class on the *test suite's* side of the boundary. The scripted mocks
+decided which subtask they were playing by substring against the full worktree
+path — `if "st-1" in cwd` — and `TempRepo` builds its sandbox with
+`tempfile.mkdtemp(prefix="adg-test-")`. That prefix ends in `st-`, so whenever
+the random suffix opened with a digit, every path in the run contained `st-1`
+(`.../adg-test-1bnhfu9z/...`) and every implementer in the wave took the st-1
+branch: alpha's report written by three hands, beta's escalate never written at
+all, and a stray `alpha.py` making beta look like it had done work. The
+arithmetic closes exactly: a suffix drawn from 37 characters opens with `1`
+once in 37 draws, and two vulnerable tests rolled that die per run —
+1 − (36/37)² ≈ 1 in 19. Contention never raised the rate; two concurrent
+suites just rolled twice as many dice. Every dissected failing run showed the
+orchestrator behaving correctly.
 
-The captured evidence, verbatim from a failing run: `st-2-beta`'s implementer
-wrote an `escalate` report, the log has no `reported escalate` line at all, and
-the wave carried on into review. So `_collect_report` did not return a report
-that was on disk — the same *symptom* as the substring defect, a different and
-still-undiagnosed cause. Note it is caught by the assertion on the **reason**,
-not the one on the status: the run does park, just for an unrelated reason. An
-outcome assertion alone would have called this green.
+It is pinned the same way the first defect was — deterministically, not
+statistically: point `TMPDIR` at a directory named like `adg-test-1w` and the
+old mocks fail every run. `_tree_name()` now matches ids against the
+worktree's own basename, and the full suite passes under `adg-test-1w`, `-2w`
+and `-3w` alike.
 
-`registry.default.yaml` therefore still ships `max_parallel_agents: 1`, and this
-is now a known-live defect rather than a suspected one. The sequential path is
-unaffected: with one implementer at a time there is no sibling to be confused
-with, and the failure has never been observed outside a wave.
+**The same class was also latent on the product side.** `_collect_report`
+matched a subtask's report by `id in name`. The ids today's tests use
+(`st-1-alpha`) cannot collide, but the planner writes the ids, and a plan
+naming siblings `st-1` and `st-11` would hand st-1 the sibling's report — the
+parked-over confusion, back through another door. The match is now exact
+against the `<stage>-<id>.json` contract (the stage token may be any word that
+contains no `-`, so `implement-st-alpha.json` can never be claimed by a
+subtask named plain `alpha`), and
+`test_a_report_for_st_11_is_never_read_as_st_1s` fails on the substring code
+every time.
+
+`registry.default.yaml` now ships `max_parallel_agents: 3`. What that rests
+on: three attribution defects — two in the product, one in the harness — each
+fixed and pinned by a deterministic test, and the wave's concurrent invariants
+(counters, worktree isolation, escalation propagation, quota parks) each held
+by a test that actually opens its window. What it does not rest on: any wave
+run with real agent CLIs, which the mock adapter cannot stand in for. The
+first parallel deployment is still a maiden voyage, and worth watching like
+one.
 
 One thing ruled out by reading: that test's `Interleaved` hook used to wrap
 `_invoke`, which *contains* the report read, so the window it documents was
@@ -266,5 +289,7 @@ never opened and it had been passing on the strength of a comment. The hook now
 wraps `_collect_report`. It still passes in isolation, so the forced ordering is
 not the trigger either.
 
-The parallel tests set their own concurrency — `TestWaveRaces` at 3, because it
-plans three subtasks and a lower cap never opens the window it exists to probe.
+The parallel tests still pin their own concurrency rather than inheriting the
+registry's — `TestWaveRaces` at 3, because it plans three subtasks and a lower
+cap never opens the window it exists to probe. A registry tuned back down must
+not quietly turn the race tests into sequential runs that pass.

@@ -372,6 +372,17 @@ def _report(cwd_task, name, payload):
         json.dump(payload, fh)
 
 
+def _tree_name(cwd):
+    """The worktree's own directory name, for scripted mocks deciding which
+    subtask they were dispatched as. Matching a subtask id against the FULL
+    path is a trap: mkdtemp's prefix "adg-test-" ends in "st-", so whenever
+    the random suffix opens with a digit, "st-1" (or st-2, st-3) appears in
+    *every* path of the run and every mock takes the same branch. That was
+    the long-standing ~1-in-19 wave flake: a suffix drawn from 37 characters
+    starts with "1" once in 37 runs, and two tests each rolled that die."""
+    return os.path.basename(cwd.rstrip("/"))
+
+
 class TestClassifier(unittest.TestCase):
     """The keyword classifier sent a 12-line change down the full planning
     pipeline. Classification is a judgement, so a model makes it."""
@@ -690,7 +701,7 @@ class TestParallelEndToEnd(unittest.TestCase):
             with lock:
                 seen_cwds.add(cwd)
             # Each writes only its own file, so the merges must be clean.
-            name = "alpha" if "st-1" in cwd else "beta"
+            name = "alpha" if "st-1" in _tree_name(cwd) else "beta"
             with open(os.path.join(cwd, "%s.py" % name), "w") as fh:
                 fh.write("VALUE = %r\n" % name)
 
@@ -704,9 +715,10 @@ class TestParallelEndToEnd(unittest.TestCase):
 
         script = {"planner": planner, "implementer": implementer,
                   "test-author": lambda e, c: None, "reviewer": reviewer}
-        # A parallel test has to build its own concurrency. The shipped registry
-        # ships max_parallel_agents: 1 until the wave race is closed, so inheriting
-        # it silently turned every one of these into a sequential run that still passed.
+        # A parallel test pins its own concurrency rather than inheriting the
+        # registry's: when the registry shipped max_parallel_agents: 1, every
+        # one of these silently became a sequential run that still passed, and
+        # a future tuning-down must not do that again.
         pol = dict(self.reg["policy"]["limits"],
                    escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
                    max_parallel_agents=2)
@@ -734,16 +746,17 @@ class TestParallelEndToEnd(unittest.TestCase):
                 fh.write(self.PLAN)
 
         def implementer(env, cwd):
-            if "st-2" in cwd:
+            if "st-2" in _tree_name(cwd):
                 raise RuntimeError("beta agent exploded")
             with open(os.path.join(cwd, "alpha.py"), "w") as fh:
                 fh.write("VALUE = 1\n")
 
         script = {"planner": planner, "implementer": implementer,
                   "test-author": lambda e, c: None}
-        # A parallel test has to build its own concurrency. The shipped registry
-        # ships max_parallel_agents: 1 until the wave race is closed, so
-        # inheriting it turns this into a sequential run that still passes.
+        # A parallel test pins its own concurrency rather than inheriting the
+        # registry's: when the registry shipped max_parallel_agents: 1, this
+        # silently became a sequential run that still passed, and a future
+        # tuning-down must not do that again.
         pol = dict(self.reg["policy"]["limits"],
                    escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
                    max_parallel_agents=2)
@@ -896,9 +909,10 @@ class TestWaveRaces(unittest.TestCase):
         sh(["git", "add", "-A"], self.t.repo)
         sh(["git", "commit", "-qm", "cfg"], self.t.repo)
         self.reg = router.load_registry(REGISTRY)
-        # A parallel test has to build its own concurrency. The shipped registry
-        # ships max_parallel_agents: 1 until the wave race is closed, so
-        # inheriting it turns every race test into a sequential run that passes.
+        # A parallel test pins its own concurrency rather than inheriting the
+        # registry's: when the registry shipped max_parallel_agents: 1, every
+        # race test silently became a sequential run that passed, and a future
+        # tuning-down must not do that again.
         #
         # 3, not 2, and it matters: this class plans three independent subtasks,
         # so a cap of 2 runs them two-then-one and never opens the three-way
@@ -949,7 +963,7 @@ class TestWaveRaces(unittest.TestCase):
 
         def implementer(env, cwd):
             td = env["AGENT_DELEGATION_TASK_DIR"]
-            if "st-1" in cwd:
+            if "st-1" in _tree_name(cwd):
                 with open(os.path.join(cwd, "alpha.py"), "w") as fh:
                     fh.write("A = 1\n")
                 _report(td, "implement-st-1-alpha.json", {
@@ -1008,7 +1022,7 @@ class TestWaveRaces(unittest.TestCase):
 
         def implementer(env, cwd):
             td = env["AGENT_DELEGATION_TASK_DIR"]
-            if "st-1" in cwd:
+            if "st-1" in _tree_name(cwd):
                 with open(os.path.join(cwd, "alpha.py"), "w") as fh:
                     fh.write("A = 1\n")
                 # Legal under SKILL.md, and it sorts ahead of every sibling's.
@@ -1017,7 +1031,7 @@ class TestWaveRaces(unittest.TestCase):
                     "subtask": "st-1-alpha", "status": "complete",
                     "summary": "did alpha", "evidence": {"tests": "ok"}})
                 alpha_landed.set()
-            elif "st-2" in cwd:
+            elif "st-2" in _tree_name(cwd):
                 alpha_landed.wait(10)   # alpha's file is on disk before I report
                 # It MUST leave a file behind. An escalating agent normally has
                 # checkpointed something, and without that the unrelated
@@ -1063,6 +1077,67 @@ class TestWaveRaces(unittest.TestCase):
         self.assertEqual(attempts.get("st-2-beta"), 1, attempts)
         roles = [h for h in task.state["delegation_history"] if h["role"] == "implementer"]
         self.assertGreaterEqual(len(roles), 2, "a delegation record was lost")
+
+    def test_a_report_for_st_11_is_never_read_as_st_1s(self):
+        """The id must fill the whole name after the stage token, not merely
+        appear in it. Planners write the ids, and nothing stops a plan from
+        naming siblings st-1 and st-11 -- with substring matching, st-1's
+        collector claims `implement-st-11.json` the moment it lands first, and
+        a sibling's escalate becomes st-1's own."""
+        import threading
+        eleven_reported = threading.Event()
+
+        PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1
+  goal: add a
+  file_scope: ["a.py"]
+  acceptance: [AC-1]
+- id: st-11
+  goal: add b
+  file_scope: ["b.py"]
+  acceptance: [AC-2]
+```
+"""
+
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(PLAN)
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            if _tree_name(cwd).endswith("st-11"):
+                with open(os.path.join(cwd, "b.py"), "w") as fh:
+                    fh.write("B = 1\n")
+                _report(td, "implement-st-11.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-11", "status": "escalate",
+                    "summary": "the plan contradicts the tree — nothing verified",
+                    "evidence": {"not_verified": ["everything"]}})
+                eleven_reported.set()
+            else:
+                eleven_reported.wait(10)   # st-11's report is on disk first
+                with open(os.path.join(cwd, "a.py"), "w") as fh:
+                    fh.write("A = 1\n")
+                # Deliberately writes no report: green checks plus a changed
+                # file is a legal way for an implementer to finish, and any
+                # escalate attributed to st-1 can only have been read across.
+
+        task = store.Task.create(self.t.repo, "T-W11", "# t\n\nAdd things\n", self.pol)
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(
+            {"planner": planner, "implementer": implementer,
+             "test-author": lambda e, c: None}),
+            lambda k, t: True, log=logs.append).run()
+
+        joined = "\n".join(logs)
+        self.assertEqual(status, "needs_human", joined)
+        self.assertIn("st-11: agent reported escalate", joined,
+                      "st-11's own escalate was not seen")
+        self.assertNotIn("st-1: agent reported escalate", joined,
+                         "st-1 was credited with its sibling's report")
 
     def test_hotspots_from_a_real_plan_force_serialization(self):
         # The old test hand-wrote a `hotspots` key the plan parser dropped, so

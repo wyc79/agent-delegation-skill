@@ -200,13 +200,12 @@ policy:
     max_attempts_per_subtask: 8
     max_review_loops: 2
     max_replans: 1
-    # 1, not 3, until the wave path is settled -- see "The wave defect" in
-    # orchestrator/README.md. One root cause is found and fixed; the evidence
-    # that nothing else remains is not yet strong enough to raise this. The
-    # sequential path loses nothing but wall-clock, and shipping the unsafe
-    # number while documenting the safe one asks every reader to notice a
-    # paragraph before their first run. Raise it deliberately, not by default.
-    max_parallel_agents: 1
+    # Raised from 1 after the last wave defect was run to ground: the
+    # intermittent failure that kept this pinned was the test harness's own
+    # path matching, not a race -- see "The wave defect" in
+    # orchestrator/README.md. Every attribution defect found on the way, in
+    # product and harness both, is fixed and held by a deterministic test.
+    max_parallel_agents: 3
     human_approval_required: [plan, merge, dependency_change, destructive_op]
   escalation_thresholds:
     test_stuck_attempts: 3

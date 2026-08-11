@@ -262,18 +262,20 @@ $ADG channels                  # quota cooldowns and draw per seat
 And from a clone of *this* repo, the suites:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 149 tests, no tokens spent
+python3 orchestrator/tests/test_orchestrator.py  # 155 tests, no tokens spent
 python3 orchestrator/tests/test_failover.py      #  95 more, same
 ```
 
 They drive the real state machine over a real git repository with a scripted
 adapter, so they need no agent CLI installed and spend nothing.
 
-**Two limits to know before you rely on it.** Parallel subtasks still carry a
-shared-state race — roughly 1 full-suite run in 8 — so `max_parallel_agents`
-ships as `1` and should stay there until it is closed; the sequential path is
-unaffected. And live quota metering, telemetry-driven registry recalibration,
-and container isolation are absent.
+**Two limits to know before you rely on it.** Parallel waves are enabled
+(`max_parallel_agents: 3`) on the strength of deterministic tests: the
+long-intermittent wave failure turned out to be the test harness's own path
+matching, not a race, and every report-attribution defect found on the way is
+fixed and pinned — but no wave has yet run with real agent CLIs, so treat the
+first as a shakedown. And live quota metering, telemetry-driven registry
+recalibration, and container isolation are absent.
 [`orchestrator/README.md`](orchestrator/README.md) has the configuration, the
 full scope boundary, and the defect write-up; `DESIGN.md` §15 has the design it
 was built from.

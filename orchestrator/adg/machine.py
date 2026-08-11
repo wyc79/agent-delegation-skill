@@ -1546,8 +1546,19 @@ a planner does that next, from your design.
             # subtask read a sibling's `complete` and the run delivered a patch
             # built on work that had asked to stop. Subtask ids are unique, so
             # matching on the id alone cannot cross threads.
+            #
+            # And the id must fill the name, not merely appear in it. The
+            # contract is `<stage>-<id>.json` (SKILL.md step 3); a substring
+            # test hands st-1 the report of a sibling named st-11, and the
+            # planner -- not this code -- chooses the ids. The stage token is
+            # not pinned to a word list, only forbidden from containing the
+            # separator, so `implement-st-alpha.json` can never be claimed by
+            # a subtask named plain `alpha`.
             if subtask:
-                if subtask["id"] not in name:
+                stem, want = name[:-len(".json")], subtask["id"]
+                if not stem.endswith("-" + want):
+                    continue
+                if "-" in stem[:-len(want) - 1]:
                     continue
             elif role not in name:
                 continue
