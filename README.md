@@ -16,11 +16,13 @@ Two principles drive every design decision, in this order:
 2. Separate the workflow from the model/provider, so providers can be swapped
    without redesigning anything.
 
-[`DESIGN.md`](DESIGN.md) is the **initial design** — lifecycle, routing,
-escalation, parallelism, security, failure recovery — written before any code
-existed. It is the reasoning behind the decisions, not a description of current
-behaviour; where the two disagree the code is right.
 [`orchestrator/README.md`](orchestrator/README.md) is what is actually built.
+
+`DESIGN.md` — the initial design, written before any code existed — was removed
+on 2026-08-10. It described a workflow-quality thesis this project no longer
+holds, so keeping it at the root would have made the repo's most prominent
+document its most out-of-date one. Code comments still cite it by section
+(`DESIGN.md §5.4`); those resolve through git history, where the file remains.
 
 ## Install
 

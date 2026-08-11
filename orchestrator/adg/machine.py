@@ -454,7 +454,7 @@ a planner does that next, from your design.
                 "plan.md as keep, adapt or discard. Work that is already green is "
                 "reset to pending when your plan lands, so anything you leave out "
                 "will be built again." % self.task.file("escalation.md"))
-        self._run_once("planner", choice, cwd=self.repo, extra=extra)
+        self._run_once("planner", choice, cwd=self.repo, extra=self._with_note(extra))
         subtasks = self._read_plan_subtasks()
         if not subtasks:
             raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
@@ -597,7 +597,8 @@ a planner does that next, from your design.
                 sub["id"], attempts, role_choice.model, "" if session is None else ", continued"))
             session, report, role_choice = self._invoke(
                 "implementer", role_choice, cwd=base, subtask=sub,
-                session=session, failure=failure, extra=self._findings_brief(sub))
+                session=session, failure=failure,
+                extra=self._with_note(self._findings_brief(sub)))
             self.budget.used_attempt(sub["id"])
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
@@ -1084,7 +1085,7 @@ a planner does that next, from your design.
                       "block if they independently land on authority — an acceptance "
                       "criterion, a plan line, or a stated non-goal. Otherwise record "
                       "them under `advisory`." % chaff)
-        self._run_once("reviewer", choice, cwd=base, extra=extra)
+        self._run_once("reviewer", choice, cwd=base, extra=self._with_note(extra))
         verdict = self._read_verdict()
         self.log("review: %s" % verdict["verdict"])
         self.task.update(review_outcome={"reviewed": True, "verdict": verdict["verdict"]})
@@ -1135,6 +1136,36 @@ a planner does that next, from your design.
         else:
             raise Halt("needs_human", "reviewer escalated: %s" %
                        (verdict.get("findings") or [{}])[0].get("claim", "no detail"))
+
+    def _human_note(self):
+        """The last thing a human said at a gate, formatted for a prompt.
+
+        An approval with a qualification -- "yes, but keep the old endpoint
+        working" -- is not approval of what was proposed. It approves something
+        slightly different, and the agent that builds it has to be told, or the
+        note is a record of an instruction nobody followed.
+
+        It carries forward rather than being consumed by its first reader. A
+        qualification on the plan applies to every subtask under that plan, not
+        only the first one dispatched; and the reviewer needs it too, or it
+        flags the retained endpoint as scope creep and rejects work that is
+        doing exactly what the human asked for. Superseded by the next
+        approval, never cleared on read.
+        """
+        gn = self.task.state.get("gate_note") or {}
+        note = (gn.get("note") or "").strip()
+        if not note:
+            return ""
+        return ("A human approved the %s with a qualification. It is part of what "
+                "was approved, and where it conflicts with the written plan the "
+                "human is right:\n\n  %s" % (gn.get("kind", "work"), note))
+
+    def _with_note(self, extra):
+        """Append the human's qualification to a prompt that may be empty."""
+        note = self._human_note()
+        if not note:
+            return extra
+        return "%s\n\n%s" % (extra, note) if extra else note
 
     def _findings_brief(self, sub):
         """What the reviewer rejected, for the implementer that has to fix it."""

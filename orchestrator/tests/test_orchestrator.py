@@ -2758,6 +2758,51 @@ class TestEndToEnd(unittest.TestCase):
         self.assertNotEqual((task.state.get("pending_gate") or {}).get("kind"), first,
                             "still parked on the gate that was already answered")
 
+    def test_a_qualified_approval_reaches_the_agents_that_act_on_it(self):
+        """"Yes, but keep the old endpoint" is not a yes to what was proposed.
+
+        The note was recorded in `gates[]` and read by nobody, which makes it a
+        record of an instruction that never happened. It has to reach the
+        implementer, who builds the different thing, and the reviewer, who would
+        otherwise flag the retained endpoint as scope creep and reject work that
+        is doing exactly what the human asked.
+        """
+        script, _ = self._script()
+        task = store.Task.create(self.t.repo, "T-042", "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        task.update(gate_note={"kind": "plan", "note": "keep the old endpoint working"})
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                            lambda k, t: True, log=lambda *_: None)
+
+        note = orch._human_note()
+        self.assertIn("keep the old endpoint working", note)
+        self.assertIn("plan", note, "the agent is not told which gate this came from")
+
+        # folded into a prompt that already had content, and one that had none
+        self.assertIn("existing text", orch._with_note("existing text"))
+        self.assertIn("keep the old endpoint working", orch._with_note("existing text"))
+        self.assertEqual(orch._with_note(None), note)
+
+        # and it survives all the way into what an agent is actually handed
+        for role in ("implementer", "reviewer"):
+            text = prompts.compose(role, task, extra=orch._with_note(None))
+            self.assertIn("keep the old endpoint working", text,
+                          "the %s never sees the qualification" % role)
+
+    def test_no_qualification_adds_nothing_to_a_prompt(self):
+        """An unqualified yes must not append an empty paragraph to every
+        downstream prompt — `_with_note` has to be a no-op, not a formatter."""
+        script, _ = self._script()
+        task = store.Task.create(self.t.repo, "T-043", "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                            lambda k, t: True, log=lambda *_: None)
+        self.assertEqual(orch._human_note(), "")
+        self.assertEqual(orch._with_note("just this"), "just this")
+        self.assertIsNone(orch._with_note(None))
+        task.update(gate_note={"kind": "plan", "note": "   "})
+        self.assertEqual(orch._human_note(), "", "whitespace is not a qualification")
+
     def test_unparseable_plan_parks_rather_than_guessing(self):
         script, _ = self._script()
         script["planner"] = lambda env, cwd: _spit(

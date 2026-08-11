@@ -267,13 +267,26 @@ def cmd_approve(args):
     # resume past the stage that asked them, so a machine-side recording would
     # silently lose those approvals entirely.
     task.record_gate(pend["kind"], decision, args.note)
-    task.update(pending_gate=dict(pend, decision=decision, note=args.note))
+    if decision == "approved" and args.note.strip():
+        # Carried into the prompts of the planner, implementers and reviewer.
+        # A qualified yes approves something other than what was proposed, and
+        # the agents that build and check it have to be told -- otherwise the
+        # note is a record of an instruction nobody ever followed.
+        task.update(gate_note={"kind": pend["kind"], "note": args.note.strip()})
+    # The merge gate keeps its pending decision because `_stage_integrate` is
+    # re-entered and consumes it. The design and plan gates resume PAST the
+    # stage that asked, so nothing would ever consume theirs -- and a stale
+    # `pending_gate` makes the next `approve` refuse as already-answered.
+    if pend["kind"] == "merge":
+        task.update(pending_gate=dict(pend, decision=decision, note=args.note))
+    else:
+        task.update(pending_gate=None)
     print("%s gate: %s%s" % (pend["kind"], decision,
                              " — %s" % args.note if args.note else ""))
     if decision == "declined":
         # A decline ends the run by definition, so there is nothing to continue
-        # into. The machine still consumes the pending decision on the next
-        # resume, which is what puts it in the gate history.
+        # into. It is already in the gate history above; nothing downstream has
+        # to run for the rejection to have been recorded.
         task.update(status="needs_human")
         print("task parked at needs_human; `delegate resume --stage <stage>` to redirect")
         return 0

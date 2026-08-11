@@ -3,7 +3,7 @@
 The deterministic half of the system. The skill tells agents *how to behave*;
 this program decides *what runs next, on which model, and whether it is allowed
 to*. **This file is what is actually built**; the `§` citations throughout point
-at [`../DESIGN.md`](../DESIGN.md), the initial design, for why a decision went
+in git history at `DESIGN.md`, the initial design, for why a decision went
 the way it did — start at its §15.
 
 **`adg`** is short for *agent delegation*. It is the Python package name, and the
