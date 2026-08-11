@@ -19,21 +19,47 @@ prevent. The one exception is already covered elsewhere: a file outside its
 declared scope is caught mechanically by verify.scope_violations.
 """
 
+import glob
 import json
 import os
 import subprocess
 
 ENV_OVERRIDE = "ADG_WINNOW_SCAN"
 
+_TAIL = os.path.join("code-winnow", "scripts", "scan.py")
+
 # Standard skill locations across runtimes, in the order a human would expect
 # a project-local install to win.
 SEARCH = (
-    os.path.join(".claude", "skills", "code-winnow", "scripts", "scan.py"),
-    os.path.join(".agents", "skills", "code-winnow", "scripts", "scan.py"),
-    os.path.join("~", ".claude", "skills", "code-winnow", "scripts", "scan.py"),
-    os.path.join("~", ".cursor", "skills", "code-winnow", "scripts", "scan.py"),
-    os.path.join("~", ".agents", "skills", "code-winnow", "scripts", "scan.py"),
+    os.path.join(".claude", "skills", _TAIL),
+    os.path.join(".agents", "skills", _TAIL),
+    os.path.join("~", ".claude", "skills", _TAIL),
+    os.path.join("~", ".cursor", "skills", _TAIL),
+    os.path.join("~", ".agents", "skills", _TAIL),
 )
+
+# Plugin installs nest the same `skills/<name>/` tail under a marketplace and a
+# plugin directory, at a depth that varies by runtime -- which is why this is a
+# bounded walk rather than more entries in SEARCH. `companions.py` already had
+# to do this; a skill delivered as a plugin was reported "not installed" here
+# only because this module happened to be written against the flat layout.
+PLUGIN_ROOTS = (
+    os.path.join("~", ".claude", "plugins", "cache"),
+    os.path.join("~", ".claude", "plugins", "marketplaces"),
+)
+
+
+def _in_plugins():
+    for root in PLUGIN_ROOTS:
+        base = os.path.expanduser(root)
+        if not os.path.isdir(base):
+            continue
+        for depth in range(1, 4):
+            pattern = os.path.join(base, *(["*"] * depth), "skills", _TAIL)
+            for hit in sorted(glob.glob(pattern)):
+                if os.path.isfile(hit):
+                    return hit
+    return None
 
 
 def find(repo, configured=None):
@@ -45,7 +71,8 @@ def find(repo, configured=None):
         path = os.path.expanduser(rel) if rel.startswith("~") else os.path.join(repo, rel)
         if os.path.isfile(path):
             return os.path.abspath(path)
-    return None
+    hit = _in_plugins()
+    return os.path.abspath(hit) if hit else None
 
 
 def misconfigured(configured=None):
@@ -127,6 +154,14 @@ def summarize(data, run_id=None):
                             "generated or unreadable — nothing was scanned"
                             if data.get("errors") else
                             "no diff in scope — nothing was scanned")}
+        # Files in scope, none of them opened. scan.py calls this out and clears
+        # `complete`, but reporting it as a scan that ran and found nothing put
+        # the whole fact in a caveat under a zero -- and a zero is what a clean
+        # branch looks like. It scanned nothing; say that instead.
+        if "scanned_files" in data and not data.get("scanned_files"):
+            return {"ran": False, "run_id": run_id,
+                    "why": "all %d file(s) in scope were skipped or unreadable "
+                           "— nothing was scanned" % data["files"]}
     out = {"ran": True, "run_id": run_id, "total": len(findings),
            # False when a file in scope could not be read. The findings that did
            # land are still true; the coverage behind them is not whole, and a

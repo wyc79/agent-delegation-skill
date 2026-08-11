@@ -65,10 +65,11 @@ Push the rules into POCOs and let components call them.
 
 ## Windows
 
-Unity development is mostly Windows. Long paths, case-insensitive scope
-matching, CRLF diffs, and the editor holding file locks all bite here — see
-`DESIGN.md` §4.4b. Practical rule: keep worktrees at a short path, and expect
-`git worktree remove` to fail while the editor is open.
+Unity development is mostly Windows. Long paths, case-insensitive scope matching
+(`Foo.cs` and `foo.cs` are one file, so two agents scoped to them share it), CRLF
+diffs, and the editor holding file locks all bite here. Practical rule: keep
+worktrees at a short path, and expect `git worktree remove` to fail while the
+editor is open.
 
 ## Before you report
 

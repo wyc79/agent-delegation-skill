@@ -40,8 +40,11 @@ automatable here — needs manual check."
 
 Write tests that run without the engine, the network, or a full build wherever
 the logic allows — those run on every implementation iteration. Tests that need
-the engine or a long build run only at stage boundaries, so mark them clearly
-(the project's tag or directory convention; your prompt names it).
+the engine or a long build run only at stage boundaries, so mark them clearly,
+using whatever tag or directory convention the existing suite already uses. Your
+prompt names the fast and slow **commands**, not the convention — read the
+difference between them, and if the suite has no convention to follow, say which
+tests are slow in your report rather than inventing one nobody will honour.
 
 If a requirement can only be checked slowly, that is fine — just do not disguise
 a slow test as a fast one.

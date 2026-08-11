@@ -56,10 +56,15 @@ Log a `deviations.md` entry too if the resolution departed from the plan.
 
 ## Step 5 — Report
 
-Write `reports/integrate-integrator.json` per `schemas/report.schema.json`:
-what conflicted, how you resolved each conflict and on what authority, what you
-discarded (explicitly — this is the part humans most need to see), and the
-verification evidence for the combined result.
+Write `reports/integrate-<subtask-id>.json` per `schemas/report.schema.json` —
+the id of the subtask whose merge you were called in for, which your prompt
+names. **Not `integrate-integrator.json`:** a wave can conflict twice and call
+two integrators, and a role-named file cannot say which merge it describes, so
+it is read as no report at all.
+
+Record what conflicted, how you resolved each conflict and on what authority,
+what you discarded (explicitly — this is the part humans most need to see), and
+the verification evidence for the combined result.
 
 ## Stop and escalate when
 
@@ -67,6 +72,7 @@ verification evidence for the combined result.
   failure; resolving it by fiat hides it.
 - Reconciliation would require substantial new code rather than a merge.
 - An unmergeable binary conflict has no clearly correct side.
+- One side's work must be discarded wholesale.
 
 ## Your triggers
 
@@ -76,4 +82,3 @@ Beyond the shared ones in `SKILL.md`, and only when the condition applies:
 |---|---|
 | Before you write code | `references/companions.md` |
 | You are reconciling work from concurrent worktrees | `references/parallelism.md` |
-- One side's work must be discarded wholesale.

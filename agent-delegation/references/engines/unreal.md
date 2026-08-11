@@ -64,8 +64,7 @@ booting the full editor. Push rules there wherever the plan allows.
 
 Unreal development is mostly Windows, where deep `Intermediate/` paths routinely
 approach the 260-character limit and the editor holds locks on `Binaries/`. Keep
-worktrees at a short root path and expect cleanup to need a retry — see
-`DESIGN.md` §4.4b.
+worktrees at a short root path and expect cleanup to need a retry.
 
 ## Before you report
 

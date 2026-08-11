@@ -16,8 +16,11 @@ Two principles drive every design decision, in this order:
 2. Separate the workflow from the model/provider, so providers can be swapped
    without redesigning anything.
 
-The full technical design — lifecycle, routing, escalation, parallelism,
-security, failure recovery — is in [`DESIGN.md`](DESIGN.md).
+[`DESIGN.md`](DESIGN.md) is the **initial design** — lifecycle, routing,
+escalation, parallelism, security, failure recovery — written before any code
+existed. It is the reasoning behind the decisions, not a description of current
+behaviour; where the two disagree the code is right.
+[`orchestrator/README.md`](orchestrator/README.md) is what is actually built.
 
 ## Install
 
@@ -86,13 +89,15 @@ agent-delegation/
 │   ├── escalation.md     when to stop, and how to hand off a stuck task
 │   ├── deviations.md     minor vs major departures from the plan
 │   ├── parallelism.md    file scopes and worktree etiquette
+│   ├── handover.md       continuing a turn another agent left part-way
+│   ├── companions.md     which optional skills apply to which role
 │   ├── scratch-files.md  the narrow in-repo escape hatch
 │   └── engines/          Godot / Unity / Unreal specifics
 ├── schemas/              JSON Schema for reports, verdicts, subtask blocks
 └── templates/            copy-paste starting points for task/plan/deviations
 
 registry.default.yaml     model scores, tier bands, routing policy (orchestrator-side)
-DESIGN.md                 the full architecture and the reasoning behind it
+DESIGN.md                 the initial design — why each decision went that way
 ```
 
 **Progressive disclosure is a hard constraint, not a style.** `SKILL.md` stays
@@ -135,10 +140,12 @@ Optional, detected automatically, each attached where it belongs. Missing ones
 are reported as missing rather than silently skipped.
 
 - **[code-winnow](https://github.com/wyc79/code-winnow-skill)** — its
-  deterministic scanner runs as part of verification (stdlib, sub-second, no
-  model call) and flags generated-code chaff. Pointed at this repo's own last
-  five commits it read 25 files in 0.6s and returned five P2s — two dead locals
-  and three near-duplicate tests — all of them real.
+  deterministic scanner runs at the review stage (stdlib, sub-second, no model
+  call) and flags generated-code chaff, on tasks that skip LLM review too. It is
+  fast enough that the cost never enters the decision: on this repo it reads a
+  five-commit range in about 0.6s. The findings it returns are advisory, and it
+  has been worth having — an early run against five commits of this repo turned
+  up two dead locals and three near-duplicate tests, all real.
 - **[`andrej-karpathy-skills:karpathy-guidelines`](https://github.com/multica-ai/andrej-karpathy-skills)** — 67 lines on the mistakes
   that make generated code fail review (overcomplication, unrequested scope,
   unstated assumptions). Read by agents *before* they write code.
@@ -262,7 +269,7 @@ $ADG channels                  # quota cooldowns and draw per seat
 And from a clone of *this* repo, the suites:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 155 tests, no tokens spent
+python3 orchestrator/tests/test_orchestrator.py  # 171 tests, no tokens spent
 python3 orchestrator/tests/test_failover.py      #  95 more, same
 ```
 

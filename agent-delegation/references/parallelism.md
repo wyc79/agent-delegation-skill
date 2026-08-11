@@ -17,8 +17,9 @@ stay inside your scope so the merge is mechanical.
 ## Rules while working
 
 1. **Write only inside your `file_scope`.** This is what makes concurrent work
-   safe. It is enforced — out-of-scope hunks get flagged at review and may be
-   reverted automatically.
+   safe. It is enforced by measurement, not by a rollback: every file you touch
+   outside it is compared against the plan mechanically and sent to a reviewer,
+   including on tasks that would otherwise have skipped review entirely.
 2. **Reading outside your scope is fine.** `reads:` in your subtask block lists
    what you depend on; reading more is allowed, but remember those files may be
    changing under you.

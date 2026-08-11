@@ -1602,6 +1602,17 @@ class TestResume(unittest.TestCase):
             pass
         self.assertNotEqual(store.Task.open(self.t.repo, "T-RS").state["status"], "plan")
 
+    def test_every_advertised_stage_has_a_handler(self):
+        """STAGES is what `--stage` is validated against, so an entry with no
+        `_stage_` method is a stage the CLI accepts and the run loop then parks
+        on -- the exact outcome that validation was added to prevent. "verify"
+        sat here for that reason: checks run inside implement and review, never
+        as a stage of their own."""
+        from adg.machine import STAGES, TERMINAL
+        missing = [s for s in STAGES
+                   if s not in TERMINAL and not hasattr(Orchestrator, "_stage_" + s)]
+        self.assertEqual(missing, [])
+
     def test_a_misspelled_stage_is_refused_before_it_is_written(self):
         # --stage was written to status verbatim, and an unknown status has no
         # handler -- so a typo persisted first and parked the task with "no
@@ -1768,6 +1779,178 @@ class TestSkillContract(unittest.TestCase):
         self.assertNotIn("$AGENT_DELEGATION_TASK_DIR", desc,
                          "the task directory is a location, not an assignment")
 
+    def test_the_skill_cites_nothing_outside_itself(self):
+        """README offers `agent-delegation/` as a copy-in install, so a citation
+        of DESIGN.md or orchestrator/ is a pointer that dangles for every user who
+        takes that path -- and it is invisible from inside this repo, where the
+        file it names is always there."""
+        for base, _dirs, names in os.walk(self.SKILL):
+            for name in names:
+                if not name.endswith((".md", ".json")):
+                    continue
+                path = os.path.join(base, name)
+                body = _slurp(path)
+                rel = os.path.relpath(path, self.SKILL)
+                for outsider in ("DESIGN.md", "orchestrator/", "registry.default.yaml"):
+                    self.assertNotIn(outsider, body,
+                                     "%s cites %s, which is not shipped with the "
+                                     "skill" % (rel, outsider))
+
+    def test_the_integrator_names_its_report_by_subtask_not_by_role(self):
+        """`_reconcile` passes a subtask, so `_collect_report` identifies the
+        report by that id alone -- the wave-attribution rule. A card that says
+        `integrate-integrator.json` describes a file the orchestrator can never
+        credit, and a conflicting wave calls two integrators anyway."""
+        card = self._card("integrator")
+        self.assertIn("reports/integrate-<subtask-id>.json", card)
+        self.assertIn("Not `integrate-integrator.json`", card)
+
+    def test_a_card_named_integrator_report_is_actually_collected(self):
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, "reports"))
+            task = store.Task(d)
+            task.write_json("task.json", {"id": "T-1"})
+            sub = {"id": "st-2-beta"}
+            _report(d, "integrate-%s.json" % sub["id"], {
+                "stage": "integrate", "role": "integrator", "status": "complete",
+                "summary": "kept st-4's registration", "evidence": {"tests": "3 passed"}})
+            orch = Orchestrator.__new__(Orchestrator)
+            orch.task = task
+            report, problems = orch._collect_report("integrator", sub)
+            self.assertIsNone(problems)
+            self.assertEqual(report["status"], "complete")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestRoleMandate(unittest.TestCase):
+    """`AGENT_DELEGATION_ROLE` is what enlists an agent into this protocol. Every
+    role that carries it must have somewhere to go when the agent obeys."""
+
+    SKILL = os.path.join(REPO_ROOT, "agent-delegation")
+
+    def _task(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        task = store.Task(d)
+        task.write_json("task.json", {"id": "T-1", "limits": {}})
+        return task
+
+    def test_text_reply_roles_are_not_conscripted(self):
+        task = self._task()
+        for role in sorted(prompts.TEXT_REPLY_ROLES):
+            env = prompts.env_for(task, role)
+            self.assertNotIn("AGENT_DELEGATION_ROLE", env,
+                             "%s has no card, no task id and no report to write; "
+                             "telling it the protocol applies makes it answer with "
+                             "a blocked report instead of the verdict" % role)
+            # The location still travels: that is the whole point of the split.
+            self.assertEqual(env["AGENT_DELEGATION_TASK_DIR"], task.path)
+
+    def test_every_conscripted_role_has_a_card(self):
+        task = self._task()
+        for role in ("planner", "implementer", "test-author", "reviewer", "integrator"):
+            env = prompts.env_for(task, role)
+            self.assertEqual(env["AGENT_DELEGATION_ROLE"], role)
+            self.assertTrue(os.path.isfile(
+                os.path.join(self.SKILL, "roles", "%s.md" % role)),
+                "%s is given the mandate with no card to read" % role)
+
+    def test_runtime_does_not_keep_a_second_copy_of_the_list(self):
+        self.assertIs(runtime.HerdrAdapter.TEXT_REPLY_ROLES, prompts.TEXT_REPLY_ROLES)
+
+    def test_the_attempt_budget_is_not_quoted_to_roles_that_have_none(self):
+        task = self._task()
+        task.write_json("task.json", {"id": "T-1",
+                                      "limits": {"max_attempts_per_subtask": 8}})
+        self.assertNotIn("attempts on this subtask",
+                         prompts.compose("reviewer", task))
+        self.assertIn("attempts on this subtask",
+                      prompts.compose("implementer", task,
+                                      subtask={"id": "st-1", "file_scope": ["src/**"]}))
+
+    def test_the_scope_line_promises_only_what_happens(self):
+        task = self._task()
+        text = prompts.compose("implementer", task,
+                               subtask={"id": "st-1", "file_scope": ["src/**"]})
+        self.assertNotIn("reverted", text,
+                         "nothing in this program reverts an out-of-scope hunk; "
+                         "it records the files and forces a review")
+        self.assertIn("recorded and sent to a reviewer", text)
+
+
+class TestReviewInputs(unittest.TestCase):
+    """`roles/reviewer.md` step 1 calls them "the diff, and the verify output
+    your prompt provides", and step 6 authorises a `blocked` report when they
+    never arrive. The prompt named neither, so a card-compliant reviewer could
+    halt the run over an input the orchestrator was holding all along."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_the_reviewer_is_given_the_diff_and_the_verify_output(self):
+        _spit(os.path.join(self.t.repo, ".adg.yaml"), 'fast:\n  - "true"\n')
+        task = store.Task.create(self.t.repo, "T-RV", "# t\n\n- **AC-1** — works\n",
+                                 dict(self.reg["policy"]["limits"]))
+        task.update(status="review", classification={"tier": "complex"},
+                    subtasks=[{"id": "st-1-main", "status": "complete",
+                               "actual_files": ["app.py"], "planned_scope": ["**"]}])
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(),
+                            lambda k, t: True, log=lambda *_: None)
+        with self.assertRaises(Halt):
+            # The mock writes no verdict, so review halts -- but the prompt was
+            # composed and logged on the way, which is what this reads back.
+            orch._stage_review()
+        text = "".join(_slurp(task.file("agent-logs", n))
+                       for n in os.listdir(task.file("agent-logs"))
+                       if n.startswith("reviewer-"))
+        self.assertIn("git diff %s" % task.state["repo"]["base_commit"], text,
+                      "the reviewer was never told what to diff against")
+        self.assertIn(os.path.join(task.path, "verify"), text,
+                      "the reviewer was never pointed at the verify output")
+
+
+class TestCapabilityHint(unittest.TestCase):
+    """subtask.schema.json has always said a hint "raises the router's
+    requirements for this subtask". Nothing read it, so a subtask marked
+    very_high drew the same model as a one-line rename."""
+
+    def setUp(self):
+        self.reg = router.load_registry(REGISTRY)
+
+    def test_a_hint_becomes_a_numeric_floor(self):
+        self.assertEqual(router.as_boost({"reasoning": "high", "coding": "very_high"}),
+                         {"reasoning": 4, "coding": 5})
+
+    def test_a_typo_is_dropped_rather_than_guessed_at(self):
+        self.assertEqual(router.as_boost({"reasoning": "extremely_high"}), {})
+        self.assertEqual(router.as_boost(None), {})
+
+    def test_the_hint_raises_the_floor(self):
+        r = router.Router(self.reg)
+        plain = r.candidates("implementer")[0]
+        strong = r.candidates("implementer", boost=router.as_boost({"reasoning": "very_high"}))
+        self.assertEqual(plain.model, "balanced-coder")
+        self.assertTrue(strong, "reasoning 5 is enrolled for implementer")
+        for c in strong:
+            self.assertGreaterEqual(c.spec["reasoning"], 5)
+
+    def test_an_unreachable_hint_degrades_instead_of_parking_the_task(self):
+        t = TempRepo()
+        self.addCleanup(t.close)
+        task = store.Task.create(t.repo, "T-CH", "# t\n",
+                                 dict(self.reg["policy"]["limits"]))
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(),
+                            lambda k, txt: True, log=lambda *_: None)
+        # ctx 10**9 is above every enrolled model: a floor nothing can clear.
+        choice = orch._pick_implementer({"id": "st-1", "capability_hint": {"ctx": 10 ** 9}})
+        self.assertEqual(choice.model, "balanced-coder")
+
 
 class TestRoundVersioning(unittest.TestCase):
     def setUp(self):
@@ -1821,6 +2004,37 @@ class TestWinnow(unittest.TestCase):
         finally:
             del os.environ[winnow.ENV_OVERRIDE]
         shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_plugin_install_is_found_rather_than_reported_missing(self):
+        """code-winnow can be delivered as a plugin, which nests the same
+        `skills/<name>/` tail under a marketplace and a plugin directory.
+        `companions.py` already walked those roots; this module was written
+        against the flat layout and answered "not installed"."""
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        nested = os.path.join(home, ".claude", "plugins", "cache", "some-market",
+                              "winnow-plugin", "skills", "code-winnow", "scripts")
+        os.makedirs(nested)
+        open(os.path.join(nested, "scan.py"), "w").close()
+        prev = os.environ.get("HOME")
+        os.environ["HOME"] = home
+        try:
+            found = winnow.find(tempfile.mkdtemp())
+        finally:
+            if prev is not None:
+                os.environ["HOME"] = prev
+        self.assertEqual(found, os.path.join(nested, "scan.py"))
+
+    def test_files_in_scope_but_none_opened_is_not_a_clean_scan(self):
+        """scan.py answers this with files>0, scanned_files=0 and complete:false.
+        Summarised as a run that found nothing, the whole fact lived in a caveat
+        under a zero -- and a zero is what a clean branch looks like."""
+        out = winnow.summarize({"files": 4, "scanned_files": 0, "findings": [],
+                                "complete": False, "errors": [{"path": "a.min.js"}]},
+                               "v-1")
+        self.assertFalse(out["ran"])
+        self.assertIn("nothing was scanned", out["why"])
+        self.assertIn("did not run", winnow.as_text(out))
 
     def test_a_configured_path_that_is_wrong_says_so(self):
         # Otherwise a typo in winnow_scan is indistinguishable from a machine

@@ -21,6 +21,25 @@ class RoutingError(RuntimeError):
     pass
 
 
+def as_boost(hint):
+    """A plan's `capability_hint` as a `boost` mapping, or {}.
+
+    The planner writes difficulty in words (`{reasoning: high}`); `_meets` reads
+    floors as numbers. Unknown capabilities and unknown words are dropped rather
+    than guessed at -- a hint is the planner's read, and a typo in it must not be
+    able to raise a floor nothing can clear.
+    """
+    out = {}
+    for cap, level in (hint or {}).items():
+        if isinstance(level, bool):
+            continue
+        if isinstance(level, str):
+            level = _LEVELS.get(level.lower())
+        if isinstance(level, (int, float)):
+            out[cap] = int(level)
+    return out
+
+
 class NoModelAvailable(RoutingError):
     pass
 

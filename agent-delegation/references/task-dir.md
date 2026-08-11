@@ -45,11 +45,19 @@ POSIX shell (Linux, macOS, Git Bash / WSL on Windows):
 ```bash
 CD=$(git rev-parse --path-format=absolute --git-common-dir)
 CD=${CD%/}
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) CD=$(printf %s "$CD" | tr 'A-Z' 'a-z');; esac
 NAME=$(basename "$(dirname "$CD")")
 HASH=$(printf %s "$CD" | { command -v sha256sum >/dev/null && sha256sum || shasum -a 256; } | cut -c1-8)
 ROOT=${XDG_STATE_HOME:-$HOME/.local/state}
 echo "$ROOT/agent-delegation/projects/$NAME-$HASH/tasks/"
 ```
+
+The `case` line is rule 3, and it is the whole reason this recipe is safe to run
+under Git Bash. Without it a Git Bash agent hashes `C:/Repo/.git` while the
+orchestrator — a native Windows process — hashes `c:/repo/.git`, they compute
+two different project keys for one repository, and the agent reports the task
+directory as missing. WSL is Linux and takes the `esac` branch correctly: its
+paths are `/mnt/c/...` and case-sensitive.
 
 PowerShell (native Windows):
 
