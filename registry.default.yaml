@@ -5,12 +5,12 @@
 # Two things live here and they are different:
 #   * Capability scores + tier bands  -> reference data, the same for everyone.
 #     Inherit these; do not hand-tune them without evidence from telemetry.
-#   * enrolled_roles + policy         -> yours. `delegate init` proposes them by
+#   * enrolled + policy               -> yours. `delegate init` proposes them by
 #     detecting which agent CLIs are signed in; you confirm once.
 #
-# Enrollment is FAIL-CLOSED: a model with `enrolled_roles: []` is invisible to
-# the router no matter how capable. That is how the top tier stays off by
-# default — there is no denylist to maintain.
+# Enrollment is FAIL-CLOSED: a model with `enrolled: false` is invisible to the
+# router no matter how capable. That is how a tier stays off by default —
+# there is no denylist to maintain.
 
 version: 1
 
@@ -23,13 +23,18 @@ version: 1
 #   speed       1 slow ... 5 fast
 #   ctx         usable context window
 #   cost_*      USD per million tokens, list price (metered channels only)
-#   tier        t1 cheap/fast | t2 strong | t3 ultra (heaviest reasoning tiers)
+#   tier        t1 cheap/fast | t2 the workhorse | t3 the strongest enrolled
+#
+# ONE model per band, and that is the point: a job asks for a tier, so a tier
+# has to name something. When t2 held both the workhorse and the strong model,
+# `tier: t2` could not say which -- the score decided, the strong one never won
+# an implementation, and "the default provider for t2" had no answer.
 # ---------------------------------------------------------------------------
 
 models:
   # --- t2: strong. The working ceiling for most deployments. ----------------
   opus-class-strong:
-    tier: t2
+    tier: t3
     reasoning: 5
     coding: 5
     adherence: 4
@@ -38,7 +43,7 @@ models:
     ctx: 200000
     cost_in: 15
     cost_out: 75
-    enrolled_roles: [planner, reviewer, integrator, implementer]
+    enrolled: true
     notes: >
       Plan and review. Enrolled for implementer as the ESCALATION target, not as
       a default: the implementer profile weights speed, so this scores 25 against
@@ -58,7 +63,7 @@ models:
     ctx: 200000
     cost_in: 3
     cost_out: 15
-    enrolled_roles: [implementer, test-author, integrator]
+    enrolled: true
     notes: The workhorse. Most implementation should land here.
 
   # --- t1: cheap/fast. Predictable work only. -------------------------------
@@ -72,7 +77,7 @@ models:
     ctx: 1000000
     cost_in: 0.3
     cost_out: 1.5
-    enrolled_roles: [test-author, classifier, reporter]
+    enrolled: true
     notes: Classification, plain-language briefs, mechanical test writing.
 
   # --- t3: ultra. Present, scored, DELIBERATELY UNUSED. ---------------------
@@ -88,52 +93,28 @@ models:
     ctx: 1000000
     cost_in: 25
     cost_out: 125
-    enrolled_roles: []
+    enrolled: false
     notes: >
       Heaviest reasoning tier. Large marginal cost and latency for usually
       marginal gain on coding work. Turn on only for a specific hard problem,
       and prefer a re-plan or a human first.
 
 # ---------------------------------------------------------------------------
-# Role -> capability requirements. The workflow names roles; only this file
-# names models. Swapping providers is an edit here and nowhere else.
+# What a job needs. One profile, because there is one kind of job: something the
+# caller decomposed, run in a worktree. Which MODEL serves it is decided by the
+# job's `tier`, not by a role -- a role names which instructions an agent reads
+# and stopped naming which model runs it.
+#
+# `require` is a floor every candidate must clear whatever its tier; `weights`
+# rank what is left. Both apply within a band, so they only ever choose between
+# models the caller's tier already admitted.
 # ---------------------------------------------------------------------------
 
 profiles:
-  planner:
-    require: {reasoning: 5, ctx: 150000}
-    weights: {reasoning: 3, adherence: 1}
-    cost_sensitivity: low
-
-  implementer:
-    require: {coding: 4, tool: 4}
+  worker:
+    require: {coding: 3, tool: 3}
     weights: {coding: 3, adherence: 2, speed: 1}
     cost_sensitivity: high
-
-  test-author:
-    require: {coding: 3}
-    weights: {adherence: 3, coding: 2}
-    cost_sensitivity: high
-
-  reviewer:
-    require: {reasoning: 4, coding: 4}
-    weights: {reasoning: 3, coding: 2}
-    cost_sensitivity: medium
-
-  integrator:
-    require: {reasoning: 4, coding: 4, adherence: 4}
-    weights: {reasoning: 2, adherence: 3}
-    cost_sensitivity: medium
-
-  classifier:
-    require: {}
-    weights: {speed: 2}
-    cost_sensitivity: max
-
-  reporter:
-    require: {}
-    weights: {speed: 2, adherence: 2}
-    cost_sensitivity: max
 
 # ---------------------------------------------------------------------------
 # Access channels — how models are actually reachable. Written by
@@ -153,6 +134,20 @@ profiles:
 # For a subscription seat the marginal cost of a call is ~0 while the quota
 # window has headroom, so the router weights quota draw, not list price.
 # ---------------------------------------------------------------------------
+
+# The tier -> default provider table this produces. A job names a tier; the tier
+# names a model; `prefers` names the seat that should serve it when more than
+# one can. This is the contract a calling skill picks from, so it has to be
+# legible here rather than emergent:
+#
+#     t1  fast-cheap         cursor-seat     mechanical, high volume
+#     t2  balanced-coder     cursor-seat     the workhorse; most jobs
+#     t3  opus-class-strong  claude-seat     the hard one in the batch
+#
+# `prefers` is load-bearing for t2, where both seats expose the model: without
+# it the tie fell to the alphabet and every job went to claude-seat. It is a
+# preference and not a pin -- a cooled or drawn-down seat still yields, which is
+# the entire point of the program.
 
 channels:
   claude-seat:
@@ -216,7 +211,7 @@ policy:
   # control that does not exist reads as protection and is not. Add it back in
   # the same commit that makes the router price a slot against it.
   escalation_ceiling:
-    max_tier: t2                      # ultra tier is out of the ladder's reach
+    max_tier: t3                      # the strongest ENROLLED tier; ultra is off
   # Deployment defaults for task.json `limits`.
   # A task may lower any of these; never raise. Missing/invalid -> fail closed.
   limits:

@@ -4,7 +4,11 @@
   "title": "Subtask block",
   "description": "Schema for each entry in the YAML `## Subtasks` block of plan.md. Written by the planner; read by the orchestrator (for scheduling and scope enforcement) and by implementers (as their assignment).",
   "type": "object",
-  "required": ["id", "goal", "file_scope", "acceptance"],
+  "required": [
+    "id",
+    "goal",
+    "file_scope"
+  ],
   "additionalProperties": false,
   "properties": {
     "id": {
@@ -19,41 +23,38 @@
     "file_scope": {
       "type": "array",
       "minItems": 1,
-      "items": { "type": "string" },
-      "description": "Write scope: globs this subtask may modify. Enforced — out-of-scope hunks are flagged at review. Be precise; an over-broad scope defeats parallel safety."
+      "items": {
+        "type": "string"
+      },
+      "description": "Write scope: globs this subtask may modify. Enforced \u2014 out-of-scope hunks are flagged at review. Be precise; an over-broad scope defeats parallel safety."
     },
     "reads": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Files this subtask depends on but must not modify."
     },
     "depends_on": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Subtask ids that must complete first. Empty means it can start immediately."
-    },
-    "parallel_group": {
-      "type": "string",
-      "description": "The planner's grouping of subtasks it believes can run together. Advisory: scheduling is decided from depends_on plus disjoint write scopes and hotspots, so a group is a hint to a human reader and never grants concurrency on its own."
     },
     "hotspots": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Unmergeable or high-coupling files this subtask must touch (engine scenes, project settings, central modules). Taken as exclusive locks."
     },
     "frozen_interfaces": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Exact signatures/signals this subtask must expose for others to code against. Changing one later is a major deviation."
-    },
-    "capability_hint": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "Planner's read on difficulty; raises the router's capability floors for this subtask. Advisory in one direction only: a floor nothing enrolled can clear is logged and dropped rather than parking the task.",
-      "properties": {
-        "reasoning": { "enum": ["low", "medium", "high", "very_high"] },
-        "coding": { "enum": ["low", "medium", "high", "very_high"] }
-      }
     },
     "estimated_loc": {
       "type": "integer",
@@ -63,12 +64,24 @@
     "acceptance": {
       "type": "array",
       "minItems": 1,
-      "items": { "type": "string", "pattern": "^AC-[0-9]+$" },
+      "items": {
+        "type": "string",
+        "pattern": "^AC-[0-9]+$"
+      },
       "description": "Acceptance criteria from task.md this subtask satisfies. Every AC in task.md must be claimed by at least one subtask."
     },
     "test_notes": {
       "type": "string",
       "description": "How this should be verified, and whether the checks are fast (engine-free) or slow."
+    },
+    "tier": {
+      "type": "string",
+      "enum": [
+        "t1",
+        "t2",
+        "t3"
+      ],
+      "description": "Which capability band should run this job. t1 cheap and fast, t2 the workhorse, t3 the strongest enrolled. The registry maps each band to a model and a default provider. Advisory: a band nothing enrolled can serve is logged and demoted rather than parking the run."
     }
   }
 }

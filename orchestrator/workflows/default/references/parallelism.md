@@ -18,13 +18,13 @@ stay inside your scope so the merge is mechanical.
 
 1. **Write only inside your `file_scope`.** This is what makes concurrent work
    safe. It is enforced by measurement, not by a rollback: every file you touch
-   outside it is compared against the plan mechanically and sent to a reviewer,
-   including on tasks that would otherwise have skipped review entirely.
+   outside it is measured mechanically and reported back to whoever dispatched
+   you, against the scope they gave you.
 2. **Reading outside your scope is fine.** `reads:` in your subtask block lists
    what you depend on; reading more is allowed, but remember those files may be
    changing under you.
 3. **Commit checkpoints often, inside your worktree.** They are free, and they
-   are what lets a crashed or escalated task resume instead of restarting. Never
+   are what lets an interrupted task resume instead of restarting. Never
    push, never switch branches, never `git checkout` another agent's branch.
 4. **Do not reformat, rename, or reorganize** files that are only incidentally in
    your path. A whole-file reformat turns a one-line merge into a manual one.
@@ -42,21 +42,6 @@ files, and central "everything touches it" modules. The plan marks them
 If you find yourself needing to edit a hotspot that is not in your subtask's
 `hotspots` list, stop and raise a signal. Two agents in one scene file produces a
 conflict no merge tool can resolve.
-
-## For planners deciding what can run in parallel
-
-Parallelize only when subtasks have **disjoint write scopes** and no dependency
-between them — or when you can freeze the interface between them in the plan,
-turning a dependency into a contract both sides code against.
-
-Do not parallelize for its own sake. Two agents on tightly coupled work is slower
-than one agent doing both, once you count the conflict, the integrator pass, and
-the re-verification. Sequential is the safe default; parallel is an optimization
-you justify.
-
-Signs a split should stay sequential: the pieces share a hotspot, the interface
-between them is exactly what the task is figuring out, or one piece's design
-plausibly changes the other's.
 
 ## When integration conflicts
 

@@ -1,96 +1,44 @@
-# The bundled default workflow: the role protocol this project used to BE.
+# The bundled workflow: delegate places the jobs you supply onto seats.
 #
-# It is one workflow among several now, not the only one. Everything the
-# orchestrator used to hardcode about it lives here -- which stages run, which
-# role each dispatches, where that role's instructions are, and which installed
-# skill supplies a stage's method.
+# There used to be a role protocol here -- a planner decomposed, a reviewer
+# ruled -- and it was measured against a caller doing the same work in one warm
+# context. It cost 4x the money, 4x the wall clock and 4x the tokens for an
+# identical result. What is left is the part no model release makes redundant:
+# N jobs, placed on whichever enrolled seat can run them, in isolated worktrees,
+# with quota metering, breakers and cross-provider failover underneath.
 #
-# What this file cannot do is invent a stage. The state machine is code on
-# purpose: `implement` runs worktrees, waves, an escalation ladder and a rework
-# loop, while `classify` is one line of text the program parses. Listing them as
-# if they were interchangeable data would be a lie that fails on the first
-# non-default workflow. A manifest enables a stage, disables it, repoints its
-# instructions, or hands its discipline to a foreign skill.
+# You supply the decomposition. Nothing here will second-guess it, review the
+# result, or retry a stuck job on a dearer model -- those are the caller's
+# decisions and the caller already has skills that make them.
+#
+#     delegate run "<what this is>" --plan my-jobs.md
+#
+# `--plan` is written to the task's plan.md, which is where the machine looks
+# for jobs when the task has none.
+#
+# A manifest cannot invent a stage: the state machine owns the graph
+# (`machine.STAGES`), and this file only says which parts of it run, where a
+# role's instructions live, and what a stage's method is. Naming a stage the
+# machine does not have would read like policy and route nothing, so the two
+# stages below are the two there are.
 
 name: default
 description: >
-  The role protocol: a planner decomposes, implementers work one subtask each in
-  isolated worktrees, a test author writes from requirements blind to the
-  implementation, and a reviewer rules against the plan.
+  Execution. The caller supplies the jobs; delegate places them on seats, runs
+  each in an isolated worktree, and integrates what comes back.
 
-# Read by every dispatched agent before its role card.
+# Read by every dispatched agent before its card. The worktree contract: what
+# isolation means, what the scope boundary is, and what to do when stuck.
 protocol: PROTOCOL.md
 
 stages:
 
-  # --- the two text-reply stages ------------------------------------------
-  # No role card, no report, no task id: these are one-shot questions this
-  # program parses, not roles in the protocol. `prompts.TEXT_REPLY_ROLES` is
-  # what stops them being conscripted, and it stays code -- an agent handed a
-  # mandate it has no card for writes a `blocked` report instead of answering.
-
-  intake:
-    role: intake
-
-  classify:
-    role: classifier
-    # Which work needs a plan, in this workflow's terms. The two tiers and the
-    # VERDICT line the program parses stay in `machine.CLASSIFY_PROMPT` -- the
-    # machine routes on the tier names, so they are not a manifest's to rename
-    # -- but the judgement itself used to be a string constant that opened
-    # "Classify this software task", which is this workflow's opinion sitting in
-    # the state machine. A workflow that says nothing here gets
-    # `DEFAULT_CLASSIFY_CRITERIA`, on the same rule as `enabled()`: silence
-    # leaves a stage as the machine has it. (yamlite drops blank lines inside a
-    # block scalar, so these paragraphs are separated by a single newline.)
-    criteria: |
-      SIMPLE: one coherent change a single competent engineer would finish in
-      one sitting without a written plan. A few files, no new architecture, no
-      format or interface that other code depends on.
-      COMPLEX: needs a plan first -- multiple independent parts, a new
-      abstraction or dependency, a change to a shared interface / schema / save
-      format, wide blast radius, or genuine ambiguity about what is wanted.
-      Bias: when the work is small and self-contained, say SIMPLE. Planning a
-      small task wastes far more than it saves.
-
-  # --- design -------------------------------------------------------------
-
-  brainstorm:
-    role: planner
-    card: roles/planner.md
-    # The whole compatibility story, in one block. This decision used to be
-    # hardcoded in `machine._stage_brainstorm` for exactly one skill; pointing
-    # the stage somewhere else is now a manifest edit rather than a patch.
-    discipline:
-      skill: superpowers:brainstorming
-      text: >
-        Use the `superpowers:brainstorming` skill's discipline for this: explore
-        the code first, then reason about purpose, constraints and success
-        criteria before proposing anything. Ignore its instructions about where
-        to save files and about committing.
-      fallback: Explore the code before proposing anything.
-
-  # --- the rest -----------------------------------------------------------
-
-  plan:
-    role: planner
-    card: roles/planner.md
-
   implement:
     role: implementer
-    card: roles/implementer.md
+    card: roles/worker.md
 
-  review:
-    role: reviewer
-    card: roles/reviewer.md
-
+  # Merges the job branches and writes the patch. Disabling it would end a run
+  # with the work stranded on branches nobody merges.
   integrate:
     role: integrator
     card: roles/integrator.md
-
-# Roles a stage dispatches alongside its own. The test author is not a stage:
-# it runs inside `plan`, before any implementation exists, which is the property
-# that makes it able to encode what was ASKED rather than what was built.
-extra_roles:
-  test-author:
-    card: roles/test-author.md

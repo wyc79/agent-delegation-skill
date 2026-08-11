@@ -330,14 +330,11 @@ admits only one sensible reading.
                         "depends_on": s.get("depends_on") or [],
                         "hotspots": s.get("hotspots") or [],
                         "frozen_interfaces": s.get("frozen_interfaces") or [],
-                        # Carried, not dropped. subtask.schema.json asks the
-                        # planner for these and they were landing nowhere:
-                        # `capability_hint` now routes (below), and the other two
-                        # are read by the agent out of plan.md but belong in
-                        # task.json so a run's record shows what was planned.
-                        "capability_hint": s.get("capability_hint") or {},
+                        # `tier` is the caller's routing decision and the only
+                        # one it gets to make; `estimated_loc` lands in the
+                        # record so a run shows what was asked for.
+                        "tier": s.get("tier"),
                         "estimated_loc": s.get("estimated_loc"),
-                        "parallel_group": s.get("parallel_group"),
                     })
                 return out
         return []
@@ -496,7 +493,7 @@ admits only one sensible reading.
         self.log("  %s: worktree brought up to %s" % (sub["id"], branch))
 
     def _one_subtask(self, sub, base):
-        role_choice = self._pick_implementer(sub)
+        role_choice = self._pick_worker(sub)
         # All per-subtask state stays local: this method runs concurrently in a
         # wave, and anything on self is shared with the siblings.
         attempts, session, report, failure = 0, None, None, None
@@ -587,33 +584,32 @@ admits only one sensible reading.
         out.append("Its worktree and checkpoints are left in place.")
         return " | ".join(out)
 
-    def _pick_implementer(self, sub):
-        """The implementer for one subtask, raised by its `capability_hint`.
+    def _pick_worker(self, sub):
+        """The seat for one job, from the tier the caller asked for.
 
-        The hint is the planner's read on difficulty, and subtask.schema.json has
-        always promised it "raises the router's requirements for this subtask" --
-        which nothing did, so a subtask marked `{reasoning: very_high}` drew the
-        same model as a one-line rename.
+        `tier` is the whole of the routing decision a caller gets to make, and
+        it is deliberately the only one: it names a band, the registry says
+        which model serves that band and which seat prefers it, and everything
+        else -- cooldowns, headroom, failover -- is this program's business.
 
-        Advisory on the way down, though: a hint no enrolled model can clear must
-        not park a task. The planner is guessing about difficulty, and a guess
-        that stops the run outright is worse than a guess that gets the ordinary
-        implementer. The demotion is logged, because a subtask running below the
-        strength its plan asked for is exactly the thing you want to see in the
-        log when it later escalates.
+        Advisory on the way down. A tier nothing enrolled can serve must not
+        park the run: the caller is judging difficulty from outside, and a guess
+        that stops the work outright is worse than a guess that gets the
+        ordinary worker. The demotion is logged, because a job running below the
+        band it asked for is exactly what you want to see in the log when it
+        later comes back stuck.
         """
-        boost = routing.as_boost(sub.get("capability_hint"))
-        if not boost:
-            return self._pick("implementer")
+        tier = sub.get("tier")
+        if not tier:
+            return self._pick()
         try:
-            return self._pick("implementer", boost=boost)
+            return self._pick(tier=tier)
         except routing.AllChannelsCooled:
             raise
         except routing.NoModelAvailable as e:
-            choice = self._pick("implementer")
-            self.log("  %s: plan asked for %s and nothing enrolled clears it — "
-                     "running on %s (%s)"
-                     % (sub["id"], sub.get("capability_hint"), choice.model, e))
+            choice = self._pick()
+            self.log("  %s: asked for tier %s and nothing enrolled serves it — "
+                     "running on %s (%s)" % (sub["id"], tier, choice.model, e))
             return choice
 
     def _run_wave(self, wave):
@@ -894,7 +890,10 @@ admits only one sensible reading.
         """A conflict two agents produced is judgement, not mechanism: which
         side matches the plan, and what did the other one mean."""
         try:
-            choice = self._pick("integrator")
+            # The strongest enrolled band: reconciling two agents' work is the
+            # hardest judgement this program asks for, and it is rare enough
+            # that paying for it is right.
+            choice = self._pick(tier=self._top_tier())
         except routing.AllChannelsCooled:
             # Re-raised, never flattened. `AllChannelsCooled` subclasses
             # `NoModelAvailable` precisely so a mandatory stage propagates it to
@@ -1139,6 +1138,19 @@ admits only one sensible reading.
         return "delegated change"
 
     # ---------------------------------------------------------------- infra
+    def _top_tier(self):
+        """The strongest band this deployment will actually use: the highest
+        tier with something enrolled, clamped by `escalation_ceiling`. Asked
+        rather than written down, so enrolling or retiring a model moves it."""
+        cap = (self.budget.ceiling() or {}).get("max_tier") or routing.TIERS[-1]
+        allowed = routing.TIERS[:routing.TIERS.index(cap) + 1]
+        live = {m.get("tier") for m in (self.reg.get("models") or {}).values()
+                if m.get("enrolled")}
+        for t in reversed(allowed):
+            if t in live:
+                return t
+        return None
+
     def _channel_state(self):
         """-> (now, cooled, utilization, entries). One clock read feeds routing,
         so every gate in a single selection sees the same instant."""
@@ -1154,7 +1166,7 @@ admits only one sensible reading.
             util[name] = cooldown.utilization(usage.get(name), chan.get("quota"), now)
         return now, set(cools), util, cools
 
-    def _pick(self, role, boost=None, exclude=(), min_reasoning=None):
+    def _pick(self, role=None, boost=None, exclude=(), min_reasoning=None, tier=None):
         """Best candidate this runtime can actually launch. The registry says
         what a deployment could use; only the adapter knows what is installed,
         so an uninstalled CLI is skipped rather than crashing the run.
@@ -1169,7 +1181,7 @@ admits only one sensible reading.
             return self.router.candidates(role, ceiling=self.budget.ceiling(),
                                           boost=boost, cooldowns=blocked,
                                           utilization=util,
-                                          ignore_reserve=ignore_reserve)
+                                          ignore_reserve=ignore_reserve, tier=tier)
 
         # Two passes, and the order matters. A reservation only withholds a seat
         # while the role has somewhere else to go, and "somewhere else" means a
