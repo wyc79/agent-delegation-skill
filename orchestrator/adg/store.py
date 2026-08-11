@@ -6,7 +6,7 @@ its worktrees -- that is what lets every agent in every worktree find the same
 task state with no configuration.
 
 The derivation must stay byte-identical to the agent-facing recipe in
-agent-delegation/references/task-dir.md, or agents and orchestrator will read
+orchestrator/workflows/default/references/task-dir.md, or agents and orchestrator will read
 different directories.
 """
 

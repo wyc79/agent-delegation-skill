@@ -206,7 +206,7 @@ policy:
     # orchestrator/README.md. Every attribution defect found on the way, in
     # product and harness both, is fixed and held by a deterministic test.
     max_parallel_agents: 3
-    human_approval_required: [plan, merge, dependency_change, destructive_op]
+    human_approval_required: [design, plan, merge, dependency_change, destructive_op]
   escalation_thresholds:
     test_stuck_attempts: 3
     edit_churn_rewrites: 4

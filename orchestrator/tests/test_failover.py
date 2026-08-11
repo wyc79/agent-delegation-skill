@@ -750,6 +750,55 @@ class TestFailoverEndToEnd(unittest.TestCase):
                               log=logs.append, clock=clock).run()
         return task, status, logs
 
+    def test_the_two_skill_searches_do_not_diverge(self):
+        """`companions` and `winnow` both answer "is this skill installed", and
+        they had different answers. `winnow` searched project-local trees and
+        `plugins/marketplaces`; `companions` searched neither, so a superpowers
+        install `winnow.find()` could see reported "not installed" there — and
+        `_stage_brainstorm` silently dropped to the generic prompt.
+
+        Neither module has to own the list. What must not happen is the two
+        drifting apart again without anything noticing.
+        """
+        from adg import companions, winnow
+        home = {r for r in companions.ROOTS if r.startswith("~")}
+        for entry in winnow.SEARCH:
+            if not entry.startswith("~"):
+                continue
+            root = entry.split(os.sep + "code-winnow")[0]
+            self.assertIn(root, home, "winnow searches %s and companions does not" % root)
+        for root in winnow.PLUGIN_ROOTS:
+            self.assertIn(root, home,
+                          "winnow searches the plugin root %s and companions does not" % root)
+        self.assertTrue(companions.PROJECT_ROOTS,
+                        "companions cannot see a project-local install at all")
+
+    def test_a_timeout_on_every_seat_is_not_reported_as_a_quota_wall(self):
+        """The failure the split introduced, and that no test drove.
+
+        `_invoke` appends a timed-out seat to `cooled` so the next iteration
+        cannot hand the same call back to it. `_pick` then reported everything
+        in that list as "in a quota cooldown" -- so a run where both agents
+        merely hung parked with `reason: quota_all_exhausted` and **zero open
+        breakers**: `delegate status` said "waiting on quota", the brief told
+        the human their subscription was exhausted, and a provider wall that
+        never happened went into the record that exists to count them.
+        """
+        _, script = self._script(quota_first=False)
+        script["implementer"] = lambda env, cwd: {
+            "settled": "timeout", "output": "", "code": None}
+        task, status, logs = self._run(script)
+
+        self.assertEqual(status, "needs_human", "\n".join(logs))
+        park = task.state.get("park") or {}
+        self.assertNotEqual(park.get("reason"), "quota_all_exhausted",
+                            "a hung agent was recorded as a provider quota wall")
+        self.assertEqual(cooldown.read(T0)[0], {},
+                         "a timeout opened a breaker after all")
+        # and it says what actually happened
+        self.assertTrue(any("timed out on every enrolled seat" in x for x in logs),
+                        "\n".join(logs))
+
     def test_a_quota_wall_fails_over_and_the_task_still_finishes(self):
         _, script = self._script(quota_first=True)
         task, status, logs = self._run(script)

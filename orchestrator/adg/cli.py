@@ -167,7 +167,7 @@ def cmd_init(args):
     if unused:
         print("\npresent but deliberately not enrolled: %s" % ", ".join(unused))
 
-    installed = companions.detect()
+    installed = companions.detect(repo)
     print("\ncompanion skills: %s" % (", ".join(k for k, v in installed.items() if v)
                                        or "none detected"))
     print("chaff scanner  : %s" % (winnow.find(repo) or "not installed"))
@@ -267,17 +267,29 @@ def cmd_approve(args):
     # resume past the stage that asked them, so a machine-side recording would
     # silently lose those approvals entirely.
     task.record_gate(pend["kind"], decision, args.note)
-    if decision == "approved" and args.note.strip():
+    if decision == "approved":
         # Carried into the prompts of the planner, implementers and reviewer.
         # A qualified yes approves something other than what was proposed, and
         # the agents that build and check it have to be told -- otherwise the
         # note is a record of an instruction nobody ever followed.
+        #
+        # Written even when empty, which CLEARS a previous one. Guarding this on
+        # a non-empty note meant an unqualified approval at a later gate left the
+        # earlier qualification flowing into every downstream prompt for the rest
+        # of the run -- while `_human_note` promised it was "superseded by the
+        # next approval".
         task.update(gate_note={"kind": pend["kind"], "note": args.note.strip()})
     # The merge gate keeps its pending decision because `_stage_integrate` is
     # re-entered and consumes it. The design and plan gates resume PAST the
     # stage that asked, so nothing would ever consume theirs -- and a stale
     # `pending_gate` makes the next `approve` refuse as already-answered.
-    if pend["kind"] == "merge":
+    #
+    # Only an APPROVAL is kept. A declined merge gate left the decision behind
+    # forever: the human's agent fixed what was wrong, called `approve`, and got
+    # "the merge gate was already answered 'declined'" with no way back. Worse,
+    # a later run with `--yes` still found the stale decline and threw away all
+    # the rework at a gate nobody was asked about.
+    if pend["kind"] == "merge" and decision == "approved":
         task.update(pending_gate=dict(pend, decision=decision, note=args.note))
     else:
         task.update(pending_gate=None)
@@ -290,15 +302,22 @@ def cmd_approve(args):
         task.update(status="needs_human")
         print("task parked at needs_human; `delegate resume --stage <stage>` to redirect")
         return 0
-    if args.no_continue:
-        print("recorded; not resuming (--no-continue)")
-        return 0
-
+    # Written whether or not we continue now. `--no-continue` used to return
+    # with the status still `awaiting_approval` and `pending_gate` already
+    # cleared, which stranded the task: nothing handles that status, so `resume`
+    # halted with "no handler for stage 'awaiting_approval'", and `approve`
+    # refused because the gate was no longer pending. `resume_status` was gone,
+    # so the run could only be restarted at a guessed stage -- and for a design
+    # gate the guess is wrong, because `needs_human` resumes at `implement` and
+    # skips planning entirely.
     resume_at = pend.get("resume_status")
     if not resume_at:
         sys.exit("the parked gate recorded no resume point; "
                  "use `delegate resume --stage <stage>`")
     task.update(status=resume_at)
+    if args.no_continue:
+        print("recorded; task set to %s, not resuming (--no-continue)" % resume_at)
+        return 0
     return cmd_resume(argparse.Namespace(
         repo=args.repo, registry=args.registry, id=args.id, stage=None,
         adapter=args.adapter, no_panes=args.no_panes, dry_run=args.dry_run,
@@ -329,6 +348,18 @@ def cmd_resume(args):
                              % (args.stage, ", ".join(STAGES)))
             sys.exit(2)
         task.update(status=args.stage)
+    elif was == "awaiting_approval":
+        # Not a stage, and not something `resume` can guess its way past. Left
+        # to fall through, the run loop found no `_stage_awaiting_approval` and
+        # parked with "no handler for stage", which reads as a crash for what is
+        # an ordinary state: a question is waiting on a human. The gate still
+        # holds its own resume point, so answering it is the only correct move.
+        pend = task.state.get("pending_gate") or {}
+        sys.exit("task %s is waiting on the %s gate, not parked. Answer it with "
+                 "`delegate approve --note \"...\"` or `delegate reject --note "
+                 "\"...\"`; `delegate show --brief` prints the question. To "
+                 "abandon the question and restart elsewhere, pass an explicit "
+                 "--stage." % (task.state["id"], pend.get("kind", "?")))
     elif was in ("needs_human", "abandoned"):
         task.update(status="implement")
     print("resuming %s from %s%s" % (task.state["id"], task.state["status"],

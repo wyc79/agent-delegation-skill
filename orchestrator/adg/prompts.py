@@ -18,7 +18,7 @@ import os
 # `agent-delegation/` at the repo root is now a different thing with a different
 # audience -- the front-door skill for the agent a human is talking to, which
 # teaches only when to call `delegate`. Two audiences were sharing one directory,
-# and `compose` below points dispatched agents at `SKILL.md`: leaving them
+# and `compose` below points dispatched agents at `PROTOCOL.md`: leaving them
 # merged would have handed every implementer a document telling it to call
 # `delegate`, which is the wrong document and an invitation to recurse.
 WORKFLOW_DIR = os.path.join("workflows", "default")
@@ -116,7 +116,7 @@ def env_for(task, role):
     """Location and activation, split.
 
     `AGENT_DELEGATION_TASK_DIR` used to be both: it said where the artifacts
-    are, and SKILL.md's description named it as a trigger, so *setting the
+    are, and the protocol's frontmatter named it as a trigger, so *setting the
     variable* is what enlisted an agent into this protocol. That conflates a
     path with a mandate, and it collides with any other skill hosted on this
     runtime -- dispatch a foreign judgement pass through it and the agent loads
@@ -132,7 +132,7 @@ def env_for(task, role):
     `intake` and `reporter` are this program's own names for one-shot questions;
     none has a card in `roles/`, none is in the report schema's role enum, and
     none is handed a task id. Setting the mandate for them conscripted an agent
-    that then read SKILL.md, found no row for itself in the Step 2 table and no
+    that then read the protocol, found no row for itself in the Step 2 table and no
     task id in its prompt, and was told by Step 1 to write a `blocked` report
     rather than answer the question -- degrading silently into "classifier gave
     no usable verdict" and a task planned as COMPLEX for no reason. The rule

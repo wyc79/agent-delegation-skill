@@ -7,6 +7,7 @@ without spending a token on a model.
 Run: python3 orchestrator/tests/test_orchestrator.py
 """
 
+import argparse
 import json
 import os
 import shutil
@@ -17,7 +18,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from adg import brief, limits, prompts, router, runtime, schema, store, verify, winnow, yamlite
+from adg import (brief, cli, limits, prompts, router, runtime, schema, store,
+                 verify, winnow, yamlite)
 from adg.machine import Halt, Orchestrator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1051,7 +1053,7 @@ class TestWaveRaces(unittest.TestCase):
     def test_a_sibling_report_named_for_the_role_is_never_read_as_mine(self):
         """The wave defect's symptom, reachable with no timing at all.
 
-        SKILL.md permits `<stage>-<role-or-subtask>.json`, so
+        PROTOCOL.md permits `<stage>-<role-or-subtask>.json`, so
         `implement-implementer.json` is a legal name for a subtask's report.
         _collect_report accepted a file on `role in name` alone, and sorted()
         made that file win for *every* sibling — so the escalating subtask read
@@ -1065,7 +1067,7 @@ class TestWaveRaces(unittest.TestCase):
             if "st-1" in _tree_name(cwd):
                 with open(os.path.join(cwd, "alpha.py"), "w") as fh:
                     fh.write("A = 1\n")
-                # Legal under SKILL.md, and it sorts ahead of every sibling's.
+                # Legal under PROTOCOL.md, and it sorts ahead of every sibling's.
                 _report(td, "implement-implementer.json", {
                     "stage": "implement", "role": "implementer",
                     "subtask": "st-1-alpha", "status": "complete",
@@ -2802,6 +2804,108 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIsNone(orch._with_note(None))
         task.update(gate_note={"kind": "plan", "note": "   "})
         self.assertEqual(orch._human_note(), "", "whitespace is not a qualification")
+
+    def test_a_later_unqualified_approval_clears_an_earlier_qualification(self):
+        """`_human_note` promises the note is "superseded by the next approval".
+        It was only written when non-empty, so approving the design with
+        "keep the old endpoint" and then the plan with nothing left the design's
+        qualification flowing into every prompt for the rest of the run."""
+        task = self._parked("T-053")
+        pend = task.state["pending_gate"]
+        cli.cmd_approve(self._args(task, "approve", note="keep the old endpoint",
+                                   no_continue=True))
+        self.assertEqual(task.state["gate_note"]["note"], "keep the old endpoint")
+
+        task.update(status="awaiting_approval",
+                    pending_gate=dict(pend, kind="merge", decision=None))
+        cli.cmd_approve(self._args(task, "approve", no_continue=True))
+        self.assertEqual(task.state["gate_note"]["note"], "",
+                         "the earlier qualification outlived the approval that "
+                         "was supposed to supersede it")
+
+    # --- the CLI half of the gate flow -------------------------------------
+    #
+    # These three drive `cmd_approve` / `cmd_reject` themselves. Every earlier
+    # gate test simulated the CLI by hand-writing `pending_gate`, so all three
+    # bugs below lived in the one code path nothing executed.
+
+    def _parked(self, task_id):
+        """A task parked at its first gate, via the real park path."""
+        from adg.machine import AwaitingApproval
+        script, _ = self._script()
+        task = store.Task.create(self.t.repo, task_id,
+                                 "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+
+        def park(kind, text):
+            raise AwaitingApproval(kind, text, resume_status=None)
+
+        Orchestrator(task, self.reg, runtime.MockAdapter(script), park,
+                     log=lambda *_: None).run()
+        self.assertEqual(task.state["status"], "awaiting_approval")
+        return task
+
+    def _args(self, task, decision, **kw):
+        fields = dict(repo=self.t.repo, registry=REGISTRY, id=task.state["id"],
+                      note="", adapter="mock", no_panes=False, dry_run=True,
+                      no_continue=False, decision=decision)
+        fields.update(kw)
+        return argparse.Namespace(**fields)
+
+    def test_a_rejected_gate_can_be_answered_again_after_the_fix(self):
+        """A decline is not the end of the task, only of that run.
+
+        The merge gate kept its pending decision unconditionally, so a reject
+        was permanent: the human's agent fixed the problem, called `approve`,
+        and got "already answered 'declined'" with no way back -- and a later
+        `--yes` run found the stale decline and threw the rework away at a gate
+        nobody was asked about.
+        """
+        task = self._parked("T-050")
+        kind = task.state["pending_gate"]["kind"]
+        cli.cmd_approve(self._args(task, "reject"))
+        self.assertEqual([g["state"] for g in task.state["gates"]], ["declined"])
+        self.assertIsNone(task.state.get("pending_gate"),
+                          "a decline left a decision behind that nothing consumes")
+        self.assertEqual(task.state["status"], "needs_human")
+
+        # the gate is answerable again once the run is put back in front of it
+        task.update(status="awaiting_approval",
+                    pending_gate={"kind": kind, "brief": "b", "resume_status": "implement"})
+        # --no-continue: what is under test is that the gate ACCEPTS a second
+        # answer, not what the run does afterwards.
+        cli.cmd_approve(self._args(task, "approve", no_continue=True))
+        self.assertEqual([g["state"] for g in task.state["gates"]],
+                         ["declined", "approved"],
+                         "the rework could not be approved after a decline")
+
+    def test_no_continue_leaves_a_task_that_can_still_be_resumed(self):
+        """It cleared `pending_gate` and left the status at `awaiting_approval`,
+        which nothing handles -- so `resume` halted with "no handler for stage"
+        and `approve` refused because no gate was pending. `resume_status` was
+        gone, and for a design gate the fallback guess is wrong: `needs_human`
+        resumes at `implement` and skips planning entirely."""
+        task = self._parked("T-051")
+        resume_at = task.state["pending_gate"]["resume_status"]
+        cli.cmd_approve(self._args(task, "approve", no_continue=True))
+        self.assertEqual(task.state["status"], resume_at,
+                         "the task was left on a status no stage handles")
+        self.assertNotEqual(task.state["status"], "awaiting_approval")
+
+    def test_resume_on_a_waiting_gate_says_to_answer_it(self):
+        """`awaiting_approval` is not a stage. Falling through gave
+        "no handler for stage 'awaiting_approval'", which reads as a crash for
+        an ordinary state: a question is waiting on a human."""
+        task = self._parked("T-052")
+        args = argparse.Namespace(repo=self.t.repo, registry=REGISTRY,
+                                  id=task.state["id"], stage=None, adapter="mock",
+                                  no_panes=False, dry_run=True, yes=False,
+                                  when_open=False)
+        with self.assertRaises(SystemExit) as cm:
+            cli.cmd_resume(args)
+        self.assertIn("approve", str(cm.exception))
+        self.assertEqual(task.state["status"], "awaiting_approval",
+                         "refusing to resume must not also mutate the task")
 
     def test_unparseable_plan_parks_rather_than_guessing(self):
         script, _ = self._script()

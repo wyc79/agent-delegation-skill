@@ -257,7 +257,7 @@ admits only one sensible reading.
 
     def _stage_intake(self):
         self.log("intake: %s" % self.task.state["id"])
-        found = companions.detect()
+        found = companions.detect(self.repo)
         if any(found.values()):
             self.log("companions: %s" % ", ".join(k for k, v in found.items() if v))
         self.task.update(companions=found)
@@ -422,9 +422,14 @@ a planner does that next, from your design.
             self.log("brainstorm: produced no design — planning from the request alone")
             self.task.update(status="plan")
             return
-        self._gate("design", "Approve this design before a plan is written from it? "
-                             "Answer any open questions below, or accept the "
-                             "defaults by approving.", resume_status="plan")
+        # Guarded like the other two. It was unconditional, so `design` in
+        # `human_approval_required` did nothing and removing it did nothing
+        # either -- the one gate a policy could not turn off was the one whose
+        # stage is already optional.
+        if self.budget.requires_approval("design"):
+            self._gate("design", "Approve this design before a plan is written from it? "
+                                 "Answer any open questions below, or accept the "
+                                 "defaults by approving.", resume_status="plan")
         self.task.update(status="plan")
 
     def _stage_plan(self):
@@ -1369,7 +1374,15 @@ a planner does that next, from your design.
                         role, ceiling=self.budget.ceiling(), boost=boost,
                         utilization=util)
                     if self.adapter.can_run(c.agent_kind)]
-            hit = sorted({c.channel for c in free} & blocked)
+            # Intersected with `cooled`, NOT with `blocked`. `blocked` also
+            # carries `exclude` -- seats this run walked away from for reasons
+            # that are not quota at all. A timeout hop appends to that list and
+            # deliberately writes no breaker, so reporting those channels here
+            # parked the task as `quota_all_exhausted` with ZERO open breakers:
+            # `delegate status` said "waiting on quota", the brief told the
+            # human their subscription was gone, and a provider wall that never
+            # happened went into the record that exists to count them.
+            hit = sorted({c.channel for c in free} & cooled)
             if hit:
                 reopen = cooldown.earliest_reopen(entries, hit)
                 raise routing.AllChannelsCooled(
@@ -1379,9 +1392,12 @@ a planner does that next, from your design.
                     "them, `delegate channels --clear <name>` overrides one."
                     % (role, ", ".join(hit), _stamp(reopen)))
         raise routing.NoModelAvailable(
-            "no runnable model for role %r: %s" % (
-                role, ", ".join("%s needs %s" % (c.model, c.agent_kind)
-                                for c in candidates) or "nothing enrolled"))
+            "no runnable model for role %r%s: %s" % (
+                role,
+                " (already tried and set aside this run: %s)"
+                % ", ".join(sorted(exclude)) if exclude else "",
+                ", ".join("%s needs %s" % (c.model, c.agent_kind)
+                          for c in candidates) or "nothing enrolled"))
 
     def _meter(self, choice):
         """Count one invocation against the channel's window (§5.4). An
@@ -1575,7 +1591,23 @@ a planner does that next, from your design.
                 "reopens_at": at})
             # Excluded explicitly as well as through the breaker: if the state
             # file could not be written, the loop must still terminate.
-            nxt = self._replacement(role, choice, cooled)
+            try:
+                nxt = self._replacement(role, choice, cooled)
+            except routing.NoModelAvailable:
+                # Every seat has now been tried. Say what actually happened
+                # rather than letting this reach the generic handler as a
+                # crash: nothing is broken and nothing is out of quota, the
+                # agents did not come back. This is the honest halt that the
+                # old `outcome == "blocked" and settled == "timeout"` branch
+                # used to raise before the hop existed.
+                if reason == "timeout":
+                    self._close(session)
+                    raise Halt("needs_human",
+                               "%s timed out on every enrolled seat (%s); no "
+                               "breaker was opened -- the seats are not out of "
+                               "quota, the calls did not return"
+                               % (role, ", ".join(sorted(cooled))))
+                raise
             self.log("failover: %s %s -> %s (%s%s)"
                      % (role, choice.channel, nxt.channel, reason,
                         ", reopens %s" % _stamp(at) if at else ", seat not cooled"))
@@ -1611,9 +1643,11 @@ a planner does that next, from your design.
             "elapsed_ms": res.get("elapsed_ms"),
             "report_problems": problems or None,
         })
-        if outcome == "blocked" and res.get("settled") == "timeout":
-            self._close(session)
-            raise Halt("needs_human", "%s agent timed out" % role)
+        # No timeout branch here any more. Since the hop/cool split a timeout
+        # never reaches this point: `failure` is "timeout", which is in
+        # HOPS_TO_ANOTHER_SEAT, so the loop above hops instead of breaking out.
+        # The honest halt this branch used to raise now lives at the hop site,
+        # for the case where every seat has been tried.
         # Returned, never stashed on self: wave threads share this object, and
         # a sibling overwriting the attribute is how an escalation gets read as
         # a success.
@@ -1745,14 +1779,14 @@ a planner does that next, from your design.
             # When a subtask is named, its id is the ONLY thing that identifies
             # its report. Accepting `role in name` as an alternative could not
             # tell two concurrent implementers apart: every sibling in a wave
-            # runs as "implementer", SKILL.md permits `<stage>-<role>.json`, and
+            # runs as "implementer", PROTOCOL.md permits `<stage>-<role>.json`, and
             # sorted() then handed the same file to all of them. An escalating
             # subtask read a sibling's `complete` and the run delivered a patch
             # built on work that had asked to stop. Subtask ids are unique, so
             # matching on the id alone cannot cross threads.
             #
             # And the id must fill the name, not merely appear in it. The
-            # contract is `<stage>-<id>.json` (SKILL.md step 3); a substring
+            # contract is `<stage>-<id>.json` (PROTOCOL.md step 3); a substring
             # test hands st-1 the report of a sibling named st-11, and the
             # planner -- not this code -- chooses the ids. The stage token is
             # not pinned to a word list, only forbidden from containing the

@@ -109,7 +109,6 @@ orchestrator/workflows/default/
 └── templates/            copy-paste starting points for task/plan/deviations
 
 registry.default.yaml     model scores, tier bands, routing policy (orchestrator-side)
-DESIGN.md                 the initial design — why each decision went that way
 ```
 
 **Progressive disclosure is a hard constraint, not a style.** `PROTOCOL.md` stays
@@ -273,8 +272,8 @@ $ADG channels                  # quota cooldowns and draw per seat
 And from a clone of *this* repo, the suites:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 171 tests, no tokens spent
-python3 orchestrator/tests/test_failover.py      #  95 more, same
+python3 orchestrator/tests/test_orchestrator.py  # 181 tests, no tokens spent
+python3 orchestrator/tests/test_failover.py      #  98 more, same
 ```
 
 They drive the real state machine over a real git repository with a scripted

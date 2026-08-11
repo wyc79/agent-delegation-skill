@@ -64,7 +64,9 @@ directory matters; `--repo <path>` overrides it.
 `run` also takes `--id`, `--mode attended|autonomous`, `--adapter herdr|local|mock`,
 `--no-panes`, `--max-cost N`, `--review auto|always|never`, `--dry-run`, `--yes`.
 `resume`, `approve` and `reject` take the adapter flags too; `approve` and
-`reject` also take `--no-continue`, which records the decision without resuming.
+`reject` also take `--no-continue`, which records the decision and advances the
+task to the stage it would have resumed at, without running it. Pick it up later
+with plain `delegate resume`.
 `--id` is optional only while the project has exactly one task.
 
 Two to understand before using them:
@@ -105,17 +107,31 @@ other. Answering it is your job:
 3. **Take their answer with its qualifications.** "Yes, but keep the old
    endpoint" is not a yes.
 4. **Record it.** `delegate approve --id T-001 --note "keep the old endpoint
-   working"`, or `reject` with the same shape. The note lands in `gates[]` in
-   `task.json` and is echoed in the run log when the machine consumes the
-   decision. It is the record of what a human actually decided, which nothing
-   else reconstructs — write what they said, not your summary of it.
-5. **Approving continues the run in the same call**, from `resume_status`, which
-   is deliberately past the stage that asked so an approved plan is not
-   re-planned. It may park at the next gate. Go back to step 1.
+   working"`, or `reject` with the same shape.
+
+   **`--note` is not just a record.** On an approval it is written into the
+   prompts of the planner, of every implementer, and of the reviewer, and it
+   stays there until a later approval carries a new one. The reviewer is the
+   one that matters most: without the note it sees a retained endpoint nobody
+   planned for, calls it scope creep, and rejects work that is doing exactly
+   what the human asked. So write **what they said**, not your summary of it —
+   you are writing an instruction, not a log line.
+
+   An approval with no note changes nothing downstream, and does not clear a
+   note an earlier gate set.
+5. **Approving continues the run in the same call.** For the `design` and `plan`
+   gates it resumes past the stage that asked, so an approved plan is not
+   re-planned; the `merge` gate re-enters `integrate` to do the landing it was
+   approving. Either way it may park at the next gate — go back to step 1.
+
+**Answer a waiting gate with `approve` or `reject`, never `resume`.**
+`awaiting_approval` is not a stage, and `resume` will refuse and tell you so.
 
 Rejecting ends that run: the decision is recorded, the task parks at
-`needs_human`, nothing continues. `delegate resume --stage <stage>` restarts from
-a stage you name — `intake`, `classify`, `brainstorm`, `plan`, `implement`,
+`needs_human`, nothing continues. The gate can be answered again later — fix
+what was wrong, put the run back in front of it, and approve. `delegate resume
+--stage <stage>` restarts from a stage you name — `intake`, `classify`,
+`brainstorm`, `plan`, `implement`,
 `review`, `integrate`.
 
 **Never answer a gate the human has not answered.** Approving on their behalf

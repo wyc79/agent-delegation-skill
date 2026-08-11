@@ -168,14 +168,20 @@ provider gave.
   threshold and attaches a signal must not end up worse off than one that fails
   in silence. If following `references/escalation.md` ever routes to a higher
   rung than saying nothing, the incentive has inverted and agents will learn it.
-- **The skill names no model and no runtime.** If either leaks into
-  `agent-delegation/`, the boundary has broken. It must also stand alone when
-  only `agent-delegation/` is copied into a skills directory, so nothing under
-  it may cite `DESIGN.md` or anything else outside itself.
+- **The protocol names no model and no runtime.** If either leaks into
+  `workflows/default/`, the boundary has broken. It must also stand alone
+  wherever the orchestrator unpacks it, so nothing under it may cite the repo
+  root or anything else outside itself.
+
+  This invariant belongs to the **protocol only**. The front-door skill at
+  `agent-delegation/` is the opposite case by design: its whole job is to name
+  the runtime, down to `--adapter herdr|local|mock`. Before the two audiences
+  were split they shared a directory, and the rule read as though it bound
+  both.
 - **`AGENT_DELEGATION_ROLE` is a mandate, and only a role in `roles/` may carry
   it.** `classifier`, `intake` and `reporter` are this program's names for
   one-shot questions, not roles in the protocol; setting it for them made an
-  agent load `SKILL.md`, find no card and no task id, and answer with a `blocked`
+  agent load `PROTOCOL.md`, find no card and no task id, and answer with a `blocked`
   report instead of the verdict. `prompts.TEXT_REPLY_ROLES` is the one list, and
   `runtime.py` reads it rather than keeping a second copy.
 
@@ -242,14 +248,14 @@ timing race, on the strength of an intermittent ~1-in-8 full-suite failure.
 
 **It was not a race.** `_collect_report` identified a report by substring, and
 when a subtask was named it accepted `role in name` as an *alternative* to the
-subtask id. Every sibling in a wave runs as `implementer`, `SKILL.md` permitted
+subtask id. Every sibling in a wave runs as `implementer`, `PROTOCOL.md` permitted
 `<stage>-<role>.json`, and `sorted()` then handed the first such file to all of
 them. One substring match that cannot tell two concurrent agents apart — no
 interleaving required, which is why rerunning the suite was the wrong instrument
 and why it never reproduced in isolation.
 
 Now a named subtask is identified by its id alone, and ids are unique, so no
-thread can read another's report. `SKILL.md` requires the id in the filename to
+thread can read another's report. `PROTOCOL.md` requires the id in the filename to
 match. `TestWaveRaces.test_a_sibling_report_named_for_the_role_is_never_read_as_mine`
 pins it deterministically: it fails on the old code every time, not one time in
 eight.
