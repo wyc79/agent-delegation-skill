@@ -750,6 +750,78 @@ class TestFailoverEndToEnd(unittest.TestCase):
                               log=logs.append, clock=clock).run()
         return task, status, logs
 
+    def test_a_seat_without_room_to_finish_loses_to_one_that_has_it(self):
+        """Tested on the decision itself, not through the router.
+
+        Measured first: on the shipped registry the shadow price already moves
+        the implementer to `cursor-seat` at every draw where headroom would have
+        objected, so routing through `_pick` proves nothing about this rule --
+        it passes for the other mechanism's reasons. The preference only ever
+        binds where the shadow price has NOT already reordered the pool, which
+        is a custom registry's case, so that is what is exercised here.
+        """
+        task = store.Task.create(self.t.repo, "T-HR", "# t\n\n- **AC-1** — x\n", self.pol)
+        task.update(subtasks=[{"id": "st-%d" % i, "status": "pending"} for i in range(4)])
+        logs = []
+        orch = _orch(self.reg, runtime.MockAdapter({}), task, clock=lambda: T0, logs=logs)
+        need = orch._calls_remaining()
+        self.assertEqual(need, 6)
+
+        by_seat = {}
+        for c in orch.router.candidates("implementer", ceiling=orch.budget.ceiling()):
+            by_seat.setdefault(c.channel, c)
+        claude, cursor = by_seat["claude-seat"], by_seat["cursor-seat"]
+
+        # claude-seat nearly drawn down, cursor-seat fresh; claude offered first
+        util = {"claude-seat": 38 / 40.0, "cursor-seat": 0.0}
+        self.assertLess(orch._headroom("claude-seat", util), need)
+        picked = orch._prefer_by_headroom("implementer", [claude, cursor], util)
+        self.assertEqual(picked.channel, "cursor-seat")
+        self.assertTrue(any("headroom:" in x for x in logs), "the move was silent")
+
+    def test_headroom_does_not_second_guess_a_seat_that_can_finish(self):
+        """It must only act when the seat genuinely cannot finish. Otherwise it
+        is a second, quieter router fighting the shadow price."""
+        task = store.Task.create(self.t.repo, "T-HR4", "# t\n\n- **AC-1** — x\n", self.pol)
+        task.update(subtasks=[{"id": "st-1", "status": "pending"}])
+        logs = []
+        orch = _orch(self.reg, runtime.MockAdapter({}), task, clock=lambda: T0, logs=logs)
+        by_seat = {}
+        for c in orch.router.candidates("implementer", ceiling=orch.budget.ceiling()):
+            by_seat.setdefault(c.channel, c)
+        order = [by_seat["claude-seat"], by_seat["cursor-seat"]]
+        picked = orch._prefer_by_headroom("implementer", order, {"claude-seat": 0.1})
+        self.assertEqual(picked.channel, "claude-seat", "overrode a seat that had room")
+        self.assertFalse([x for x in logs if "headroom:" in x], "logged a non-event")
+
+    def test_an_unmetered_seat_is_not_treated_as_having_no_room(self):
+        """`None` headroom is "no meter", not "nothing left". Reading it as zero
+        would route away from every metered-key seat in the registry."""
+        task = store.Task.create(self.t.repo, "T-HR2", "# t\n\n- **AC-1** — x\n", self.pol)
+        orch = _orch(self.reg, runtime.MockAdapter({}), task, clock=lambda: T0)
+        chan = dict(self.reg["channels"]["claude-seat"])
+        chan.pop("quota", None)
+        self.reg["channels"]["claude-seat"] = chan
+        self.assertIsNone(orch._headroom("claude-seat", {}))
+        # and it is still selectable
+        self.assertEqual(orch._pick("planner").channel, "claude-seat")
+
+    def test_no_seat_with_room_still_starts_the_run(self):
+        """It must never refuse work. A wrong estimate that parks a runnable
+        task is worse than one that hops mid-run, because the hop already
+        works."""
+        for i in range(39):
+            cooldown.record_use("claude-seat", 5 * 3600, T0 - i)
+        for i in range(499):
+            cooldown.record_use("cursor-seat", 30 * 24 * 3600, T0 - i)
+        task = store.Task.create(self.t.repo, "T-HR3", "# t\n\n- **AC-1** — x\n", self.pol)
+        task.update(subtasks=[{"id": "st-%d" % i, "status": "pending"} for i in range(9)])
+        logs = []
+        orch = _orch(self.reg, runtime.MockAdapter({}), task,
+                     clock=lambda: T0, logs=logs)
+        self.assertIsNotNone(orch._pick("implementer"), "refused to start")
+        self.assertTrue(any("anyway" in x for x in logs), "started without saying why")
+
     def test_the_two_skill_searches_do_not_diverge(self):
         """`companions` and `winnow` both answer "is this skill installed", and
         they had different answers. `winnow` searched project-local trees and

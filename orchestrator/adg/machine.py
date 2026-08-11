@@ -1360,12 +1360,13 @@ a planner does that next, from your design.
             raise routing.NoModelAvailable(
                 "no runnable model for role %r at reasoning >= %s"
                 % (role, min_reasoning))
-        for c in pool:
-            if self.adapter.can_run(c.agent_kind):
-                if c.demoted:
-                    self.log("  reserve: %s on %s anyway — no alternative"
-                             % (role, c.channel))
-                return c
+        runnable = [c for c in pool if self.adapter.can_run(c.agent_kind)]
+        if runnable:
+            c = self._prefer_by_headroom(role, runnable, util)
+            if c.demoted:
+                self.log("  reserve: %s on %s anyway — no alternative"
+                         % (role, c.channel))
+            return c
         if blocked:
             # Would this role have had somewhere to go with nothing filtered?
             # If so this is a quota event with a known reopen time, not a
@@ -1398,6 +1399,64 @@ a planner does that next, from your design.
                 % ", ".join(sorted(exclude)) if exclude else "",
                 ", ".join("%s needs %s" % (c.model, c.agent_kind)
                           for c in candidates) or "nothing enrolled"))
+
+    # How many invocations the rest of this task needs, beyond the one being
+    # dispatched. A LOWER bound and deliberately so: one implementer call per
+    # unfinished subtask, plus a review and an integrate. Rework loops, test
+    # authoring and escalations all push the real number up.
+    #
+    # Under-estimating is the safe direction here. This check only ever changes
+    # which seat is preferred; a number that is too small prefers a seat
+    # slightly too often, while one that is too large would walk away from
+    # seats that could have finished the work.
+    TAIL_CALLS = 2
+
+    def _calls_remaining(self):
+        pending = [s for s in (self.task.state.get("subtasks") or [])
+                   if s.get("status") != "complete"]
+        return max(1, len(pending)) + self.TAIL_CALLS
+
+    def _headroom(self, channel, util):
+        """Invocations left in this channel's window, or None when unknowable.
+
+        None is not zero. A channel with no `est_capacity` has no meter and
+        never had one -- treating that as "no room" would route away from every
+        metered-key seat in the registry, which is exactly backwards.
+        """
+        chan = (self.reg.get("channels") or {}).get(channel) or {}
+        cap = quota.parse_capacity((chan.get("quota") or {}).get("est_capacity"))
+        if not cap:
+            return None
+        return cap * max(0.0, 1.0 - float(util.get(channel, 0.0)))
+
+    def _prefer_by_headroom(self, role, runnable, util):
+        """Among seats that can do the work, prefer one that can FINISH it.
+
+        The router already prices draw -- a 90%-drawn seat costs more than a
+        metered key -- but pricing is not the same question as "will this run
+        get to the end here". A seat with four calls left is the cheapest
+        option right up to the moment it walls mid-implementation.
+
+        This never refuses work. If nothing has the headroom the run starts
+        anyway on the best candidate and says so: a wrong estimate that parks a
+        runnable task is worse than one that hops mid-run, because the hop
+        already works and is tested.
+        """
+        need = self._calls_remaining()
+        fits = [c for c in runnable
+                if (self._headroom(c.channel, util) or float("inf")) >= need]
+        if not fits:
+            best = runnable[0]
+            self.log("  headroom: no seat for %s has room for ~%d more call(s); "
+                     "starting on %s anyway — a wall from here fails over"
+                     % (role, need, best.channel))
+            return best
+        if fits[0] is not runnable[0]:
+            self.log("  headroom: %s -> %s, %s has ~%d call(s) left and this task "
+                     "needs ~%d"
+                     % (role, fits[0].channel, runnable[0].channel,
+                        self._headroom(runnable[0].channel, util) or 0, need))
+        return fits[0]
 
     def _meter(self, choice):
         """Count one invocation against the channel's window (§5.4). An
