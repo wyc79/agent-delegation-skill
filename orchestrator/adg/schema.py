@@ -13,9 +13,15 @@ import json
 import os
 import re
 
-_SKILL = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "agent-delegation", "schemas")
+from . import prompts
+
+# Derived, never rebuilt. This module used to compute the path itself, and when
+# the protocol moved under `orchestrator/workflows/default/` the copy in
+# `prompts` was updated and this one was not -- so every schema load broke while
+# `prompts.skill_path()` resolved correctly. Same shape as the timeout bug two
+# commits back: duplicated behaviour means a fix to one copy proves nothing
+# about the other. One resolver, imported.
+_SKILL = os.path.join(prompts.skill_path(), "schemas")
 
 _TYPES = {
     "object": dict, "array": list, "string": str,

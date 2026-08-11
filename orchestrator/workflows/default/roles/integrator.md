@@ -75,7 +75,7 @@ the verification evidence for the combined result.
 
 ## Your triggers
 
-Beyond the shared ones in `SKILL.md`, and only when the condition applies:
+Beyond the shared ones in `PROTOCOL.md`, and only when the condition applies:
 
 | Condition | Read |
 |---|---|

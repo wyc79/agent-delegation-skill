@@ -10,7 +10,18 @@ Deliberately absent: any model name, any routing logic, any provider detail.
 
 import os
 
-SKILL_DIRNAME = "agent-delegation"
+# The protocol dispatched agents follow, relative to `orchestrator/`. It lives
+# here rather than at the repo root because it is orchestrator-internal: it is
+# the bundled DEFAULT WORKFLOW, one of several the runtime will eventually be
+# able to host, not something a user installs.
+#
+# `agent-delegation/` at the repo root is now a different thing with a different
+# audience -- the front-door skill for the agent a human is talking to, which
+# teaches only when to call `delegate`. Two audiences were sharing one directory,
+# and `compose` below points dispatched agents at `SKILL.md`: leaving them
+# merged would have handed every implementer a document telling it to call
+# `delegate`, which is the wrong document and an invitation to recurse.
+WORKFLOW_DIR = os.path.join("workflows", "default")
 
 # Roles whose whole answer is a line of text this program parses. They have no
 # role card, write no report, and are handed no task id -- so they are not
@@ -19,8 +30,16 @@ TEXT_REPLY_ROLES = frozenset({"classifier", "intake", "reporter"})
 
 
 def skill_path():
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(root, SKILL_DIRNAME)
+    """Where the dispatched-agent protocol lives.
+
+    Still called `skill_path`, and still exported to agents as
+    `AGENT_DELEGATION_SKILL_DIR`, because that name is the contract: the role
+    cards and `references/task-dir.md` both name the variable, and agents on
+    other providers read those files. Renaming the path is free; renaming the
+    thing agents look for is not.
+    """
+    orchestrator = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(orchestrator, WORKFLOW_DIR)
 
 
 def compose(role, task, subtask=None, extra=None, verify_cfg=None):
@@ -29,7 +48,7 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
         "You are the **%s** in a delegated development workflow." % role.upper(),
         "",
         "Read and follow this protocol before anything else:",
-        "  %s/SKILL.md" % skill,
+        "  %s/PROTOCOL.md" % skill,
         "Then read your role card:",
         "  %s/roles/%s.md" % (skill, role),
         "",

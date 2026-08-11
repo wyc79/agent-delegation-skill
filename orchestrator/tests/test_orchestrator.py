@@ -1740,7 +1740,10 @@ class TestSkillContract(unittest.TestCase):
     file that satisfied both, and nothing caught it because every fixture in
     this suite was hand-written to be valid."""
 
-    SKILL = os.path.join(REPO_ROOT, "agent-delegation")
+    # The dispatched-agent protocol, which moved under orchestrator/ when the
+    # repo-root `agent-delegation/` became the front-door skill for the
+    # user's own agent. Two audiences, two directories.
+    SKILL = os.path.join(REPO_ROOT, "orchestrator", "workflows", "default")
 
     def _card(self, name):
         with open(os.path.join(self.SKILL, "roles", "%s.md" % name)) as fh:
@@ -1804,26 +1807,37 @@ class TestSkillContract(unittest.TestCase):
                          "implementer.md restates the severity rule differently again")
 
     def test_task_md_authority_matches_what_the_planner_is_told(self):
-        skill = _slurp(os.path.join(self.SKILL, "SKILL.md"))
+        skill = _slurp(os.path.join(self.SKILL, "PROTOCOL.md"))
         self.assertNotIn("amended only by humans", skill)
         self.assertIn("planner may add criteria", skill)
         self.assertIn("missing entirely", self._card("planner"))
 
-    def test_the_skill_activates_on_a_role_not_on_a_path(self):
-        """A path says where files are. Triggering on it means any agent handed
-        a scratch directory loads this protocol -- including a foreign skill's
-        pass dispatched through the same runtime, which then holds two sets of
-        instructions naming different output files."""
-        desc = _slurp(os.path.join(self.SKILL, "SKILL.md")).split("---")[1]
-        self.assertIn("$AGENT_DELEGATION_ROLE", desc)
-        self.assertNotIn("$AGENT_DELEGATION_TASK_DIR", desc,
-                         "the task directory is a location, not an assignment")
+    def test_the_protocol_does_not_advertise_itself_as_an_installable_skill(self):
+        """It is data the orchestrator reads, handed to an agent by absolute
+        path, so it must not carry a skill identity.
+
+        This replaces a test that asserted the frontmatter description triggered
+        on `$AGENT_DELEGATION_ROLE` rather than on a path. That property is not
+        gone -- it moved. With no frontmatter there is no loader trigger at all,
+        which is the stronger form of the same guarantee, and what still
+        enlists an agent is `env_for` withholding the role variable (see
+        TestRoleMandate). What this guards now is the collision that replaced
+        it: two files in one repo both declaring `name: agent-delegation`, with
+        a loader free to pick either.
+        """
+        text = _slurp(os.path.join(self.SKILL, "PROTOCOL.md"))
+        self.assertFalse(text.startswith("---"),
+                         "the protocol still declares skill frontmatter")
+        self.assertNotIn("\nname: agent-delegation", text)
+        root_skill = _slurp(os.path.join(REPO_ROOT, "agent-delegation", "SKILL.md"))
+        self.assertTrue(root_skill.startswith("---"),
+                        "the front-door skill lost the frontmatter it needs")
 
     def test_the_skill_cites_nothing_outside_itself(self):
-        """README offers `agent-delegation/` as a copy-in install, so a citation
-        of DESIGN.md or orchestrator/ is a pointer that dangles for every user who
-        takes that path -- and it is invisible from inside this repo, where the
-        file it names is always there."""
+        """The protocol travels: an agent reads it from whatever machine the
+        orchestrator put it on, so a citation of DESIGN.md or the repo root is a
+        pointer that dangles wherever it is unpacked -- and it is invisible from
+        inside this repo, where the file it names is always there."""
         for base, _dirs, names in os.walk(self.SKILL):
             for name in names:
                 if not name.endswith((".md", ".json")):
@@ -1868,7 +1882,10 @@ class TestRoleMandate(unittest.TestCase):
     """`AGENT_DELEGATION_ROLE` is what enlists an agent into this protocol. Every
     role that carries it must have somewhere to go when the agent obeys."""
 
-    SKILL = os.path.join(REPO_ROOT, "agent-delegation")
+    # The dispatched-agent protocol, which moved under orchestrator/ when the
+    # repo-root `agent-delegation/` became the front-door skill for the
+    # user's own agent. Two audiences, two directories.
+    SKILL = os.path.join(REPO_ROOT, "orchestrator", "workflows", "default")
 
     def _task(self):
         d = tempfile.mkdtemp()

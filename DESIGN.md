@@ -389,7 +389,6 @@ with **budgets treated as design constraints, not aspirations**:
 | One `roles/<role>.md` | ~100 lines | always, exactly one | Numbered steps + that role's outputs |
 | `references/<topic>.md` | ~150 lines each | on the named trigger | Depth for a situation that arose |
 | `schemas/*.json` | as needed | when writing that artifact | Exact field validation |
-| `references/engines/*.md` | ~150 lines | game repos only | Engine-specific rules from §10 |
 
 **What stays in `SKILL.md`** — only what *every* role needs before it knows
 anything else: how to identify your assigned role and find your card; the
@@ -777,7 +776,7 @@ that reports nothing looks exactly like a clean result.
 
 Availability is detected once by the orchestrator and written to `task.json`, so
 agents never hunt the filesystem. The agent-facing version is
-`agent-delegation/references/companions.md`.
+`orchestrator/workflows/default/references/companions.md`.
 
 ### 4.5 The in-repo escape hatch
 

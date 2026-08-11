@@ -82,7 +82,18 @@ rule; nothing here writes them.)
 
 ```text
 agent-delegation/
-├── SKILL.md              entry point (≤100 lines) — orientation and routing
+└── SKILL.md              THE FRONT DOOR. For the agent a human is talking to:
+                          when to call `delegate`, which command comes next,
+                          how to answer a parked gate. No methodology.
+
+orchestrator/workflows/default/
+                          The protocol DISPATCHED agents follow — the bundled
+                          default workflow, orchestrator-internal, not
+                          something a user installs.
+├── PROTOCOL.md           entry point (≤100 lines) — orientation and routing.
+│                         No frontmatter: it is read by absolute path, not
+│                         installed, and two files claiming the same skill
+│                         name is a collision a loader resolves arbitrarily.
 ├── roles/                one card per role; an agent reads exactly one
 ├── references/           depth loaded only when its trigger fires
 │   ├── task-dir.md       locating task state on Linux / macOS / Windows
@@ -91,8 +102,7 @@ agent-delegation/
 │   ├── parallelism.md    file scopes and worktree etiquette
 │   ├── handover.md       continuing a turn another agent left part-way
 │   ├── companions.md     which optional skills apply to which role
-│   ├── scratch-files.md  the narrow in-repo escape hatch
-│   └── engines/          Godot / Unity / Unreal specifics
+│   └── scratch-files.md  the narrow in-repo escape hatch
 ├── schemas/              JSON Schema for reports, verdicts, subtask blocks
 └── templates/            copy-paste starting points for task/plan/deviations
 
@@ -100,17 +110,17 @@ registry.default.yaml     model scores, tier bands, routing policy (orchestrator
 DESIGN.md                 the initial design — why each decision went that way
 ```
 
-**Progressive disclosure is a hard constraint, not a style.** `SKILL.md` stays
+**Progressive disclosure is a hard constraint, not a style.** `PROTOCOL.md` stays
 at 100 lines or under; role cards under 130; references load only on a stated
 condition ("tests failed 3 times → read `references/escalation.md`"). Context
 spent on protocol is context not spent on the code.
 
-The budget that matters is **per role, not per repo**. `SKILL.md` is read by all
+The budget that matters is **per role, not per repo**. `PROTOCOL.md` is read by all
 five roles, so a line there costs five times a line in a card — which is why
 triggers that belong to one role live on that role's card. A reviewer never
-loads the engine notes, the parallelism rules, or the companion table, because
-it never writes code or shares a worktree. Moving those three rows out of the
-shared entry point lengthened four cards and made every individual role cheaper.
+loads the parallelism rules or the companion table, because it never writes code
+or shares a worktree. Moving those rows out of the shared entry point lengthened
+the cards and made every individual role cheaper.
 
 ## Design choices worth knowing before you adopt it
 
@@ -155,20 +165,12 @@ are reported as missing rather than silently skipped.
   you and then handed to the planner as a settled approach. Also
   `systematic-debugging` at the second failed attempt. Its `writing-plans` is
   deliberately *not* used — a plan here is a machine-enforced contract, not
-  prose ([`companions.md`](agent-delegation/references/companions.md)).
+  prose ([`companions.md`](orchestrator/workflows/default/references/companions.md)).
 
 Their findings are advisory. Authority stays with the acceptance criteria, the
 plan, and the deterministic checks. See
-[`agent-delegation/references/companions.md`](agent-delegation/references/companions.md)
+[`orchestrator/workflows/default/references/companions.md`](orchestrator/workflows/default/references/companions.md)
 and `DESIGN.md` §4.7.
-
-## Game development
-
-Web-dev assumptions break in game repos, so the engine references cover what
-actually bites: binary and semi-mergeable scene formats, Unity `.meta` GUID
-coupling, generated files, serialized-field renames that silently drop designer
-data, Blueprint changes invisible to the compiler, and the pure-vs-engine-bound
-test split that keeps iteration from grinding on a five-minute engine boot.
 
 ## Status
 
