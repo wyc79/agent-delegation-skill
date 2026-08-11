@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import time
 
-from . import quota
+from . import prompts, quota
 from .store import git
 
 
@@ -346,12 +346,15 @@ class HerdrAdapter(LocalAdapter):
         tail = re.sub(r"[^a-z0-9]+", "", os.path.basename(task_dir.rstrip("/")).lower())[-6:]
         return re.sub(r"[^a-z0-9-]+", "-", "%s-%s" % (role.lower(), tail or "task"))[:32]
 
-    # Roles whose whole answer is a line of text the orchestrator parses.
     # A pane renders the agent on the terminal's alternate screen, so reading it
     # back yields TUI chrome rather than the reply -- these run as subprocesses.
     # Everything else communicates through report files, where a pane costs
     # nothing and buys the human a window into the run.
-    TEXT_REPLY_ROLES = {"classifier", "intake", "reporter"}
+    #
+    # One definition, in prompts, because the same set decides something else:
+    # these roles are not given AGENT_DELEGATION_ROLE. Two copies of a set that
+    # answers two questions drift, and the drift is silent in both directions.
+    TEXT_REPLY_ROLES = prompts.TEXT_REPLY_ROLES
 
     def start_agent(self, role, kind, cwd, env):
         if not self.panes or role in self.TEXT_REPLY_ROLES:

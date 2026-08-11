@@ -19,7 +19,13 @@ from . import (brief, companions, cooldown, limits as lim, prompts, quota,
                router as routing, schema, verify, winnow, yamlite)
 from .store import git
 
-STAGES = ["intake", "classify", "brainstorm", "plan", "implement", "verify",
+# Statuses the machine can actually be resumed at -- `cli.cmd_resume` validates
+# `--stage` against this list. "verify" is deliberately absent: checks run inside
+# `implement` and `review` rather than as a stage of their own, so there is no
+# `_stage_verify`. Listing it let a resume pass validation and then park with
+# "no handler for stage 'verify'", which is the exact outcome that validation was
+# added to prevent.
+STAGES = ["intake", "classify", "brainstorm", "plan", "implement",
           "review", "integrate", "done"]
 TERMINAL = {"done", "abandoned", "needs_human"}
 
@@ -457,6 +463,14 @@ a planner does that next, from your design.
                         "depends_on": s.get("depends_on") or [],
                         "hotspots": s.get("hotspots") or [],
                         "frozen_interfaces": s.get("frozen_interfaces") or [],
+                        # Carried, not dropped. subtask.schema.json asks the
+                        # planner for these and they were landing nowhere:
+                        # `capability_hint` now routes (below), and the other two
+                        # are read by the agent out of plan.md but belong in
+                        # task.json so a run's record shows what was planned.
+                        "capability_hint": s.get("capability_hint") or {},
+                        "estimated_loc": s.get("estimated_loc"),
+                        "parallel_group": s.get("parallel_group"),
                     })
                 return out
         return []
@@ -520,7 +534,7 @@ a planner does that next, from your design.
         self._one_subtask(sub, self._ensure_worktree())
 
     def _one_subtask(self, sub, base):
-        role_choice = self._pick("implementer")
+        role_choice = self._pick_implementer(sub)
         # All per-subtask state stays local: this method runs concurrently in a
         # wave, and anything on self is shared with the siblings.
         attempts, session, report, failure = 0, None, None, None
@@ -576,6 +590,35 @@ a planner does that next, from your design.
                 role_choice, attempts, session = self._climb(
                     sub, 2, role_choice, attempts, result, report, session)
         self._finish_subtask(sub, base)
+
+    def _pick_implementer(self, sub):
+        """The implementer for one subtask, raised by its `capability_hint`.
+
+        The hint is the planner's read on difficulty, and subtask.schema.json has
+        always promised it "raises the router's requirements for this subtask" --
+        which nothing did, so a subtask marked `{reasoning: very_high}` drew the
+        same model as a one-line rename.
+
+        Advisory on the way down, though: a hint no enrolled model can clear must
+        not park a task. The planner is guessing about difficulty, and a guess
+        that stops the run outright is worse than a guess that gets the ordinary
+        implementer. The demotion is logged, because a subtask running below the
+        strength its plan asked for is exactly the thing you want to see in the
+        log when it later escalates.
+        """
+        boost = routing.as_boost(sub.get("capability_hint"))
+        if not boost:
+            return self._pick("implementer")
+        try:
+            return self._pick("implementer", boost=boost)
+        except routing.AllChannelsCooled:
+            raise
+        except routing.NoModelAvailable as e:
+            choice = self._pick("implementer")
+            self.log("  %s: plan asked for %s and nothing enrolled clears it — "
+                     "running on %s (%s)"
+                     % (sub["id"], sub.get("capability_hint"), choice.model, e))
+            return choice
 
     def _entry_rung(self, report):
         """Which rung an agent's own `escalate` enters at, and the signals that
@@ -960,8 +1003,30 @@ a planner does that next, from your design.
         choice = self._pick("reviewer")
         self._archive_reports("review-")
         self.log("review: %s via %s" % (choice.model, choice.channel))
-        extra = ("Write your verdict to reports/review-reviewer.json, matching "
-                 "%s/schemas/verdict.schema.json." % prompts.skill_path())
+        # The two inputs `roles/reviewer.md` step 1 calls "the diff, and the
+        # verify output your prompt provides" -- and step 6 authorises a
+        # `blocked` report when they never arrive. They never did: this prompt
+        # named neither, so a card-compliant reviewer was entitled to stop the
+        # run over a missing input the orchestrator was holding the whole time.
+        # The diff is named rather than pasted; a large one does not belong in a
+        # prompt, and the base commit is the part the reviewer cannot derive.
+        extra = (
+            "The change under review is everything between the task's base commit "
+            "and HEAD in this worktree. Produce it yourself, and read it rather "
+            "than any summary of it:\n"
+            "  git diff %s\n\n"
+            "The deterministic checks have already run: %s. Every command, exit "
+            "code and full output is here, and it is the verify evidence your "
+            "role card tells you to weigh:\n"
+            "  %s\n"
+            "Quote from it rather than re-running. If you do re-run something, "
+            "say so and say why.\n\n"
+            "Write your verdict to reports/review-reviewer.json, matching "
+            "%s/schemas/verdict.schema.json."
+            % (self.task.state["repo"].get("base_commit", "HEAD"),
+               result.summary(),
+               self.task.file("verify", result.run_id + ".json"),
+               prompts.skill_path()))
         chaff = winnow.as_text(self.task.state.get("winnow"))
         if chaff:
             extra += ("\n\n%s\nRead these after the diff, not before. They may only "
@@ -1362,9 +1427,6 @@ a planner does that next, from your design.
             self._log_transcript(role, text, res)
             if res.get("failure") != "quota_exhausted":
                 break
-            # Close first: `_cool` touches a shared file, and letting it run
-            # ahead of teardown meant a write failure leaked the session -- under
-            # the herdr adapter, an orphaned pane.
             # Close first: `_cool` touches a shared file, and letting it run
             # ahead of teardown meant a write failure leaked the session -- under
             # the herdr adapter, an orphaned pane.

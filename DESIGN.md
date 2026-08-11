@@ -1,6 +1,14 @@
-# Multi-Provider Agent Delegation System — Technical Design
+# Multi-Provider Agent Delegation System — Initial Design
 
-**Status:** Draft v1 · **Date:** 2026-08-09 · **Scope:** Design only, no implementation
+**Status:** Initial design, written 2026-08-09, before any code existed.
+
+**This is a record of reasoning, not a specification of current behaviour.** It is
+kept because roughly seventy `§` citations across the skill's orchestrator point
+here for *why a decision went the way it did* — the one thing that cannot be
+reconstructed from the code later. Where this document and the code disagree, **the
+code is right and this is history**: `orchestrator/README.md` states what is actually
+built, what is deliberately absent, and where the scope boundary sits. Read a section
+here to understand a decision, never to predict what the program does.
 
 This document designs a reusable multi-agent task-delegation workflow for software
 development, with particular attention to game-development projects. The two governing

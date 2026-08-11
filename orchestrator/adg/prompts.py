@@ -12,6 +12,11 @@ import os
 
 SKILL_DIRNAME = "agent-delegation"
 
+# Roles whose whole answer is a line of text this program parses. They have no
+# role card, write no report, and are handed no task id -- so they are not
+# playing a role in this protocol, and `env_for` must not tell them they are.
+TEXT_REPLY_ROLES = frozenset({"classifier", "intake", "reporter"})
+
 
 def skill_path():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,7 +46,13 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
             "",
             "Your subtask: %s" % subtask.get("id"),
             "Goal: %s" % subtask.get("goal", ""),
-            "Write scope (a hard boundary — edits outside it are reverted):",
+            # What actually happens, not what sounds strictest. Nothing in this
+            # program reverts a hunk: `verify.scope_violations` records the files
+            # and `_skip_review` turns a simple task's skipped review back on. A
+            # prompt that threatens an automatic revert is asking to be found out
+            # by the one agent that tests it.
+            "Write scope (a hard boundary — every file you touch outside it is "
+            "recorded and sent to a reviewer):",
         ]
         lines += ["  %s" % g for g in subtask.get("file_scope", [])]
         if subtask.get("reads"):
@@ -57,10 +68,16 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
 
     state = task.state
     lims = state.get("limits", {})
+    if subtask:
+        # Only the implementer loop counts attempts, and only against a subtask.
+        # Telling a reviewer it has "8 attempts on this subtask" names a budget
+        # it cannot spend for a subtask it was not given.
+        lines += [
+            "",
+            "Budget for this session: at most %s attempts on this subtask. "
+            "Escalate rather than exceeding it." % lims.get("max_attempts_per_subtask", "?"),
+        ]
     lines += [
-        "",
-        "Budget for this session: at most %s attempts on this subtask. "
-        "Escalate rather than exceeding it." % lims.get("max_attempts_per_subtask", "?"),
         "",
         "Finish by writing your report to:",
         "  %s/reports/" % task.path,
@@ -91,10 +108,23 @@ def env_for(task, role):
     one: an agent outside this protocol has no role in it. A task directory can
     now be handed to a foreign agent as a plain scratch location without
     conscripting it.
+
+    Which is why the text-reply roles do not get it either. `classifier`,
+    `intake` and `reporter` are this program's own names for one-shot questions;
+    none has a card in `roles/`, none is in the report schema's role enum, and
+    none is handed a task id. Setting the mandate for them conscripted an agent
+    that then read SKILL.md, found no row for itself in the Step 2 table and no
+    task id in its prompt, and was told by Step 1 to write a `blocked` report
+    rather than answer the question -- degrading silently into "classifier gave
+    no usable verdict" and a task planned as COMPLEX for no reason. The rule
+    stated in orchestrator/winnow-passes.md for foreign passes binds this
+    dispatcher's own roles first.
     """
-    return {"AGENT_DELEGATION_TASK_DIR": task.path,
-            "AGENT_DELEGATION_SKILL_DIR": skill_path(),
-            "AGENT_DELEGATION_ROLE": role}
+    env = {"AGENT_DELEGATION_TASK_DIR": task.path,
+           "AGENT_DELEGATION_SKILL_DIR": skill_path()}
+    if role not in TEXT_REPLY_ROLES:
+        env["AGENT_DELEGATION_ROLE"] = role
+    return env
 
 
 def retry(failure):

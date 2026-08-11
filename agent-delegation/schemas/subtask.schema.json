@@ -34,7 +34,7 @@
     },
     "parallel_group": {
       "type": "string",
-      "description": "Subtasks sharing a group may run concurrently. The orchestrator still verifies scopes and demotes to sequential on any overlap."
+      "description": "The planner's grouping of subtasks it believes can run together. Advisory: scheduling is decided from depends_on plus disjoint write scopes and hotspots, so a group is a hint to a human reader and never grants concurrency on its own."
     },
     "hotspots": {
       "type": "array",
@@ -49,7 +49,7 @@
     "capability_hint": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Planner's read on difficulty; raises the router's requirements for this subtask.",
+      "description": "Planner's read on difficulty; raises the router's capability floors for this subtask. Advisory in one direction only: a floor nothing enrolled can clear is logged and dropped rather than parking the task.",
       "properties": {
         "reasoning": { "enum": ["low", "medium", "high", "very_high"] },
         "coding": { "enum": ["low", "medium", "high", "very_high"] }
@@ -58,7 +58,7 @@
     "estimated_loc": {
       "type": "integer",
       "minimum": 1,
-      "description": "Rough changed-line estimate. Used for iteration budgets and the scope_overrun signal, so an honest number matters more than a flattering one."
+      "description": "Rough changed-line estimate. It is the baseline the implementer measures its own scope_overrun signal against (references/escalation.md), so an honest number matters more than a flattering one. Nothing else is computed from it."
     },
     "acceptance": {
       "type": "array",

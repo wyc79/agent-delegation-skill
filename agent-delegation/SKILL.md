@@ -36,9 +36,8 @@ the report is how you ask. The wrong role corrupts other agents' artifacts.
 | Reviewer | `roles/reviewer.md` | Check requirements → plan → diff → evidence, and rule |
 | Integrator | `roles/integrator.md` | Reconcile conflicting subtask results with minimal change |
 
-Follow its numbered steps in order. **Do not read the other cards** — a reviewer
-holding the implementer's card starts from the implementer's frame, and that
-independence is the point of the split.
+Follow its numbered steps in order. **Do not read another role's card** — it
+starts you from that role's frame, and the independence is the point of the split.
 
 ## The task directory, relative to `$TASK_DIR`
 
@@ -90,12 +89,12 @@ Shared triggers; your card carries its own, and nobody carries another's.
 ## Step 3 — Report before you exit
 
 Write `$TASK_DIR/reports/<stage>-<subtask-id>.json`, or `<stage>-<role>.json`
-with no subtask. **The id is not optional when you have one** — siblings share
-your role name, so a role-named file cannot be attributed and counts as no
-report. The name is matched exactly, id filling everything after the stage
-word: decoration like `implement-st-1-final.json` also counts as no report. Match `schemas/report.schema.json`: status (`complete` / `blocked` /
-`escalate`), a summary **for the next agent** (what changed, what surprised you,
-what they must know), artifacts, deviations, signals, and real command output.
+with no subtask. **The id is not optional when you have one**, and must fill
+everything after the stage word exactly — siblings share your role name, so a
+role-named file and `implement-st-1-final.json` alike count as no report at all.
+Match `schemas/report.schema.json`: status (`complete` / `blocked` / `escalate`),
+a summary **for the next agent** (what changed, what surprised you, what they
+must know), artifacts, deviations, signals, and real command output.
 
 **`escalate` is routed by your `signals`, not your prose** — one that names its
 type, cites an artifact and carries real output. Nothing routable stops the run.

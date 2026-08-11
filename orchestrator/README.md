@@ -2,7 +2,9 @@
 
 The deterministic half of the system. The skill tells agents *how to behave*;
 this program decides *what runs next, on which model, and whether it is allowed
-to* — see [`../DESIGN.md`](../DESIGN.md) §15.
+to*. **This file is what is actually built**; the `§` citations throughout point
+at [`../DESIGN.md`](../DESIGN.md), the initial design, for why a decision went
+the way it did — start at its §15.
 
 **`adg`** is short for *agent delegation*. It is the Python package name, and the
 prefix on everything this tool creates so it is greppable and never mistaken for
@@ -54,11 +56,13 @@ No config is legal — checks are then reported as *not run* rather than faked.
 
 `winnow_scan` is only needed when autodetect misses. It looks in
 `.claude/skills/` and `.agents/skills/` under the repo, then `~/.claude`,
-`~/.cursor` and `~/.agents` — so a code-winnow installed anywhere else (another
-runtime's skill directory, a bare clone) has to be pointed at, either with this
-key or the `ADG_WINNOW_SCAN` environment variable. Either one wins over
-autodetect, and a path that is set but wrong is reported as a misconfiguration
-rather than quietly reported as "not installed".
+`~/.cursor` and `~/.agents`, then walks `~/.claude/plugins/` for the same
+`skills/code-winnow/scripts/scan.py` tail nested under a marketplace and a
+plugin — so a code-winnow delivered as a plugin is found rather than reported
+missing. Anywhere else (another runtime's skill directory, a bare clone) has to
+be pointed at, either with this key or the `ADG_WINNOW_SCAN` environment
+variable. Either one wins over autodetect, and a path that is set but wrong is
+reported as a misconfiguration rather than quietly reported as "not installed".
 
 ## Quota failover
 
@@ -165,7 +169,15 @@ provider gave.
   in silence. If following `references/escalation.md` ever routes to a higher
   rung than saying nothing, the incentive has inverted and agents will learn it.
 - **The skill names no model and no runtime.** If either leaks into
-  `agent-delegation/`, the boundary has broken.
+  `agent-delegation/`, the boundary has broken. It must also stand alone when
+  only `agent-delegation/` is copied into a skills directory, so nothing under
+  it may cite `DESIGN.md` or anything else outside itself.
+- **`AGENT_DELEGATION_ROLE` is a mandate, and only a role in `roles/` may carry
+  it.** `classifier`, `intake` and `reporter` are this program's names for
+  one-shot questions, not roles in the protocol; setting it for them made an
+  agent load `SKILL.md`, find no card and no task id, and answer with a `blocked`
+  report instead of the verdict. `prompts.TEXT_REPLY_ROLES` is the one list, and
+  `runtime.py` reads it rather than keeping a second copy.
 
 ## Tests
 
@@ -191,11 +203,19 @@ accounting from the CLI, autonomous mode ending at an opened PR, model-rendered
 briefs, quota-aware failover with per-channel cooldowns and a utilization shadow
 price, and signal-routed escalation from an agent's own report.
 
+A subtask's `capability_hint` raises the router's floors for that subtask, in one
+direction only: a hint nothing enrolled can clear is logged and dropped rather
+than parking the task, because the planner is guessing at difficulty and a guess
+should not be able to stop a run.
+
 Still absent: *live* quota metering (the draw above is estimated from invocation
 counts, not read from a provider), weekly-cap modelling, telemetry-driven
 registry recalibration, and container isolation. Rung 1 of the §6.2 ladder — "a
 different model at the same tier" — is not built either: the router escalates by
-raising a capability floor, which has no same-tier expression.
+raising a capability floor, which has no same-tier expression. `parallel_group`
+is not read: waves are formed from `depends_on` plus disjoint write scopes and
+hotspots, which is strictly safer than honouring a planner's grouping, and the
+schema says so rather than promising otherwise.
 
 ### What escalates, and what only reports
 
