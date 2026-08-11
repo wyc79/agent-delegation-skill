@@ -213,10 +213,6 @@ def cmd_run(args):
     body = request if request.lstrip().startswith("#") else \
         "# Task %s\n\n## Request (verbatim)\n\n%s\n" % (task_id, request.strip())
     task = store.Task.create(repo, task_id, body, merged, mode=args.mode)
-    if args.review != "auto":
-        task.update(review=args.review)
-    if getattr(args, "tier", "auto") != "auto":
-        task.update(tier=args.tier)
     if getattr(args, "plan", None):
         # The caller brought its own decomposition, so there is nothing for a
         # planner to decide. Written where the planner would have written it,
@@ -483,13 +479,6 @@ def main(argv=None):
                         "can actually bind")
     r.add_argument("--max-cost", type=float, help="lower the cost cap for this task")
     r.add_argument("--dry-run", action="store_true", help="drive the machine without agents")
-    r.add_argument("--tier", choices=["auto", "simple", "complex"], default="auto",
-                   help="auto (default): a cheap model judges whether the work "
-                        "needs a plan. simple|complex states it outright and "
-                        "skips that call — for a caller that has already decided")
-    r.add_argument("--review", choices=["auto", "always", "never"], default="auto",
-                   help="auto (default): independent LLM review for complex work, "
-                        "deterministic checks alone for simple work")
     r.add_argument("--plan", metavar="FILE",
                    help="a decomposition you already have, in plan.md's subtask "
                         "format. Pair with `--workflow orchestrator/workflows/"

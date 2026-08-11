@@ -26,8 +26,15 @@ from .store import git
 # `_stage_verify`. Listing it let a resume pass validation and then park with
 # "no handler for stage 'verify'", which is the exact outcome that validation was
 # added to prevent.
-STAGES = ["intake", "classify", "brainstorm", "plan", "implement",
-          "review", "integrate", "done"]
+# The whole graph. `delegate` places work on seats and integrates what comes
+# back. Deciding WHAT the work is, and whether it was done well, belongs to the
+# caller -- which has already made both judgements before invoking this. The
+# role protocol that used to live here (intake, classify, brainstorm, plan,
+# review) was measured against a caller doing the same job in one warm context
+# and lost on every axis but isolation: 4x the money, 4x the wall clock, 4x the
+# tokens, for an identical 31/31. What no model release makes redundant is the
+# seat that empties at 3pm, so that is what is left.
+STAGES = ["implement", "integrate", "done"]
 TERMINAL = {"done", "abandoned", "needs_human"}
 
 # The orchestrator's identity for the commits it makes on its own account, on
@@ -62,58 +69,6 @@ ENTRY_RUNG = {
     "missing_dependency": 4,    # ... or installs a package
     "merge_conflict_cross": 4,
 }
-
-# Keyword matching on natural language does not work: "API" in "calculator API"
-# forced a 12-line change down the full planning pipeline, and no keyword list
-# recognises "add a subtract function" as simple. Classification is a judgement,
-# so a cheap model makes it -- the call costs ~$0.0002 against a ~$2.60 mistake.
-# Only non-negotiable facts stay hard-coded, below.
-#
-# The frame is code and the judgement is not. `_classified` routes on the two
-# tiers by name, so the vocabulary and the VERDICT line the parser reads have to
-# stay here -- a workflow that invented a third tier would parse as neither and
-# fall through to the safe default. What a workflow CAN say is which work counts
-# as which, through `classify.criteria` in its manifest.
-CLASSIFY_PROMPT = """Classify this task as SIMPLE or COMPLEX.
-
-%(criteria)s
-
---- REQUEST ---
-%(request)s
-
---- REPOSITORY ---
-%(facts)s
-
-Reply with exactly one line:
-VERDICT: SIMPLE|COMPLEX -- <one short clause of reasoning>
-"""
-
-# Used when the workflow in force declares no `classify.criteria`. Silence in a
-# manifest leaves a stage as the machine has it -- the same rule `enabled()`
-# follows -- so a workflow that has no opinion about what counts as complex
-# still gets a working classifier rather than a prompt with a hole in it.
-DEFAULT_CLASSIFY_CRITERIA = """SIMPLE: one coherent change a single competent engineer would finish in one
-sitting without a written plan. A few files, no new architecture, no format or
-interface that other code depends on.
-
-COMPLEX: needs a plan first -- multiple independent parts, a new abstraction or
-dependency, a change to a shared interface / schema / save format, wide blast
-radius, or genuine ambiguity about what is wanted.
-
-Bias: when the work is small and self-contained, say SIMPLE. Planning a small
-task wastes far more than it saves."""
-
-
-_LOG_SEQ = [0]
-_LOG_LOCK = __import__("threading").Lock()
-
-
-def _stamp(epoch):
-    """A reopen time a human can act on, in their own zone."""
-    if not epoch:
-        return "an unknown time"
-    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(float(epoch)))
-
 
 class Halt(Exception):
     """Stop cleanly and leave the task resumable."""
@@ -155,26 +110,6 @@ class AwaitingApproval(Exception):
         self.kind, self.brief, self.resume_status = kind, brief, resume_status
 
 
-class Replan(Exception):
-    """Rung 3: the model ladder is spent, so the plan is the suspect.
-
-    Deliberately not a Halt. Rung 2 is documented as "skipped entirely if
-    nothing enrolled sits above the current model", and the rung after it is
-    the planner, not the human -- but the code went straight to needs_human,
-    so a deployment with one strong seat had a two-rung ladder that ended in a
-    shrug. Repeated failure by the best model available is evidence about the
-    plan; handing that to a human without letting the planner see it wastes the
-    one reader who can act on it cheaply.
-
-    Becomes a halt on its own when `max_replans` is spent -- that is rung 4,
-    reached by exhausting rung 3 rather than by skipping it.
-    """
-
-    def __init__(self, subtask, message):
-        super().__init__(message)
-        self.subtask = subtask
-
-
 class Orchestrator:
     def __init__(self, task, registry, adapter, gate, log=print, dry_run=False,
                  clock=time.time):
@@ -211,10 +146,8 @@ class Orchestrator:
                 if status in TERMINAL:
                     return status
                 # Switched off by the manifest. Checked here rather than inside
-                # each handler because the handlers choose their own successor
-                # -- `_stage_classify` sends simple work straight past
-                # `brainstorm` -- so this only decides which of the
-                # destinations they name is actually switched on.
+                # each handler, because a handler names its own successor and
+                # only this loop knows whether that destination is switched on.
                 if not self.workflow.enabled(status):
                     # STAGES, not the manifest's own order: `enabled()` treats a
                     # stage the manifest never mentions as on, so the sequence
@@ -227,13 +160,7 @@ class Orchestrator:
                 handler = getattr(self, "_stage_" + status, None)
                 if handler is None:
                     raise Halt("needs_human", "no handler for stage %r" % status)
-                try:
-                    handler()
-                except Replan as r:
-                    # Caught inside the loop, not beside it: rung 3 continues the
-                    # run at the plan stage, and catching it out there would end
-                    # the run instead -- the very thing this rung exists to stop.
-                    self._rung3(r)
+                handler()
         except AwaitingApproval as a:
             # Not a Halt: `needs_human` means the run is over and something is
             # wrong, and a question waiting to be answered is neither. Keeping
@@ -303,250 +230,6 @@ admits only one sensible reading.
 --- REPOSITORY ---
 %(facts)s
 """
-
-    def _stage_intake(self):
-        self.log("intake: %s" % self.task.state["id"])
-        found = companions.detect(self.repo)
-        if any(found.values()):
-            self.log("companions: %s" % ", ".join(k for k, v in found.items() if v))
-        self.task.update(companions=found)
-        self._derive_criteria()
-        self.task.update(status="classify")
-
-    def _derive_criteria(self):
-        """Give every task numbered acceptance criteria, not just complex ones.
-        The reviewer's whole evidence chain keys off AC-n; without them a review
-        has nothing to check against and grades taste instead."""
-        text = self.task.read_text("task.md", "")
-        if re.search(r"^\s*[-*]?\s*\*\*AC-\d", text, re.M) or self.dry_run:
-            return                      # already stated by whoever wrote the task
-        # Routed on the cheap classifier tier; this is not judgement.
-        res = self._optional("intake", self.CRITERIA_PROMPT % {
-            "request": text.strip()[:4000], "facts": self._repo_facts()},
-            pick_as="classifier")
-        if res is None:
-            return
-        out = (res.get("output") or "").strip()
-        if "AC-1" not in out:
-            self.log("intake: no criteria derived — the reviewer will have less to check")
-            return
-        self.task.write_text("task.md", text.rstrip() + "\n\n" + out + "\n")
-        self.log("intake: %d acceptance criteria" % len(re.findall(r"\*\*AC-\d+\*\*", out)))
-
-    def _repo_facts(self):
-        """Cheap, factual context so the classifier judges the change against
-        this repository rather than against the wording of the request."""
-        files = git(["ls-files"], self.repo, check=False).splitlines()
-        sizes = []
-        for f in files[:400]:
-            try:
-                with open(os.path.join(self.repo, f), "rb") as fh:
-                    sizes.append((len(fh.read().splitlines()), f))
-            except OSError:
-                continue
-        sizes.sort(reverse=True)
-        lines = ["%d tracked files, %d total lines" % (len(files), sum(n for n, _ in sizes))]
-        lines.append("largest: " + ", ".join("%s (%d lines)" % (f, n) for n, f in sizes[:8]))
-        if self.vcfg.get("hotspots"):
-            lines.append("declared hotspots: " + ", ".join(self.vcfg["hotspots"]))
-        return "\n".join(lines)
-
-    def _stage_classify(self):
-        """A cheap model judges; facts and the caller override it."""
-        text = self.task.read_text("task.md", "")
-        hotspots = [h for h in (self.vcfg.get("hotspots") or []) if h and h in text]
-        forced = self.task.state.get("tier")
-        if forced in ("simple", "complex"):
-            # `--tier`, and it is the most specific thing here. The caller is the
-            # agent that already decided this work was worth delegating -- the
-            # skill's "first decide whether to delegate at all" -- and one that
-            # has designed the decomposition already knows its shape. Paying a
-            # billed call to be told what it has decided, and to be told
-            # differently often enough to matter, is the indirection this
-            # removes. `auto` is still the default, so `delegate` run by hand
-            # keeps judging for itself.
-            if forced == "simple" and hotspots:
-                # A hotspot is the PROJECT's standing declaration; this flag is
-                # the operator's, for one run. The later and more specific
-                # instruction wins, but not silently: the declaration exists
-                # because these files merge badly when the work is not planned.
-                self.log("classify: --tier simple overrides a declared hotspot "
-                         "(%s) — this run is not getting a plan"
-                         % ", ".join(hotspots))
-            return self._classified(forced, "declared by the caller", "caller")
-        if hotspots:
-            # Not a judgement call: a hotspot is unmergeable or high-coupling by
-            # declaration, so it always gets a plan.
-            return self._classified("complex", "touches a declared hotspot: %s"
-                                    % ", ".join(hotspots), "policy")
-        tier, why, by = self._ask_classifier(text)
-        self._classified(tier, why, by)
-
-    def _ask_classifier(self, text):
-        if self.dry_run:
-            return "simple", "dry run", "stub"
-        prompt = CLASSIFY_PROMPT % {
-            "criteria": self.workflow.criteria("classify") or DEFAULT_CLASSIFY_CRITERIA,
-            "request": text.strip()[:4000],
-            "facts": self._repo_facts()}
-        res = self._optional("classifier", prompt)
-        if res is None:
-            # Fail safe, exactly as an unparseable verdict does: over-planning a
-            # small task wastes time, under-planning a large one wastes the run.
-            return "complex", "no classifier model available", "fallback"
-        out = (res.get("output") or "")
-        m = re.search(r"VERDICT:\s*(SIMPLE|COMPLEX)\s*-*\s*(.*)", out, re.I)
-        if not m:
-            # Unparseable: fail safe. Over-planning a small task wastes time;
-            # under-planning a large one wastes the whole run.
-            return "complex", "classifier gave no usable verdict", "fallback"
-        # Carries what it spent, like every other step. The classifier is a real
-        # billed call on a real seat; recording it without its cost made the
-        # cheapest-looking step in the run the one nothing could account for.
-        self.task.record_delegation({"stage": "classify", "role": "classifier",
-                                     "model": res.get("model"), "channel": res.get("channel"),
-                                     "adapter": self.adapter.name, "outcome": "complete",
-                                     "usd": res.get("cost_usd"),
-                                     "usd_estimated": bool(res.get("cost_estimated")) or None,
-                                     "tokens": res.get("usage"),
-                                     "elapsed_ms": res.get("elapsed_ms")})
-        return (m.group(1).lower(),
-                m.group(2).strip()[:200] or "no reason given", res.get("model"))
-
-    def _classified(self, tier, why, by):
-        self.log("classify: %s (%s)" % (tier, why))
-        nxt = "implement"
-        if tier == "complex":
-            nxt = "brainstorm" if self._brainstorm_wanted() else "plan"
-        self.task.update(classification={"tier": tier, "by": by, "why": why}, status=nxt)
-        if tier == "simple":
-            self._seed_single_subtask()
-
-    def _seed_single_subtask(self):
-        self.task.update(subtasks=[{
-            "id": "st-1-main", "status": "pending",
-            "goal": "Implement the request as described in task.md.",
-            "planned_scope": ["**"], "acceptance": [], "actual_files": [],
-        }])
-
-    def _brainstorm_wanted(self):
-        """Design dialogue is worth it on complex work, and only when a human is
-        there to answer. Unattended, the planner's open-questions-with-defaults
-        already covers the same ground without pretending to consult anyone."""
-        mode = (self.vcfg.get("brainstorm") or "auto")
-        if mode == "never":
-            return False
-        if mode == "always":
-            return True
-        return self.task.state.get("mode") == "attended"
-
-    BRAINSTORM_PROMPT = """Design this change before anyone implements it.
-
-%(discipline)s
-
-Write **only** to %(spec)s. Do not write into the repository and do not commit
-anything — this design is orchestration state, not project documentation.
-
-Produce, in this order:
-1. **Purpose** — what problem this solves, in the user's terms.
-2. **Approaches** — two or three, each with its trade-off, and say which you
-   recommend and why.
-3. **Design** — the recommended approach in enough detail to plan against:
-   the seams, the interfaces other code will touch, what stays unchanged.
-4. **Risks** — what could make this design wrong, and the earliest signal.
-5. **Questions for the human** — anything you genuinely cannot settle from the
-   code. Each one gets a *proposed default* so silence is a safe answer. Omit
-   the section if there is nothing real to ask; inventing questions to look
-   thorough wastes the one round you get.
-
-You are not implementing anything and you are not writing a task breakdown —
-a planner does that next, from your design.
-
---- REQUEST ---
-%(request)s
-"""
-
-    def _stage_brainstorm(self):
-        try:
-            choice = self._pick("planner")
-        except routing.NoModelAvailable as e:
-            self.log("brainstorm: skipped — %s" % e)
-            self.task.update(status="plan")
-            return
-        # Asked of the manifest, not decided here. This was a hardcoded `if
-        # superpowers installed` with both texts inline -- which meant hosting
-        # any other design discipline was a patch to this function rather than
-        # a workflow edit, and that is precisely what stopped this project being
-        # a runtime that hosts a method instead of one that owns it.
-        discipline = self.workflow.discipline(
-            "brainstorm", self.task.state.get("companions"))
-        self.log("brainstorm: %s via %s" % (choice.model, choice.channel))
-        self._run_once(
-            "planner", choice, cwd=self.repo,
-            extra=self.BRAINSTORM_PROMPT % {
-                "discipline": discipline,
-                "spec": self.task.file("spec.md"),
-                "request": self.task.read_text("task.md", "").strip()[:4000]})
-        spec = self.task.read_text("spec.md", "")
-        if not spec.strip():
-            self.log("brainstorm: produced no design — planning from the request alone")
-            self.task.update(status="plan")
-            return
-        # Guarded like the other two. It was unconditional, so `design` in
-        # `human_approval_required` did nothing and removing it did nothing
-        # either -- the one gate a policy could not turn off was the one whose
-        # stage is already optional.
-        if self.budget.requires_approval("design"):
-            self._gate("design", "Approve this design before a plan is written from it? "
-                                 "Answer any open questions below, or accept the "
-                                 "defaults by approving.", resume_status="plan")
-        self.task.update(status="plan")
-
-    def _stage_plan(self):
-        choice = self._pick("planner")
-        self._archive_reports("plan-")
-        self.log("plan: %s via %s" % (choice.model, choice.channel))
-        self.budget.check_cost(0.0)
-        # The template is the WORKFLOW's, unlike the report schemas, so it moves
-        # with `--workflow` -- but only if it is there. Naming a file a hosted
-        # workflow does not ship sends the planner hunting for it instead of
-        # planning, which is the same objection as pointing it at a schemas
-        # directory that does not exist.
-        extra = "Write plan.md now."
-        template = os.path.join(prompts.skill_path(), "templates", "plan.md")
-        if os.path.exists(template):
-            extra += " Use the template at %s." % template
-        if self.task.read_text("spec.md", "").strip():
-            extra += ("\n\nAn approved design is at %s. Plan against it: it settles "
-                      "the approach, so decompose and scope rather than redesigning. "
-                      "Departing from it is a decision to record in decisions.md."
-                      % self.task.file("spec.md"))
-        if self.task.read_text("escalation.md", "").strip():
-            # Rung 3 arrived here. Replanning the same decomposition would spend
-            # the replan budget reproducing the failure it was granted to escape.
-            extra += (
-                "\n\nThis is a REPLAN. An implementation escalated to you: read %s "
-                "first. The previous decomposition is the suspect — a subtask "
-                "failed repeatedly under the strongest model available, so "
-                "reissuing the same shape will fail the same way. Change "
-                "something structural: split it, re-scope it, resequence it, or "
-                "state plainly in plan.md why it is still right and what the "
-                "implementer should do differently.\n"
-                "Every completed subtask listed there must be dispositioned in "
-                "plan.md as keep, adapt or discard. Work that is already green is "
-                "reset to pending when your plan lands, so anything you leave out "
-                "will be built again." % self.task.file("escalation.md"))
-        self._run_once("planner", choice, cwd=self.repo, extra=self._with_note(extra))
-        subtasks = self._read_plan_subtasks()
-        if not subtasks:
-            raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
-        self.task.update(subtasks=self._reseed(subtasks))
-        self.log("plan: %d subtask(s)" % len(subtasks))
-        self._author_tests(subtasks)
-        if self.budget.requires_approval("plan"):
-            self._gate("plan", "Approve this plan? It splits the work into %d step(s)."
-                       % len(subtasks), resume_status="implement")
-        self.task.update(status="implement")
 
     def _reseed(self, planned):
         """Subtasks from a new plan, keeping what a surviving id already owns.
@@ -644,32 +327,6 @@ a planner does that next, from your design.
                      % (sub["id"], shelf))
             return True
         return False
-
-    def _author_tests(self, subtasks):
-        """Write tests from the requirements, before any implementation exists.
-        An implementer's own tests confirm what it built; these confirm what was
-        asked, which is the only way a missing requirement shows up (D7)."""
-        if (self.vcfg.get("test_author") or "auto") == "never":
-            return
-        try:
-            choice = self._pick("test-author")
-        except routing.NoModelAvailable as e:
-            self.log("tests: skipped — %s" % e)
-            return
-        base = self._ensure_worktree()
-        self.log("tests: %s via %s" % (choice.model, choice.channel))
-        self._run_once(
-            "test-author", choice, cwd=base,
-            extra="Write failing tests for the acceptance criteria in task.md now. "
-                  "Do not implement the feature and do not read any implementation. "
-                  "Run them and capture the failure output as evidence.")
-        # Red is the expected state here, so a failing run is not a problem --
-        # but a *passing* one means the tests do not test the new requirement.
-        result = verify.run(self.task, self.repo, base, "fast")
-        if result.ok and result.steps:
-            self.log("  warning: new tests pass before implementation — "
-                     "they may not test the requirement")
-        self._checkpoint(base, "adg %s: tests from requirements" % self.task.state["id"])
 
     def _read_plan_subtasks(self):
         """Parse the fenced YAML block the planner wrote. A plan we cannot
@@ -872,7 +529,7 @@ a planner does that next, from your design.
             session, report, role_choice = self._invoke(
                 "implementer", role_choice, cwd=base, subtask=sub,
                 session=session, failure=failure,
-                extra=self._with_note(self._findings_brief(sub)))
+                extra=self._with_note(None))
             self.budget.used_attempt(sub["id"])
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
@@ -981,8 +638,16 @@ a planner does that next, from your design.
         off verify, and an agent that reports the same thing itself. They differ
         in what noticed, never in where the ladder goes.
 
-        Returns the next (choice, attempts, session), or raises Replan when the
-        rung above is the planner."""
+        Returns the next (choice, attempts, session), or halts when the ladder
+        is spent.
+
+        The ladder ends here now. Rung 3 was "the plan is the suspect, send it
+        back to the planner" -- and there is no planner: the caller wrote the
+        decomposition and is the only thing that can revise it. Halting names
+        that plainly instead of a run that quietly rebuilds work nobody asked
+        for. `_write_escalation_bundle` went with it; the evidence a caller
+        needs is the halt message, its subtask id, and the checkpoints left in
+        the worktree, which is not reaped on a park."""
         if rung <= 2:
             _, cooled, util, _ = self._channel_state()
             stronger = self.router.escalate("implementer", role_choice,
@@ -1009,19 +674,19 @@ a planner does that next, from your design.
                 # when the model cannot change.
                 self._close(session)
                 return stronger, 0, None
-            # Rung 2 is spent, so the next rung is 3 -- the planner -- not 4.
             why = ("%s still failing after %d attempts and nothing stronger is "
                    "enrolled within the ceiling" % (sub["id"], attempts))
         else:
-            why = ("%s raised %s, which no stronger implementer can fix"
+            why = ("%s raised %s, which no stronger worker can fix"
                    % (sub["id"], ", ".join(s.get("type", "?")
                                            for s in (signals or []))))
-        # Write the bundle here, while the verify output and this agent's report
-        # are still in hand; the planner runs in a later stage and a different
-        # process.
-        self._write_escalation_bundle(sub, attempts, result, report, signals)
         self._close(session)
-        raise Replan(sub["id"], why)
+        # Its worktree stays: `_reap_worktrees` only runs on `done`, so the
+        # checkpoints this agent committed are what the caller picks up from.
+        raise Halt("needs_human",
+                   "%s — the decomposition is the suspect now, and only the "
+                   "caller that wrote it can revise it. Its worktree is left "
+                   "in place." % why)
 
     @staticmethod
     def _signal_context(signals):
@@ -1041,112 +706,6 @@ a planner does that next, from your design.
             if sug:
                 out.append("Its suggestion, which is not binding on you: %s" % sug[:400])
         return "\n".join(out) or None
-
-    def _write_escalation_bundle(self, sub, attempts, result, report, signals=None):
-        """Escalation without context just repeats the failure expensively.
-
-        Append-only, like `deviations.md`: `max_replans` can exceed one, and the
-        second replan needs to see that the first already tried something.
-
-        The completed-work inventory is the part that is easy to leave out and
-        expensive to omit. `_stage_plan` resets every subtask to pending from
-        the new plan, so a planner that does not know what is already green will
-        cheerfully re-plan work that is finished.
-
-        `signals` is present when the agent raised the escalation itself. The
-        headline has to follow it: reporting an agent's `plan_conflict` under a
-        hardcoded `test_stuck` sends the planner hunting a flaky test that was
-        never the complaint.
-        """
-        state = self.task.state
-        done = [s for s in (state.get("subtasks") or [])
-                if s.get("status") == "complete"]
-        if signals:
-            headline = (
-                "**Signal:** `%s`, raised by the implementer itself. It stopped at "
-                "the threshold rather than pushing through, so this is evidence "
-                "about the plan and not a failed attempt."
-                % ", ".join(s.get("type", "?") for s in signals))
-        else:
-            headline = (
-                "**Signal:** `test_stuck`. The same checks failed %d consecutive "
-                "attempts, and no stronger model is enrolled within the ceiling, so "
-                "the ladder has no rung left below you. Treat this as evidence about "
-                "the plan, not about the agent." % attempts)
-        lines = [
-            "## %s — rung 3 after %d attempt(s)" % (sub["id"], attempts),
-            "",
-            headline,
-            "",
-            "**Goal as planned:** %s" % (sub.get("goal") or "(none recorded)"),
-            "**Planned scope:** %s" % (", ".join(sub.get("planned_scope") or []) or "(none)"),
-            "",
-            # An agent can escalate over a plan conflict while every check is
-            # green. Titling that "Failing checks" tells the planner to go
-            # looking for a failure nobody reported.
-            "### Failing checks" if not result.ok else
-            "### Checks when it stopped — they were green",
-            "```",
-            (result.summary() or "").strip() or "(no summary)",
-        ]
-        for f in result.failures()[:3]:
-            lines += ["", "$ %s" % f["cmd"], (f["output"] or "")[-1200:]]
-        lines += ["```", ""]
-
-        summary = ((report or {}).get("summary") or "").strip()
-        lines += ["### The implementer's last word",
-                  summary[:1000] or "(it wrote no report)", ""]
-
-        if signals:
-            # `attempted` is the field that stops the next reader repeating
-            # ruled-out work, and it is worthless if it never leaves the report.
-            lines.append("### What it raised, and what it already ruled out")
-            for s in signals:
-                lines.append("- **`%s`** — %s" % (s.get("type", "?"),
-                                                  (s.get("detail") or "").strip()[:400]
-                                                  or "(no detail given)"))
-                ev = (s.get("evidence") or "").strip()
-                if ev:
-                    lines += ["", "  ```", "  " + ev[:800].replace("\n", "\n  "), "  ```"]
-                for a in (s.get("attempted") or [])[:6]:
-                    lines.append("  - tried, and it failed: %s" % str(a)[:200])
-                sug = (s.get("suggestion") or "").strip()
-                if sug:
-                    lines.append("  - its suggestion, non-binding: %s" % sug[:300])
-            lines.append("")
-
-        # Disposition is the planner's job, but the list has to come from here:
-        # it is the only place that still knows what was green before the reset.
-        lines.append("### Completed work — disposition each one (keep / adapt / discard)")
-        if done:
-            lines += ["- `%s` — %s%s" % (
-                s["id"], s.get("goal") or "(no goal)",
-                " [files: %s]" % ", ".join(s.get("actual_files") or [])
-                if s.get("actual_files") else "") for s in done]
-        else:
-            lines.append("- (nothing is complete yet — the whole plan is open)")
-        lines.append("")
-
-        dev = self.task.read_text("deviations.md", "").strip()
-        if dev:
-            lines += ["### Deviations logged so far", dev[-2000:], ""]
-
-        prev = self.task.read_text("escalation.md", "")
-        self.task.write_text("escalation.md",
-                             (prev + "\n" if prev.strip() else "") + "\n".join(lines) + "\n")
-
-    def _rung3(self, exc):
-        """Send it back to the planner, or to the human when replans are spent.
-
-        `check_replan` raises LimitBreach, which the run loop already turns into
-        needs_human -- that is rung 4, and it is reached by exhausting rung 3
-        rather than by skipping it.
-        """
-        self.budget.check_replan()
-        self.budget.used_replan()
-        self.log("  rung 3: %s — replanning (%s)"
-                 % (exc, self.budget.summary()))
-        self.task.update(status="plan", replan_reason=str(exc))
 
     def _run_wave(self, wave):
         """Each subtask in its own worktree, concurrently, then merged in
@@ -1184,11 +743,10 @@ a planner does that next, from your design.
         finished = [s for s in wave
                     if not isinstance(results.get(s["id"]), Exception)]
         # Held, not raised on the spot. A merge that will not go in is real, but
-        # it must not outrank a sibling's routing outcome: raising it here threw
-        # away a `Replan` -- the ladder's rung 3, with its escalation bundle
-        # already written -- and would swallow a quota park's reopen time, which
-        # is the exact "the sequential and parallel paths disagreed about the
-        # same event" failure the re-raises below exist to prevent.
+        # it must not outrank a sibling's routing outcome: raising it here would
+        # swallow a quota park's reopen time, which is the exact "the sequential
+        # and parallel paths disagreed about the same event" failure the
+        # re-raise below exists to prevent.
         integration_error = None
         if finished:
             try:
@@ -1201,12 +759,11 @@ a planner does that next, from your design.
                 integration_error = e
         for sub in wave:
             outcome = results.get(sub["id"])
-            if isinstance(outcome, (Replan, routing.AllChannelsCooled)):
-                # Re-raised, not flattened into a Halt. A Replan continues the
-                # run at the plan stage, and a quota park carries a reopen time
-                # and drives `resume --when-open`; downgrading either gave the
-                # wave path a different answer from the sequential one for an
-                # identical event.
+            if isinstance(outcome, routing.AllChannelsCooled):
+                # Re-raised, not flattened into a Halt: a quota park carries a
+                # reopen time and drives `resume --when-open`, and downgrading it
+                # gave the wave path a different answer from the sequential one
+                # for an identical event.
                 if integration_error is not None:
                     self.log("  wave: the finished members did not integrate "
                              "cleanly (%s) — reporting %s's outcome first, "
@@ -1482,7 +1039,7 @@ a planner does that next, from your design.
         # can only grow, so a file a rework DELETED could never leave it: the
         # deletion is itself a change, so the path came straight back in
         # `files`. It went on being reported as a scope violation, went on
-        # blocking `_skip_review`, and was still shown to the human at the merge
+        # shown to the human at the merge
         # gate as a changed file the patch does not contain. Intersecting keeps
         # the accumulation and drops the paths whose net effect is nothing. It
         # cannot pull in a sibling's file, because nothing enters this list
@@ -1499,58 +1056,11 @@ a planner does that next, from your design.
                     s["scope_violations"] = verify.scope_violations(
                         s["actual_files"], sub.get("planned_scope") or ["**"])
                     sub["actual_files"] = s["actual_files"]
-            # Only the findings THIS subtask owned. Clearing the whole list let
-            # the first subtask to finish disarm the rework for every other one:
-            # a reviewer that rejected st-1 and st-2 saw st-1 fixed, and st-2 was
-            # then re-dispatched by `_findings_brief` with nothing at all -- back
-            # to the same code with the same prompt, rebuilding exactly what was
-            # rejected, which is the failure the finding hand-off exists to stop.
-            # Not a race, and not a wave problem at all: siblings in one wave are
-            # dispatched before any of them finishes, so they all read the list
-            # intact. It bites wherever subtasks go one after another -- a cap of
-            # one, a dependency chain, or scopes that serialize them -- which is
-            # the ordinary case.
-            #
-            # An unowned finding survives, because it is addressed to whoever is
-            # reworking rather than to one subtask. The next verdict replaces the
-            # list wholesale, so nothing outlives the review that raised it.
-            state["pending_findings"] = [
-                f for f in (state.get("pending_findings") or [])
-                if not self._owned_by(f.get("suggested_owner"), sub["id"])]
         self.task.mutate(mark)
         violations = [s.get("scope_violations") or [] for s in self.task.state["subtasks"]
                       if s["id"] == sub["id"]]
         if violations and violations[0]:
             self.log("  scope: %d file(s) outside declared scope" % len(violations[0]))
-
-    def _review_policy(self):
-        """auto (default): independent review for complex work, deterministic
-        checks alone for simple work. always / never force it either way."""
-        state = self.task.state
-        return (state.get("review")
-                or (self.reg["policy"].get("review") if isinstance(self.reg.get("policy"), dict) else None)
-                or "auto")
-
-    def _skip_review(self, result):
-        """Reasons to run the reviewer anyway, even on a simple task. Each is a
-        deterministic signal that something happened nobody planned -- exactly
-        what an automated check cannot judge."""
-        mode = self._review_policy()
-        if mode == "always":
-            return None
-        if mode == "never":
-            return "review disabled for this task"
-        if self.task.state.get("classification", {}).get("tier") != "simple":
-            return None
-        if not result.ok:
-            return None
-        violations = [v for s in self.task.state["subtasks"]
-                      for v in (s.get("scope_violations") or [])]
-        if violations:
-            self.log("  review: running anyway — %d file(s) outside declared scope"
-                     % len(violations))
-            return None
-        return "simple change, all checks green, nothing outside the declared scope"
 
     def _winnow(self, base, result):
         """Deterministic chaff scan, if code-winnow is installed. Free enough to
@@ -1570,159 +1080,6 @@ a planner does that next, from your design.
             self.log("  chaff scan: %d note(s), %d notable"
                      % (summary["total"], len(summary["notable"])))
         return summary
-
-    def _stage_review(self):
-        base = self._ensure_worktree()
-        result = verify.run(self.task, self.repo, base, "slow" if self.vcfg.get("slow") else "fast")
-        wn = self._winnow(base, result)
-        self.task.update(winnow=wn)
-        skip = self._skip_review(result)
-        if skip:
-            self.log("review: skipped — %s" % skip)
-            self.task.update(review_outcome={"reviewed": False, "why": skip},
-                             status="integrate")
-            return
-        self.budget.check_review_loop()
-        if not result.ok:
-            # Never review red code (D5). Send it back as work -- and reopen a
-            # subtask, or implement would find nothing pending and bounce
-            # straight back here forever. The attempt budget bounds the loop.
-            self.log("review: skipped — checks are red (%s)" % result.summary())
-            self._reopen_subtasks()
-            self.task.update(status="implement")
-            return
-        choice = self._pick("reviewer")
-        self._archive_reports("review-")
-        self.log("review: %s via %s" % (choice.model, choice.channel))
-        # The two inputs `roles/reviewer.md` step 1 calls "the diff, and the
-        # verify output your prompt provides" -- and step 6 authorises a
-        # `blocked` report when they never arrive. They never did: this prompt
-        # named neither, so a card-compliant reviewer was entitled to stop the
-        # run over a missing input the orchestrator was holding the whole time.
-        # The diff is named rather than pasted; a large one does not belong in a
-        # prompt, and the base commit is the part the reviewer cannot derive.
-        extra = (
-            "The change under review is everything between the task's base commit "
-            "and HEAD in this worktree. Produce it yourself, and read it rather "
-            "than any summary of it:\n"
-            "  git diff %s\n\n"
-            "The deterministic checks have already run: %s. Every command, exit "
-            "code and full output is here, and it is the verify evidence your "
-            "role card tells you to weigh:\n"
-            "  %s\n"
-            "Quote from it rather than re-running. If you do re-run something, "
-            "say so and say why.\n\n"
-            # The envelope, not the payload. `roles/reviewer.md` step 6, both
-            # schemas and `_collect_report` all agree that a verdict rides
-            # inside an ordinary report as `role_data.verdict` -- one envelope,
-            # one thing to validate. This prompt was the last copy still naming
-            # the verdict schema as the file to write, so a reviewer that obeyed
-            # its prompt rather than its card produced a bare verdict object,
-            # which `schema.validate_report` then rejected for every required
-            # field it does not have. The card is pinned by a test; this string
-            # was not, which is exactly how the two drifted.
-            # Resolved against the RUNTIME's schemas directory, not the workflow
-            # in force. `schema.schemas_dir()` says why -- the report envelope is
-            # how this program reads a result, so it does not move with
-            # `--workflow` and a hosted workflow need not ship a copy. Building
-            # these two from `prompts.skill_path()` put a second, different
-            # absolute path for the same file in the same prompt, and under any
-            # workflow but the bundled one it named a file that need not exist.
-            "Write reports/review-reviewer.json as an ordinary report matching "
-            "%s, carrying your verdict under role_data.verdict, which must "
-            "itself match %s."
-            % (self.task.state["repo"].get("base_commit", "HEAD"),
-               result.summary(),
-               self.task.file("verify", result.run_id + ".json"),
-               os.path.join(schema.schemas_dir(), "report.schema.json"),
-               os.path.join(schema.schemas_dir(), "verdict.schema.json")))
-        chaff = winnow.as_text(self.task.state.get("winnow"))
-        if chaff:
-            extra += ("\n\n%s\nRead these after the diff, not before. They may only "
-                      "block if they independently land on authority — an acceptance "
-                      "criterion, a plan line, or a stated non-goal. Otherwise record "
-                      "them under `advisory`." % chaff)
-        self._run_once("reviewer", choice, cwd=base, extra=self._with_note(extra))
-        verdict = self._read_verdict()
-        self.log("review: %s" % verdict["verdict"])
-        self.task.update(review_outcome={"reviewed": True, "verdict": verdict["verdict"]})
-        self.budget.used_review_loop()
-        self._apply_verdict(verdict)
-
-    def _read_verdict(self):
-        path = os.path.join("reports", "review-reviewer.json")
-        try:
-            data = self.task.read_json(path)
-        except (OSError, ValueError):
-            raise Halt("needs_human", "reviewer wrote no valid verdict file")
-        # The verdict rides inside a normal report as role_data.verdict. A bare
-        # verdict file is still accepted: older reviewers and hand-driven runs
-        # write one, and refusing it would discard a real review over shape.
-        if "verdict" not in data:
-            inner = (data.get("role_data") or {}).get("verdict")
-            if inner is None:
-                if data.get("status") in ("blocked", "escalate"):
-                    raise Halt("needs_human", "reviewer could not review: %s"
-                               % (data.get("summary", "")[:200]))
-                raise Halt("needs_human", "reviewer report carries no verdict")
-            data = inner
-        try:
-            schema.validate_verdict(data)
-        except schema.Invalid as e:
-            raise Halt("needs_human", "reviewer verdict failed validation: %s" % e)
-        return data
-
-    def _apply_verdict(self, verdict):
-        v = verdict["verdict"]
-        # A verdict is the authority on what is still outstanding, so each one
-        # replaces the last one's findings rather than adding to them. The
-        # branches below that do not carry findings forward clear them here:
-        # `_finish_subtask` now only consumes the findings a subtask owned, so
-        # an unowned one would otherwise outlive the review that raised it.
-        if v == "APPROVE":
-            self.task.update(pending_findings=[], status="integrate")
-        elif v == "REQUEST_CHANGES":
-            blocking = [f for f in verdict.get("findings", []) if f.get("severity") == "blocking"]
-            if not blocking:
-                # `severity: minor` is legal, so `blocking` can legally be
-                # empty -- and then `owners` is empty, `_reopen_subtasks`
-                # reopens EVERYTHING on its "no owners named" fallback, and
-                # `pending_findings` is empty, so every green subtask is
-                # rebuilt from scratch with no idea what was wrong. That is the
-                # failure the finding hand-off exists to prevent, arriving
-                # through a schema-legal verdict. verdict.schema.json defines
-                # REQUEST_CHANGES as "blocking findings fixable within the
-                # current plan"; one with none is incoherent, and guessing on
-                # the reviewer's behalf costs a full rebuild.
-                # The parentheses matter: `%` binds tighter than `or`, so
-                # without them the fallback was unreachable and a verdict with
-                # no findings at all trailed off after the colon.
-                raise Halt("needs_human",
-                           "the reviewer requested changes but raised no blocking "
-                           "finding, so there is nothing to send back. Re-run the "
-                           "review, or mark the finding blocking if it is: %s"
-                           % (", ".join(f.get("claim", "?")[:80]
-                                        for f in verdict.get("findings", [])[:3])
-                              or "(it listed no findings at all)"))
-            blocking = [self._addressable(f) for f in blocking]
-            owners = {f.get("suggested_owner") for f in blocking if f.get("suggested_owner")}
-            self._reopen_subtasks(owners)
-            # Carry the findings to the implementer. Reopening a subtask without
-            # them sends an agent back to the same code with the same prompt and
-            # no idea what was wrong -- it rebuilds what the reviewer rejected.
-            self.task.update(pending_findings=blocking)
-            self.log("  %d blocking finding(s) sent back" % len(blocking))
-            self.task.update(status="implement")
-        elif v == "REPLAN":
-            self.budget.check_replan()
-            self.budget.used_replan()
-            # Cleared, not carried: the planner is about to reissue the
-            # decomposition, so findings citing subtask ids that may not survive
-            # it would be handed to whoever inherited the id.
-            self.task.update(pending_findings=[], status="plan")
-        else:
-            raise Halt("needs_human", "reviewer escalated: %s" %
-                       (verdict.get("findings") or [{}])[0].get("claim", "no detail"))
 
     def _human_note(self):
         """The last thing a human said at a gate, formatted for a prompt.
@@ -1754,91 +1111,6 @@ a planner does that next, from your design.
             return extra
         return "%s\n\n%s" % (extra, note) if extra else note
 
-    @staticmethod
-    def _owned_by(owner, subtask_id):
-        """Does a reviewer's `suggested_owner` name this subtask?
-
-        The schema documents the field as "Subtask id that should own the fix,
-        e.g. impl:st-2", so the id may arrive bare or behind a `role:` prefix --
-        which is why this was a substring test. But `"st-1" in "st-11"` is true,
-        so a finding against `st-11` also reopened `st-1` and sent green work
-        back to be rebuilt. Same defect class as the report-filename collision
-        the protocol already guards against, arriving through the one field a
-        reviewer writes by hand.
-
-        Compared on the last `:`-separated token, which accepts both documented
-        forms and neither more nor less.
-        """
-        return (owner or "").strip().split(":")[-1].strip() == subtask_id
-
-    def _addressable(self, finding):
-        """A finding whose owner this plan can actually deliver to.
-
-        `suggested_owner` is written by hand by the reviewer, against ids the
-        planner chose. One that names no subtask used to be worse than useless:
-        `_reopen_subtasks` fell through to reopening `subtasks[0]`, and
-        `_findings_brief` then filtered the finding out of that subtask's brief
-        -- it has an owner, and this is not it -- so an agent was sent back to
-        rebuild something with the reason withheld. Dropping the bad owner makes
-        it unowned, which is the honest reading: it is addressed to whoever is
-        reworking.
-        """
-        owner = finding.get("suggested_owner")
-        if not owner:
-            return finding
-        known = [s["id"] for s in (self.task.state.get("subtasks") or [])]
-        if any(self._owned_by(owner, sid) for sid in known):
-            return finding
-        self.log("  review: finding %s names %r, which is no subtask in this plan "
-                 "— treating it as unaddressed so every reworking subtask sees it"
-                 % (finding.get("id", "?"), owner))
-        return dict(finding, suggested_owner=None)
-
-    def _findings_brief(self, sub):
-        """What the reviewer rejected, for the implementer that has to fix it."""
-        findings = self.task.state.get("pending_findings") or []
-        mine = [f for f in findings
-                if not f.get("suggested_owner")
-                or self._owned_by(f.get("suggested_owner"), sub["id"])]
-        if not mine:
-            return None
-        lines = ["A reviewer rejected the previous attempt. Address these before "
-                 "anything else — each cites the requirement or plan line it comes from:"]
-        for f in mine:
-            where = " (%s%s)" % (f.get("file", ""),
-                                 ":%s" % f["line"] if f.get("line") else "") if f.get("file") else ""
-            lines.append("- [%s]%s %s" % (f.get("cite", "uncited"), where, f.get("claim", "")))
-        lines.append("If you believe a finding is wrong, say so in your report with "
-                     "evidence rather than silently ignoring it.")
-        return "\n".join(lines)
-
-    def _reopen_subtasks(self, owners=None):
-        """Mark subtasks pending again. When the reviewer named owners, only
-        those reopen -- reworking everything would discard green work.
-
-        `merged` is cleared with the status, because it describes the branch as
-        it stood when it landed and a reopened subtask is about to add commits
-        that have not. Leaving it set disarmed `_unfinish`, whose guard is
-        `complete and not merged`: a rework whose own merge was aborted stayed
-        `complete`, so on resume nothing was pending, the run fell through
-        review to integrate, and `_land` delivered a patch and a `done` for work
-        the reviewer had rejected and the implementer had redone. That is the
-        silent-loss invariant `_unfinish` exists to hold -- `complete` means
-        `its work is on the integration branch` -- defeated by a stale flag.
-        """
-        def reopen(state):
-            hit = False
-            for s in state["subtasks"]:
-                named = owners and any(self._owned_by(o, s["id"]) for o in owners)
-                if not owners or named:
-                    s["status"] = "pending"
-                    s.pop("merged", None)
-                    hit = True
-            if not hit and state["subtasks"]:
-                state["subtasks"][0]["status"] = "pending"
-                state["subtasks"][0].pop("merged", None)
-        self.task.mutate(reopen)
-
     def _stage_integrate(self):
         # Before anything expensive. Unlike the other two gates this one sits
         # MID-stage -- `_land()` follows it -- so an approved run re-enters here,
@@ -1855,14 +1127,25 @@ a planner does that next, from your design.
 
         state = self.task.state
         files = sorted({f for s in state["subtasks"] for f in s.get("actual_files", [])})
-        result = verify.run(self.task, self.repo, self._ensure_worktree(), "fast")
-        ro = self.task.state.get("review_outcome") or {}
-        if ro.get("reviewed"):
-            note = "An independent reviewer checked this against the plan and approved it."
-        else:
-            note = ("**No independent review was run** (%s). The automated checks "
-                    "below are the only evidence. Re-run with `--review always` if "
-                    "you want a second opinion." % ro.get("why", "not requested"))
+        base = self._ensure_worktree()
+        result = verify.run(self.task, self.repo, base, "fast")
+        # The chaff scan used to run inside `review`, but it is not a review: no
+        # model reads it and nothing routes on it. It is a deterministic pass
+        # over the diff whose output the merge brief prints, so it belongs on
+        # the path that still exists. Left in `review` it would have gone with
+        # the reviewer, and the brief would have quietly lost a section that
+        # still had everything it needed to produce.
+        self.task.update(winnow=self._winnow(base, result))
+        # Said plainly, every time. `delegate` runs no reviewer: it places the
+        # work the caller decomposed and integrates what comes back, and the
+        # only judgement in the record is the caller's own plus the checks
+        # below. A brief that did not say so would let a human read "complete,
+        # checks pass" as "something looked at this".
+        note = ("**Nothing reviewed this.** `delegate` dispatched the subtasks "
+                "you supplied and merged what came back; the automated checks "
+                "below, and the scope column above, are the whole of the "
+                "evidence. Judging the work against what you asked for is "
+                "yours, and this is the point to do it.")
         chaff = winnow.as_text(self.task.state.get("winnow"))
         if chaff:
             note += "\n\n" + chaff
@@ -2180,24 +1463,6 @@ a planner does that next, from your design.
             repo_info = dict(repo_info, base_commit=base)
         self.task.update(worktree=path, branch=branch, repo=repo_info)
         return path
-
-    def _archive_reports(self, match):
-        """Move a stage's previous reports aside before it runs again. Reviewers
-        are told to check whether their earlier findings were addressed, which
-        is impossible against a file the next round overwrites."""
-        src = self.task.file("reports")
-        if not os.path.isdir(src):
-            return
-        dest = self.task.file("reports", "archive")
-        for name in sorted(os.listdir(src)):
-            if not name.endswith(".json") or match not in name:
-                continue
-            os.makedirs(dest, exist_ok=True)
-            n, target = 1, None
-            while target is None or os.path.exists(target):
-                target = os.path.join(dest, "%s-r%d.json" % (name[:-5], n))
-                n += 1
-            os.replace(os.path.join(src, name), target)
 
     def _run_once(self, role, choice, cwd, **kw):
         """Invoke, close, and return the report. For roles that get one turn."""
@@ -2628,37 +1893,6 @@ Rules:
         self.log("gate %s: %s (answered out of band)%s"
                  % (kind, decision, " — %s" % note if note else ""))
         return decision == "approved"
-
-    def _gate(self, kind, question, resume_status):
-        decided = self._decision_already_made(kind)
-        if decided is not None:
-            if decided:
-                return
-            raise Halt("needs_human", "%s declined by human" % kind)
-        files = sorted({f for s in self.task.state["subtasks"] for f in s.get("actual_files", [])})
-        extra = None
-        if kind == "design":
-            extra = self.task.read_text("spec.md", "")
-        text, problems = brief.write(self.task, kind, question, files=files,
-                                     extra=extra, polish=self._polish)
-        for p in problems:
-            self.log("  brief lint: %s" % p)
-        try:
-            approved = self.gate(kind, text)
-        except AwaitingApproval as a:
-            # The injected gate keeps its `(kind, text) -> bool` signature: it
-            # knows how to reach a human and nothing about the pipeline, so it
-            # cannot know where the run continues afterwards. The caller does.
-            a.resume_status = resume_status
-            raise
-        if not approved:
-            # Recorded before the raise. A decline is the most informative thing
-            # a human does to a run -- it is the one place the machine was about
-            # to be wrong -- and logging only approvals left every rejection
-            # missing from the history that exists to count them.
-            self.task.record_gate(kind, "declined")
-            raise Halt("needs_human", "%s declined by human" % kind)
-        self.task.record_gate(kind, "approved")
 
     def _quota_park(self, exc):
         """Park on quota rather than on a generic 'no model available'. The
