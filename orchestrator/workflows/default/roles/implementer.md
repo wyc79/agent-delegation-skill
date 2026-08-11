@@ -99,10 +99,9 @@ human. Read `references/escalation.md` for the shapes.
 
 ## Your triggers
 
-Beyond the shared ones in `SKILL.md`, and only when the condition applies:
+Beyond the shared ones in `PROTOCOL.md`, and only when the condition applies:
 
 | Condition | Read |
 |---|---|
 | Before you write code | `references/companions.md` |
 | You share files with another running agent, or hit a merge conflict | `references/parallelism.md` |
-| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |

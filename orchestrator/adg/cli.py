@@ -35,8 +35,20 @@ def _confirm(kind, text):
     try:
         return input("Approve %s? [y/N] " % kind).strip().lower() in ("y", "yes")
     except EOFError:
-        print("(no tty — declining; re-run interactively to approve)")
-        return False
+        # Park, never decline. There is a real difference between "the human
+        # said no" and "there was no human to ask", and recording the first when
+        # the second happened puts a rejection nobody made into the permanent
+        # gate history -- the one record that exists to count what humans
+        # actually decided.
+        #
+        # It is also what makes the CLI usable as a bridge. The caller is now
+        # expected to be the user's own agent shelling out, and an agent has no
+        # tty either, so declining here would auto-reject every gate of every
+        # run. Parking hands the question back instead: `delegate show` prints
+        # it, the agent puts it to the user in prose, and `delegate approve` /
+        # `reject` answers it -- with a note, which y/N never carried.
+        from .machine import AwaitingApproval
+        raise AwaitingApproval(kind, text, resume_status=None)
 
 
 def _new_id(repo):
@@ -155,7 +167,7 @@ def cmd_init(args):
     if unused:
         print("\npresent but deliberately not enrolled: %s" % ", ".join(unused))
 
-    installed = companions.detect()
+    installed = companions.detect(repo)
     print("\ncompanion skills: %s" % (", ".join(k for k, v in installed.items() if v)
                                        or "none detected"))
     print("chaff scanner  : %s" % (winnow.find(repo) or "not installed"))
@@ -228,6 +240,90 @@ def _default_adapter(reg):
     return "local"
 
 
+def cmd_approve(args):
+    """Answer a gate that parked, then carry on.
+
+    This is the other half of turning a gate from a prompt into a return value.
+    `run` exits holding the question; the user's agent shows it to the human in
+    whatever form reads well; this writes the answer back and continues.
+
+    The decision is written to `pending_gate` rather than straight to the gate
+    history because the machine has to *consume* it -- that is what lets an
+    approved run skip past a question already answered instead of asking it
+    again, and it is why `--note` survives into the record either way.
+    """
+    repo = _repo(args.repo)
+    task = store.Task.open(repo, args.id)
+    pend = task.state.get("pending_gate") or {}
+    if not pend.get("kind"):
+        sys.exit("task %s is not waiting on a gate (status: %s)"
+                 % (task.state["id"], task.state["status"]))
+    if pend.get("decision"):
+        sys.exit("the %s gate was already answered %r" % (pend["kind"], pend["decision"]))
+
+    decision = "approved" if args.decision == "approve" else "declined"
+    # Recorded HERE, and only here. This is the moment the human decided, and
+    # it is the only site every gate passes through: the design and plan gates
+    # resume past the stage that asked them, so a machine-side recording would
+    # silently lose those approvals entirely.
+    task.record_gate(pend["kind"], decision, args.note)
+    if decision == "approved":
+        # Carried into the prompts of the planner, implementers and reviewer.
+        # A qualified yes approves something other than what was proposed, and
+        # the agents that build and check it have to be told -- otherwise the
+        # note is a record of an instruction nobody ever followed.
+        #
+        # Written even when empty, which CLEARS a previous one. Guarding this on
+        # a non-empty note meant an unqualified approval at a later gate left the
+        # earlier qualification flowing into every downstream prompt for the rest
+        # of the run -- while `_human_note` promised it was "superseded by the
+        # next approval".
+        task.update(gate_note={"kind": pend["kind"], "note": args.note.strip()})
+    # The merge gate keeps its pending decision because `_stage_integrate` is
+    # re-entered and consumes it. The design and plan gates resume PAST the
+    # stage that asked, so nothing would ever consume theirs -- and a stale
+    # `pending_gate` makes the next `approve` refuse as already-answered.
+    #
+    # Only an APPROVAL is kept. A declined merge gate left the decision behind
+    # forever: the human's agent fixed what was wrong, called `approve`, and got
+    # "the merge gate was already answered 'declined'" with no way back. Worse,
+    # a later run with `--yes` still found the stale decline and threw away all
+    # the rework at a gate nobody was asked about.
+    if pend["kind"] == "merge" and decision == "approved":
+        task.update(pending_gate=dict(pend, decision=decision, note=args.note))
+    else:
+        task.update(pending_gate=None)
+    print("%s gate: %s%s" % (pend["kind"], decision,
+                             " — %s" % args.note if args.note else ""))
+    if decision == "declined":
+        # A decline ends the run by definition, so there is nothing to continue
+        # into. It is already in the gate history above; nothing downstream has
+        # to run for the rejection to have been recorded.
+        task.update(status="needs_human")
+        print("task parked at needs_human; `delegate resume --stage <stage>` to redirect")
+        return 0
+    # Written whether or not we continue now. `--no-continue` used to return
+    # with the status still `awaiting_approval` and `pending_gate` already
+    # cleared, which stranded the task: nothing handles that status, so `resume`
+    # halted with "no handler for stage 'awaiting_approval'", and `approve`
+    # refused because the gate was no longer pending. `resume_status` was gone,
+    # so the run could only be restarted at a guessed stage -- and for a design
+    # gate the guess is wrong, because `needs_human` resumes at `implement` and
+    # skips planning entirely.
+    resume_at = pend.get("resume_status")
+    if not resume_at:
+        sys.exit("the parked gate recorded no resume point; "
+                 "use `delegate resume --stage <stage>`")
+    task.update(status=resume_at)
+    if args.no_continue:
+        print("recorded; task set to %s, not resuming (--no-continue)" % resume_at)
+        return 0
+    return cmd_resume(argparse.Namespace(
+        repo=args.repo, registry=args.registry, id=args.id, stage=None,
+        adapter=args.adapter, no_panes=args.no_panes, dry_run=args.dry_run,
+        yes=False, when_open=False))
+
+
 def cmd_resume(args):
     repo = _repo(args.repo)
     reg = routing.load_registry(args.registry)
@@ -252,6 +348,18 @@ def cmd_resume(args):
                              % (args.stage, ", ".join(STAGES)))
             sys.exit(2)
         task.update(status=args.stage)
+    elif was == "awaiting_approval":
+        # Not a stage, and not something `resume` can guess its way past. Left
+        # to fall through, the run loop found no `_stage_awaiting_approval` and
+        # parked with "no handler for stage", which reads as a crash for what is
+        # an ordinary state: a question is waiting on a human. The gate still
+        # holds its own resume point, so answering it is the only correct move.
+        pend = task.state.get("pending_gate") or {}
+        sys.exit("task %s is waiting on the %s gate, not parked. Answer it with "
+                 "`delegate approve --note \"...\"` or `delegate reject --note "
+                 "\"...\"`; `delegate show --brief` prints the question. To "
+                 "abandon the question and restart elsewhere, pass an explicit "
+                 "--stage." % (task.state["id"], pend.get("kind", "?")))
     elif was in ("needs_human", "abandoned"):
         task.update(status="implement")
     print("resuming %s from %s%s" % (task.state["id"], task.state["status"],
@@ -339,6 +447,20 @@ def main(argv=None):
                     help="if the task is waiting on a quota window, sleep here "
                          "until it reopens and then resume")
     rs.set_defaults(func=cmd_resume)
+
+    for name, helptext in (("approve", "answer a waiting gate with yes"),
+                           ("reject", "answer a waiting gate with no")):
+        g = sub.add_parser(name, help=helptext)
+        g.add_argument("--id")
+        g.add_argument("--note", default="",
+                       help="what the human actually said; carried into the "
+                            "gate record and, on approval, into the run")
+        g.add_argument("--adapter", choices=["herdr", "local", "mock"])
+        g.add_argument("--no-panes", action="store_true")
+        g.add_argument("--dry-run", action="store_true")
+        g.add_argument("--no-continue", action="store_true",
+                       help="record the decision without resuming the run")
+        g.set_defaults(func=cmd_approve, decision=name)
 
     st = sub.add_parser("status", help="list tasks for this project")
     st.set_defaults(func=cmd_status)

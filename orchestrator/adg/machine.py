@@ -97,6 +97,38 @@ class Halt(Exception):
         self.status = status
 
 
+class AwaitingApproval(Exception):
+    """A gate has nobody to ask right now, so the task parks holding the
+    question rather than answering it.
+
+    Distinct from a decline, and the distinction is the whole point. `_confirm`
+    used to hit `EOFError` with no tty, print "declining", and return False --
+    which recorded a rejection the human never made and killed the run. That was
+    tolerable while `delegate` was driven by a person at a terminal. It is fatal
+    once the caller is the user's own agent shelling out, because an agent has
+    no tty either: every gate would auto-decline.
+
+    Parking instead turns the gate from a prompt into a return value. The CLI
+    exits holding the brief and the question, the user's agent renders it in
+    whatever way reads well, the human answers in prose, and `delegate approve
+    --note "..."` / `reject --note "..."` writes the decision back. The note
+    then flows into the next stage's prompt, which is strictly more than y/N
+    ever carried.
+
+    `resume_status` is where the run continues once approved, and it is not
+    always the stage that asked: the design and plan gates sit at the END of
+    their stage, so re-entering it would re-run the planner and re-author the
+    tests for a question that has already been answered. The merge gate is
+    mid-stage -- `_land()` follows it -- so that one does re-enter, and
+    `_stage_integrate` consumes the recorded decision before building a brief
+    it no longer needs.
+    """
+
+    def __init__(self, kind, brief, resume_status):
+        super().__init__("awaiting approval at the %s gate" % kind)
+        self.kind, self.brief, self.resume_status = kind, brief, resume_status
+
+
 class Replan(Exception):
     """Rung 3 (§6.2): the model ladder is spent, so the plan is the suspect.
 
@@ -153,6 +185,18 @@ class Orchestrator:
                     # run at the plan stage, and catching it out there would end
                     # the run instead -- the very thing this rung exists to stop.
                     self._rung3(r)
+        except AwaitingApproval as a:
+            # Not a Halt: `needs_human` means the run is over and something is
+            # wrong, and a question waiting to be answered is neither. Keeping
+            # them apart is what lets `delegate status` say "waiting on you"
+            # instead of "broken", and what stops `resume` from restarting at
+            # `implement` the way it does for a genuine park.
+            self.task.update(status="awaiting_approval",
+                             pending_gate={"kind": a.kind, "brief": a.brief,
+                                           "resume_status": a.resume_status,
+                                           "at": self.clock()})
+            self.log("\n== AWAITING APPROVAL: %s gate" % a.kind)
+            return "awaiting_approval"
         except routing.AllChannelsCooled as q:
             # Ahead of the generic handler: this is not a crash and not a
             # registry mistake, and reporting it as either sends the reader to
@@ -213,7 +257,7 @@ admits only one sensible reading.
 
     def _stage_intake(self):
         self.log("intake: %s" % self.task.state["id"])
-        found = companions.detect()
+        found = companions.detect(self.repo)
         if any(found.values()):
             self.log("companions: %s" % ", ".join(k for k, v in found.items() if v))
         self.task.update(companions=found)
@@ -286,9 +330,16 @@ admits only one sensible reading.
             # Unparseable: fail safe. Over-planning a small task wastes time;
             # under-planning a large one wastes the whole run.
             return "complex", "classifier gave no usable verdict", "fallback"
+        # Carries what it spent, like every other step. The classifier is a real
+        # billed call on a real seat; recording it without its cost made the
+        # cheapest-looking step in the run the one nothing could account for.
         self.task.record_delegation({"stage": "classify", "role": "classifier",
                                      "model": res.get("model"), "channel": res.get("channel"),
-                                     "adapter": self.adapter.name, "outcome": "complete"})
+                                     "adapter": self.adapter.name, "outcome": "complete",
+                                     "usd": res.get("cost_usd"),
+                                     "usd_estimated": bool(res.get("cost_estimated")) or None,
+                                     "tokens": res.get("usage"),
+                                     "elapsed_ms": res.get("elapsed_ms")})
         return (m.group(1).lower(),
                 m.group(2).strip()[:200] or "no reason given", res.get("model"))
 
@@ -371,9 +422,14 @@ a planner does that next, from your design.
             self.log("brainstorm: produced no design — planning from the request alone")
             self.task.update(status="plan")
             return
-        self._gate("design", "Approve this design before a plan is written from it? "
-                             "Answer any open questions below, or accept the "
-                             "defaults by approving.")
+        # Guarded like the other two. It was unconditional, so `design` in
+        # `human_approval_required` did nothing and removing it did nothing
+        # either -- the one gate a policy could not turn off was the one whose
+        # stage is already optional.
+        if self.budget.requires_approval("design"):
+            self._gate("design", "Approve this design before a plan is written from it? "
+                                 "Answer any open questions below, or accept the "
+                                 "defaults by approving.", resume_status="plan")
         self.task.update(status="plan")
 
     def _stage_plan(self):
@@ -403,7 +459,7 @@ a planner does that next, from your design.
                 "plan.md as keep, adapt or discard. Work that is already green is "
                 "reset to pending when your plan lands, so anything you leave out "
                 "will be built again." % self.task.file("escalation.md"))
-        self._run_once("planner", choice, cwd=self.repo, extra=extra)
+        self._run_once("planner", choice, cwd=self.repo, extra=self._with_note(extra))
         subtasks = self._read_plan_subtasks()
         if not subtasks:
             raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
@@ -412,7 +468,7 @@ a planner does that next, from your design.
         self._author_tests(subtasks)
         if self.budget.requires_approval("plan"):
             self._gate("plan", "Approve this plan? It splits the work into %d step(s)."
-                       % len(subtasks))
+                       % len(subtasks), resume_status="implement")
         self.task.update(status="implement")
 
     def _author_tests(self, subtasks):
@@ -546,7 +602,8 @@ a planner does that next, from your design.
                 sub["id"], attempts, role_choice.model, "" if session is None else ", continued"))
             session, report, role_choice = self._invoke(
                 "implementer", role_choice, cwd=base, subtask=sub,
-                session=session, failure=failure, extra=self._findings_brief(sub))
+                session=session, failure=failure,
+                extra=self._with_note(self._findings_brief(sub)))
             self.budget.used_attempt(sub["id"])
             result = verify.run(self.task, self.repo, base, "fast")
             self.log("  verify: %s" % result.summary())
@@ -1033,7 +1090,7 @@ a planner does that next, from your design.
                       "block if they independently land on authority — an acceptance "
                       "criterion, a plan line, or a stated non-goal. Otherwise record "
                       "them under `advisory`." % chaff)
-        self._run_once("reviewer", choice, cwd=base, extra=extra)
+        self._run_once("reviewer", choice, cwd=base, extra=self._with_note(extra))
         verdict = self._read_verdict()
         self.log("review: %s" % verdict["verdict"])
         self.task.update(review_outcome={"reviewed": True, "verdict": verdict["verdict"]})
@@ -1085,6 +1142,36 @@ a planner does that next, from your design.
             raise Halt("needs_human", "reviewer escalated: %s" %
                        (verdict.get("findings") or [{}])[0].get("claim", "no detail"))
 
+    def _human_note(self):
+        """The last thing a human said at a gate, formatted for a prompt.
+
+        An approval with a qualification -- "yes, but keep the old endpoint
+        working" -- is not approval of what was proposed. It approves something
+        slightly different, and the agent that builds it has to be told, or the
+        note is a record of an instruction nobody followed.
+
+        It carries forward rather than being consumed by its first reader. A
+        qualification on the plan applies to every subtask under that plan, not
+        only the first one dispatched; and the reviewer needs it too, or it
+        flags the retained endpoint as scope creep and rejects work that is
+        doing exactly what the human asked for. Superseded by the next
+        approval, never cleared on read.
+        """
+        gn = self.task.state.get("gate_note") or {}
+        note = (gn.get("note") or "").strip()
+        if not note:
+            return ""
+        return ("A human approved the %s with a qualification. It is part of what "
+                "was approved, and where it conflicts with the written plan the "
+                "human is right:\n\n  %s" % (gn.get("kind", "work"), note))
+
+    def _with_note(self, extra):
+        """Append the human's qualification to a prompt that may be empty."""
+        note = self._human_note()
+        if not note:
+            return extra
+        return "%s\n\n%s" % (extra, note) if extra else note
+
     def _findings_brief(self, sub):
         """What the reviewer rejected, for the implementer that has to fix it."""
         findings = self.task.state.get("pending_findings") or []
@@ -1117,6 +1204,18 @@ a planner does that next, from your design.
         self.task.mutate(reopen)
 
     def _stage_integrate(self):
+        # Before anything expensive. Unlike the other two gates this one sits
+        # MID-stage -- `_land()` follows it -- so an approved run re-enters here,
+        # and re-entry must not re-run the verification or rebuild a brief
+        # through `_polish` to ask a question that is already answered.
+        decided = self._decision_already_made("merge")
+        if decided is False:
+            raise Halt("needs_human", "merge declined by human")
+        if decided:
+            self._land()
+            self.task.update(status="done")
+            return
+
         state = self.task.state
         files = sorted({f for s in state["subtasks"] for f in s.get("actual_files", [])})
         result = verify.run(self.task, self.repo, self._ensure_worktree(), "fast")
@@ -1140,7 +1239,17 @@ a planner does that next, from your design.
         for p in problems:
             self.log("  brief lint: %s" % p)
         if self.budget.requires_approval("merge"):
-            if not self.gate("merge", text):
+            # Recorded here rather than through _gate(), which this path has
+            # never used: the merge gate carries a brief the others do not. Both
+            # outcomes are written, so `gates` is a complete account of what a
+            # human decided rather than a list of the times they said yes.
+            try:
+                approved = self.gate("merge", text)
+            except AwaitingApproval as a:
+                a.resume_status = "integrate"
+                raise
+            self.task.record_gate("merge", "approved" if approved else "declined")
+            if not approved:
                 raise Halt("needs_human", "merge declined by human")
         self._land()
         self.task.update(status="done")
@@ -1251,12 +1360,13 @@ a planner does that next, from your design.
             raise routing.NoModelAvailable(
                 "no runnable model for role %r at reasoning >= %s"
                 % (role, min_reasoning))
-        for c in pool:
-            if self.adapter.can_run(c.agent_kind):
-                if c.demoted:
-                    self.log("  reserve: %s on %s anyway — no alternative"
-                             % (role, c.channel))
-                return c
+        runnable = [c for c in pool if self.adapter.can_run(c.agent_kind)]
+        if runnable:
+            c = self._prefer_by_headroom(role, runnable, util)
+            if c.demoted:
+                self.log("  reserve: %s on %s anyway — no alternative"
+                         % (role, c.channel))
+            return c
         if blocked:
             # Would this role have had somewhere to go with nothing filtered?
             # If so this is a quota event with a known reopen time, not a
@@ -1265,7 +1375,15 @@ a planner does that next, from your design.
                         role, ceiling=self.budget.ceiling(), boost=boost,
                         utilization=util)
                     if self.adapter.can_run(c.agent_kind)]
-            hit = sorted({c.channel for c in free} & blocked)
+            # Intersected with `cooled`, NOT with `blocked`. `blocked` also
+            # carries `exclude` -- seats this run walked away from for reasons
+            # that are not quota at all. A timeout hop appends to that list and
+            # deliberately writes no breaker, so reporting those channels here
+            # parked the task as `quota_all_exhausted` with ZERO open breakers:
+            # `delegate status` said "waiting on quota", the brief told the
+            # human their subscription was gone, and a provider wall that never
+            # happened went into the record that exists to count them.
+            hit = sorted({c.channel for c in free} & cooled)
             if hit:
                 reopen = cooldown.earliest_reopen(entries, hit)
                 raise routing.AllChannelsCooled(
@@ -1275,9 +1393,70 @@ a planner does that next, from your design.
                     "them, `delegate channels --clear <name>` overrides one."
                     % (role, ", ".join(hit), _stamp(reopen)))
         raise routing.NoModelAvailable(
-            "no runnable model for role %r: %s" % (
-                role, ", ".join("%s needs %s" % (c.model, c.agent_kind)
-                                for c in candidates) or "nothing enrolled"))
+            "no runnable model for role %r%s: %s" % (
+                role,
+                " (already tried and set aside this run: %s)"
+                % ", ".join(sorted(exclude)) if exclude else "",
+                ", ".join("%s needs %s" % (c.model, c.agent_kind)
+                          for c in candidates) or "nothing enrolled"))
+
+    # How many invocations the rest of this task needs, beyond the one being
+    # dispatched. A LOWER bound and deliberately so: one implementer call per
+    # unfinished subtask, plus a review and an integrate. Rework loops, test
+    # authoring and escalations all push the real number up.
+    #
+    # Under-estimating is the safe direction here. This check only ever changes
+    # which seat is preferred; a number that is too small prefers a seat
+    # slightly too often, while one that is too large would walk away from
+    # seats that could have finished the work.
+    TAIL_CALLS = 2
+
+    def _calls_remaining(self):
+        pending = [s for s in (self.task.state.get("subtasks") or [])
+                   if s.get("status") != "complete"]
+        return max(1, len(pending)) + self.TAIL_CALLS
+
+    def _headroom(self, channel, util):
+        """Invocations left in this channel's window, or None when unknowable.
+
+        None is not zero. A channel with no `est_capacity` has no meter and
+        never had one -- treating that as "no room" would route away from every
+        metered-key seat in the registry, which is exactly backwards.
+        """
+        chan = (self.reg.get("channels") or {}).get(channel) or {}
+        cap = quota.parse_capacity((chan.get("quota") or {}).get("est_capacity"))
+        if not cap:
+            return None
+        return cap * max(0.0, 1.0 - float(util.get(channel, 0.0)))
+
+    def _prefer_by_headroom(self, role, runnable, util):
+        """Among seats that can do the work, prefer one that can FINISH it.
+
+        The router already prices draw -- a 90%-drawn seat costs more than a
+        metered key -- but pricing is not the same question as "will this run
+        get to the end here". A seat with four calls left is the cheapest
+        option right up to the moment it walls mid-implementation.
+
+        This never refuses work. If nothing has the headroom the run starts
+        anyway on the best candidate and says so: a wrong estimate that parks a
+        runnable task is worse than one that hops mid-run, because the hop
+        already works and is tested.
+        """
+        need = self._calls_remaining()
+        fits = [c for c in runnable
+                if (self._headroom(c.channel, util) or float("inf")) >= need]
+        if not fits:
+            best = runnable[0]
+            self.log("  headroom: no seat for %s has room for ~%d more call(s); "
+                     "starting on %s anyway — a wall from here fails over"
+                     % (role, need, best.channel))
+            return best
+        if fits[0] is not runnable[0]:
+            self.log("  headroom: %s -> %s, %s has ~%d call(s) left and this task "
+                     "needs ~%d"
+                     % (role, fits[0].channel, runnable[0].channel,
+                        self._headroom(runnable[0].channel, util) or 0, need))
+        return fits[0]
 
     def _meter(self, choice):
         """Count one invocation against the channel's window (§5.4). An
@@ -1297,6 +1476,21 @@ a planner does that next, from your design.
         self.log("  quota: %s stated no reset time — assuming its %s window"
                  % (choice.channel, spec.get("window") or "default 5h"))
         return self.clock() + window
+
+    # Two decisions, not one. Fusing them meant the only failure that could move
+    # work to another seat was also the only failure that took a seat out of
+    # service for five hours -- so a hung call had to either do both or do
+    # nothing, and it did nothing.
+    #
+    #   quota_exhausted -> hop AND cool: the seat said it is out.
+    #   timeout         -> hop, never cool: this call did not come back; the
+    #                      seat is probably fine and cooling it on that evidence
+    #                      hides a working provider for the afternoon.
+    #   anything else   -> neither. An ordinary crash consumes an attempt. A
+    #                      failover that fires on any error is worse than none,
+    #                      because it hides real bugs behind provider hops.
+    HOPS_TO_ANOTHER_SEAT = frozenset({"quota_exhausted", "timeout"})
+    OPENS_THE_BREAKER = frozenset({"quota_exhausted"})
 
     def _cool(self, choice, res):
         """Open the breaker for a channel that just said it is out."""
@@ -1375,16 +1569,20 @@ a planner does that next, from your design.
             res = self.adapter.prompt(session, text, timeout=timeout)
         finally:
             self._close(session)
-        if res.get("failure") == "quota_exhausted":
-            at = self._cool(choice, res)
+        reason = res.get("failure")
+        if reason in self.HOPS_TO_ANOTHER_SEAT:
+            at = self._cool(choice, res) if reason in self.OPENS_THE_BREAKER else None
             # Accumulated, exactly as `_invoke` does: if the breaker could not be
             # written -- an unwritable state dir, or a concurrent `--clear` --
             # excluding only the last seat lets this bounce A->B->A->B through
-            # real, billed invocations until the stack runs out.
+            # real, billed invocations until the stack runs out. That reasoning
+            # binds harder for a timeout, which never writes a breaker at all,
+            # so this list is the ONLY thing stopping the bounce.
             cooled = tuple(cooled) + (choice.channel,)
             nxt = self._pick(pick_as or role, exclude=cooled)
-            self.log("failover: %s %s -> %s (quota, reopens %s)"
-                     % (role, choice.channel, nxt.channel, _stamp(at)))
+            self.log("failover: %s %s -> %s (%s%s)"
+                     % (role, choice.channel, nxt.channel, reason,
+                        ", reopens %s" % _stamp(at) if at else ", seat not cooled"))
             return self._direct(role, nxt, text, timeout, pick_as=pick_as,
                                 cooled=cooled)
         self._meter(choice)
@@ -1425,26 +1623,53 @@ a planner does that next, from your design.
                 text = prompts.retry(failure)
                 res = self.adapter.follow_up(session, text, timeout=3600)
             self._log_transcript(role, text, res)
-            if res.get("failure") != "quota_exhausted":
+            reason = res.get("failure")
+            if reason not in self.HOPS_TO_ANOTHER_SEAT:
                 break
             # Close first: `_cool` touches a shared file, and letting it run
             # ahead of teardown meant a write failure leaked the session -- under
             # the herdr adapter, an orphaned pane.
             self._close(session)
             self._salvage(cwd, role, subtask)
-            at = self._cool(choice, res)
+            at = self._cool(choice, res) if reason in self.OPENS_THE_BREAKER else None
+            # Appended whatever the reason: this list excludes the seat from THIS
+            # task's remaining picks, which is a different thing from the global
+            # breaker. A timed-out seat must not be handed the same call again on
+            # the next iteration, but nothing about one hung call justifies
+            # taking it away from every other task for five hours.
             cooled.append(choice.channel)
             self.task.record_delegation({
                 "stage": self.task.state["status"], "role": role,
                 "subtask": subtask.get("id") if subtask else None,
                 "model": choice.model, "channel": choice.channel,
-                "adapter": self.adapter.name, "outcome": "quota_exhausted",
+                "adapter": self.adapter.name, "outcome": reason,
+                # A wall still costs wall-clock, and that time is exactly what
+                # the failover path exists to shorten -- so it has to be on the
+                # record even though the call bought nothing.
+                "tokens": res.get("usage"), "elapsed_ms": res.get("elapsed_ms"),
                 "reopens_at": at})
             # Excluded explicitly as well as through the breaker: if the state
             # file could not be written, the loop must still terminate.
-            nxt = self._replacement(role, choice, cooled)
-            self.log("failover: %s %s -> %s (quota, reopens %s)"
-                     % (role, choice.channel, nxt.channel, _stamp(at)))
+            try:
+                nxt = self._replacement(role, choice, cooled)
+            except routing.NoModelAvailable:
+                # Every seat has now been tried. Say what actually happened
+                # rather than letting this reach the generic handler as a
+                # crash: nothing is broken and nothing is out of quota, the
+                # agents did not come back. This is the honest halt that the
+                # old `outcome == "blocked" and settled == "timeout"` branch
+                # used to raise before the hop existed.
+                if reason == "timeout":
+                    self._close(session)
+                    raise Halt("needs_human",
+                               "%s timed out on every enrolled seat (%s); no "
+                               "breaker was opened -- the seats are not out of "
+                               "quota, the calls did not return"
+                               % (role, ", ".join(sorted(cooled))))
+                raise
+            self.log("failover: %s %s -> %s (%s%s)"
+                     % (role, choice.channel, nxt.channel, reason,
+                        ", reopens %s" % _stamp(at) if at else ", seat not cooled"))
             # A fresh session on the new seat, in the *same* worktree: every
             # checkpoint commit is still there, so the replacement continues
             # from the last one rather than restarting the subtask (§5.5).
@@ -1467,11 +1692,21 @@ a planner does that next, from your design.
             "adapter": self.adapter.name, "outcome": outcome,
             "usd": res.get("cost_usd"),
             "usd_estimated": bool(res.get("cost_estimated")) or None,
+            # Tokens and elapsed time are kept beside the money, not derived
+            # from it. Only some CLIs report a cost at all -- where one does
+            # not, `usd` is this program's own price table applied to these
+            # token counts, so a run that stored only the money would be
+            # comparing a measurement against an estimate with nothing on the
+            # record to say which was which.
+            "tokens": res.get("usage"),
+            "elapsed_ms": res.get("elapsed_ms"),
             "report_problems": problems or None,
         })
-        if outcome == "blocked" and res.get("settled") == "timeout":
-            self._close(session)
-            raise Halt("needs_human", "%s agent timed out" % role)
+        # No timeout branch here any more. Since the hop/cool split a timeout
+        # never reaches this point: `failure` is "timeout", which is in
+        # HOPS_TO_ANOTHER_SEAT, so the loop above hops instead of breaking out.
+        # The honest halt this branch used to raise now lives at the hop site,
+        # for the case where every seat has been tried.
         # Returned, never stashed on self: wave threads share this object, and
         # a sibling overwriting the attribute is how an escalation gets read as
         # a success.
@@ -1603,14 +1838,14 @@ a planner does that next, from your design.
             # When a subtask is named, its id is the ONLY thing that identifies
             # its report. Accepting `role in name` as an alternative could not
             # tell two concurrent implementers apart: every sibling in a wave
-            # runs as "implementer", SKILL.md permits `<stage>-<role>.json`, and
+            # runs as "implementer", PROTOCOL.md permits `<stage>-<role>.json`, and
             # sorted() then handed the same file to all of them. An escalating
             # subtask read a sibling's `complete` and the run delivered a patch
             # built on work that had asked to stop. Subtask ids are unique, so
             # matching on the id alone cannot cross threads.
             #
             # And the id must fill the name, not merely appear in it. The
-            # contract is `<stage>-<id>.json` (SKILL.md step 3); a substring
+            # contract is `<stage>-<id>.json` (PROTOCOL.md step 3); a substring
             # test hands st-1 the report of a sibling named st-11, and the
             # planner -- not this code -- chooses the ids. The stage token is
             # not pinned to a word list, only forbidden from containing the
@@ -1671,7 +1906,36 @@ Rules:
             return text
         return out
 
-    def _gate(self, kind, question):
+    def _decision_already_made(self, kind):
+        """Consume a decision written by `delegate approve` / `reject`.
+
+        True, False, or None when nobody has answered yet. Consumed *before* any
+        brief is built, which is what keeps re-entry cheap: a brief goes through
+        `_polish`, an LLM call, and rebuilding one to ask a question that has
+        already been answered would spend a model call on nothing.
+
+        The decision is NOT written to the gate history here. `delegate
+        approve` already wrote it, at the moment the human actually made it --
+        and that has to be the single recording site, because the design and
+        plan gates resume *past* the stage that asked, so this method is never
+        reached for them and an approval recorded only here would vanish. Which
+        it did, until a test asked where it went.
+        """
+        pend = self.task.state.get("pending_gate") or {}
+        if pend.get("kind") != kind or not pend.get("decision"):
+            return None
+        decision, note = pend["decision"], pend.get("note", "")
+        self.task.update(pending_gate=None)
+        self.log("gate %s: %s (answered out of band)%s"
+                 % (kind, decision, " — %s" % note if note else ""))
+        return decision == "approved"
+
+    def _gate(self, kind, question, resume_status):
+        decided = self._decision_already_made(kind)
+        if decided is not None:
+            if decided:
+                return
+            raise Halt("needs_human", "%s declined by human" % kind)
         files = sorted({f for s in self.task.state["subtasks"] for f in s.get("actual_files", [])})
         extra = None
         if kind == "design":
@@ -1680,7 +1944,20 @@ Rules:
                                      extra=extra, polish=self._polish)
         for p in problems:
             self.log("  brief lint: %s" % p)
-        if not self.gate(kind, text):
+        try:
+            approved = self.gate(kind, text)
+        except AwaitingApproval as a:
+            # The injected gate keeps its `(kind, text) -> bool` signature: it
+            # knows how to reach a human and nothing about the pipeline, so it
+            # cannot know where the run continues afterwards. The caller does.
+            a.resume_status = resume_status
+            raise
+        if not approved:
+            # Recorded before the raise. A decline is the most informative thing
+            # a human does to a run -- it is the one place the machine was about
+            # to be wrong -- and logging only approvals left every rejection
+            # missing from the history that exists to count them.
+            self.task.record_gate(kind, "declined")
             raise Halt("needs_human", "%s declined by human" % kind)
         self.task.record_gate(kind, "approved")
 

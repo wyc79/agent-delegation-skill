@@ -30,8 +30,7 @@ In order:
    If one side must lose, that is a finding for the human, not a quiet `--ours`.
 
 For **binary or unmergeable files** (engine scenes, prefabs, assets), there is no
-merge — you take one side whole. Say which, and why, in your report. Read
-`references/engines/<engine>.md` before touching any of them.
+merge — you take one side whole. Say which, and why, in your report.
 
 ## Step 3 — Verify the combination, not the pieces
 
@@ -76,7 +75,7 @@ the verification evidence for the combined result.
 
 ## Your triggers
 
-Beyond the shared ones in `SKILL.md`, and only when the condition applies:
+Beyond the shared ones in `PROTOCOL.md`, and only when the condition applies:
 
 | Condition | Read |
 |---|---|

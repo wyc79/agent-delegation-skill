@@ -14,16 +14,34 @@ KNOWN = {
     "superpowers": os.path.join("skills", "brainstorming", "SKILL.md"),
 }
 
+# Home-directory installs. Kept deliberately in step with `winnow.SEARCH` and
+# `winnow.PLUGIN_ROOTS`, which searched two places this list did not:
+# `plugins/marketplaces` and the project-local trees below. The divergence was
+# silent and one-directional -- a superpowers install that `winnow.find()` could
+# see reported "not installed" here, so `_stage_brainstorm` quietly dropped to
+# the generic prompt and `compose` dropped the companions paragraph. Two lists
+# of the same thing; `test_the_two_skill_searches_do_not_diverge` now fails if
+# they drift apart again.
 ROOTS = (
     os.path.join("~", ".claude", "skills"),
     os.path.join("~", ".claude", "plugins", "cache"),
+    os.path.join("~", ".claude", "plugins", "marketplaces"),
     os.path.join("~", ".cursor", "skills"),
     os.path.join("~", ".agents", "skills"),
 )
 
+# Searched first, because a project-local install is a deliberate override.
+PROJECT_ROOTS = (
+    os.path.join(".claude", "skills"),
+    os.path.join(".agents", "skills"),
+)
 
-def _present(fragment):
-    for root in ROOTS:
+
+def _present(fragment, repo=None):
+    roots = ROOTS
+    if repo:
+        roots = tuple(os.path.join(repo, r) for r in PROJECT_ROOTS) + ROOTS
+    for root in roots:
         base = os.path.expanduser(root)
         if not os.path.isdir(base):
             continue
@@ -47,5 +65,7 @@ def _present(fragment):
     return False
 
 
-def detect():
-    return {name: _present(frag) for name, frag in KNOWN.items()}
+def detect(repo=None):
+    """What is installed. `repo` enables the project-local search, which is
+    where a deliberate per-project override lives."""
+    return {name: _present(frag, repo) for name, frag in KNOWN.items()}

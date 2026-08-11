@@ -1,100 +1,160 @@
 ---
 name: agent-delegation
-description: Use when taking part in a delegated multi-agent development workflow — when a prompt assigns you a role (planner, implementer, test author, reviewer, integrator) for a task id, when `$AGENT_DELEGATION_ROLE` is set in the environment, or when asked to plan work that other agents will implement, implement one subtask of an existing plan, write tests from requirements for someone else's implementation, review an implementation against its plan, or hand results to a downstream agent. Defines the shared protocol — which artifacts to read and write, what constraints to respect, and when to stop and escalate instead of pushing through.
+description: Use when you are the agent a human is talking to and the work in front of you should be handed to other agents instead of done in this session — starting or advancing a task with the `delegate` CLI, answering a gate that parked waiting on a human, checking what a running task has produced, or telling the human where it got to. Covers which command to run, in what order, and how to read what comes back; the dispatched agents carry their own instructions and nothing here is about how they should work.
 ---
 
-# Agent Delegation
+# Agent delegation
 
-You are **one role in a pipeline**, not the whole system. Another agent planned
-this work, or will review it, and reaches you only through files — nobody ever
-sees your reasoning, only what you write down.
+`delegate` places each stage of a task on whichever enrolled agent seat can do it
+— different providers, different models — meters the quota on each, and keeps the
+run going when one of them hits a wall.
 
-## Step 1 — Establish what you are, and where the files are
+**You run it. You are not in it.** It spawns fresh single-role agents that read a
+task directory on disk; none of them sees your context and you never see theirs.
+You stay the operator: you type the commands, read what comes back, and stand
+between the run and the human.
 
-`$AGENT_DELEGATION_ROLE` names your role, and **its presence is what says this
-protocol applies to you**. `$AGENT_DELEGATION_TASK_DIR` says only *where the
-files are*: handed that path without a role, you are not in this workflow.
+How the work gets planned, written, tested or reviewed belongs to the agents
+`delegate` spawns. They load their own instructions. This file has no opinion.
 
-Task state lives **outside the repository** — shared by every worktree, never in
-git history; that path is `$TASK_DIR` below. Unset, derive it with
-`references/task-dir.md`, never by improvising one.
+## First decide whether to delegate at all
 
-**Never create the task directory, and never write task artifacts into the
-repository.** If you cannot find it, stop. (Tool-forced exception: rule 2.)
+Delegation costs a classification call, a planning call, at least one gate
+round-trip through the human, and minutes of wall clock before a line changes.
+Most requests do not earn that.
 
-Your prompt must also carry a **task id**. Missing either, do not guess: write a
-`blocked` report naming what is missing — nobody is listening for a question, so
-the report is how you ask. The wrong role corrupts other agents' artifacts.
+**Do the work yourself** when you can finish it in a handful of edits, when you
+already have the file open and know the change, when the request is a question
+rather than work, or when the human is still deciding what they want — a
+conversation delegates badly. A one-shot edit pushed through `delegate` is
+slower, costs more, and arrives with less of the human in it.
 
-## Step 2 — Read exactly one role card
+**Delegate** when one of these holds:
 
-| Your role | Read | Your job, in one line |
-|---|---|---|
-| Planner / Architect | `roles/planner.md` | Produce a plan a weaker model can execute without you |
-| Implementer | `roles/implementer.md` | Make the plan true for one subtask, inside its file scope |
-| Test Author | `roles/test-author.md` | Encode the requirements as tests, blind to the implementation |
-| Reviewer | `roles/reviewer.md` | Check requirements → plan → diff → evidence, and rule |
-| Integrator | `roles/integrator.md` | Reconcile conflicting subtask results with minimal change |
+- The work is larger than one session can hold, and is better as a written plan
+  and separate subtasks than as one long thread.
+- Subtasks are independent and would genuinely run in parallel worktrees.
+- You want a reviewer that has not already convinced itself the code is right,
+  or tests written by something that has not seen the implementation.
+- Your own seat is the constraint — a quota wall you are about to hit, or a
+  model better suited to part of the job than you are.
 
-Follow its numbered steps in order. **Do not read another role's card** — it
-starts you from that role's frame, and the independence is the point of the split.
+Run `init` before promising anything: it prints which agent CLIs are usable and
+which model gets which role. **If every role resolves to one seat, you are paying
+for indirection** — independence and parallelism are then the only reasons left.
+Say that rather than delegating anyway.
 
-## The task directory, relative to `$TASK_DIR`
+## The commands
 
-| File | Holds | Written by |
-|---|---|---|
-| `task.json` | Status, budgets, assignments, delegation history | Orchestrator only — **never edit** |
-| `task.md` | The request and its numbered acceptance criteria (`AC-n`) | Intake or a human. The planner may add criteria if there are none; nobody else edits it |
-| `spec.md` | The approved design: purpose, the approach chosen over the alternatives, risks | Brainstorm stage, then a human. Complex attended tasks only |
-| `plan.md` | Approach plus one YAML block per subtask | Planner |
-| `escalation.md` | Append-only. Why a subtask came back to the planner: failing checks, the agent's account and signals, completed work to disposition | Orchestrator, at rung 3 |
-| `deviations.md` | Append-only log of departures from the plan | Anyone who departs |
-| `decisions.md` | Append-only design decisions and their reasons | Anyone deciding |
-| `reports/` | One JSON handoff per agent, per stage (`verify/` holds check output) | Every agent, at exit |
+Run them from the repository being changed, by absolute path. `delegate`
+identifies the project from `git rev-parse --git-common-dir`, so the working
+directory matters; `--repo <path>` overrides it.
 
-**Authority when they disagree:** `task.md` (what was asked) outranks `spec.md`
-(the approach a human approved) outranks `plan.md` + `deviations.md` (how it is
-being done) outranks the code — never resolve a conflict silently toward the
-code. Re-opening `spec.md` is a `decisions.md` entry, not a quiet call; it
-settles neither scope nor sequencing, and never outranks a criterion.
-
-## Hard rules
-
-1. **Stay inside your declared file scope.** Wanting to fix something nearby is
-   not permission to fix it.
-2. **Task artifacts never enter the repo.** A tool-forced in-repo path must be
-   one `git check-ignore -q` accepts — see `references/scratch-files.md`.
-3. **Never `git push`, never switch branches, never touch another agent's
-   worktree.** Checkpoint inside your own often — uncommitted work is lost work.
-4. **Log every departure** in `deviations.md` as *plan said → reality → what I
-   did → severity*. An unlogged deviation reads as a defect.
-5. **An honest `blocked` is a success state.** Never fabricate output or claim
-   verification you did not run; a plausible result that fails is worse.
-6. **Do not expand scope.** Unrelated bugs and cleanups go in `decisions.md` as
-   observations, not in your diff.
-7. **Write your report before you exit** (Step 3). No report means you crashed.
-
-## When to read more — only once the condition applies
-
-Shared triggers; your card carries its own, and nobody carries another's.
-
-| Condition | Read |
+| Command | Does |
 |---|---|
-| You are continuing work another agent started | `references/handover.md` |
-| Stuck, checks failed 3+ times, or scope ballooning | `references/escalation.md` |
-| Departing from the plan, unsure how severe it is | `references/deviations.md` |
-| A tool or engine forces a write inside the repo | `references/scratch-files.md` |
-| About to write an artifact and you want the exact fields | `schemas/`, `templates/` |
+| `init [--write] [--force]` | Detected seats, role assignments, companion skills, verify config. Writes nothing without `--write`. |
+| `run <request>` | Create a task and drive it. `<request>` is text, or a path to a file holding it. |
+| `resume [--id] [--stage] [--when-open]` | Continue a parked task. `--stage` restarts at a named stage; `--when-open` sleeps out a quota window first. |
+| `approve [--id] --note "…"` | Answer a waiting gate yes, then continue the run. |
+| `reject [--id] --note "…"` | Answer it no. Records the decision and stops. |
+| `status` | One line per task for this project, ending in its task directory. |
+| `show [--id] [--brief]` | `--brief` prints the gate brief, already written for a human; without it, raw `task.json`. |
+| `channels [--clear NAME]` | Per-seat cooldowns and estimated quota draw. |
 
-## Step 3 — Report before you exit
+`run` also takes `--id`, `--mode attended|autonomous`, `--adapter herdr|local|mock`,
+`--no-panes`, `--max-cost N`, `--review auto|always|never`, `--dry-run`, `--yes`.
+`resume`, `approve` and `reject` take the adapter flags too; `approve` and
+`reject` also take `--no-continue`, which records the decision and advances the
+task to the stage it would have resumed at, without running it. Pick it up later
+with plain `delegate resume`.
+`--id` is optional only while the project has exactly one task.
 
-Write `$TASK_DIR/reports/<stage>-<subtask-id>.json`, or `<stage>-<role>.json`
-with no subtask. **The id is not optional when you have one**, and must fill
-everything after the stage word exactly — siblings share your role name, so a
-role-named file and `implement-st-1-final.json` alike count as no report at all.
-Match `schemas/report.schema.json`: status (`complete` / `blocked` / `escalate`),
-a summary **for the next agent** (what changed, what surprised you, what they
-must know), artifacts, deviations, signals, and real command output.
+Two to understand before using them:
 
-**`escalate` is routed by your `signals`, not your prose** — one that names its
-type, cites an artifact and carries real output. Nothing routable stops the run.
+- `--dry-run` walks the state machine with no agents and no spend. It is the
+  cheapest way to show a human the shape of a run.
+- `--yes` auto-approves **every** gate for the whole run. It exists for
+  unattended runs with nobody present. Never reach for it because a gate is
+  inconvenient — the gates are the human's only say in what gets built.
+
+## Exit code 1 does not mean it failed
+
+`run` and `resume` exit 0 only when the task reached `done`. Parked, waiting,
+declined and crashed all exit 1. **Read the status, not the exit code**, and read
+it again after every call — each one can park again.
+
+| Status | Means |
+|---|---|
+| `awaiting_approval` | A gate is waiting on the human. Below. |
+| `waiting on quota` (as `status` prints it) | Every seat for a role is cooling. `channels` says until when; `resume --when-open` waits it out. |
+| `needs_human` | The run stopped and something needs deciding or fixing. |
+| `done` | Finished. Attended mode leaves `integrate.patch` in the task directory for `git apply` — nothing was committed to the human's branch, and no mode merges. |
+| a stage name | Interrupted mid-flight; `resume` picks it up. |
+
+## A parked gate
+
+Three gates exist: `design`, `plan`, `merge`. Reaching one with nobody at a
+terminal does not decline it — the task parks, status `awaiting_approval`, and
+`task.json` grows a `pending_gate` holding `kind`, `brief` and `resume_status`.
+A question nobody answered is not a no, and the CLI will not record one as the
+other. Answering it is your job:
+
+1. **Read the brief.** `delegate show --id T-001 --brief`, the same text as
+   `pending_gate.brief`.
+2. **Put the question to the human in prose.** Not the JSON, and not the brief
+   pasted whole unless they ask. Say what is being decided, what it changes in
+   their repo, and what happens if they say no. Offer the plan or the diff.
+3. **Take their answer with its qualifications.** "Yes, but keep the old
+   endpoint" is not a yes.
+4. **Record it.** `delegate approve --id T-001 --note "keep the old endpoint
+   working"`, or `reject` with the same shape.
+
+   **`--note` is not just a record.** On an approval it is written into the
+   prompts of the planner, of every implementer, and of the reviewer, and it
+   stays there until a later approval carries a new one. The reviewer is the
+   one that matters most: without the note it sees a retained endpoint nobody
+   planned for, calls it scope creep, and rejects work that is doing exactly
+   what the human asked. So write **what they said**, not your summary of it —
+   you are writing an instruction, not a log line.
+
+   An approval with no note changes nothing downstream, and does not clear a
+   note an earlier gate set.
+5. **Approving continues the run in the same call.** For the `design` and `plan`
+   gates it resumes past the stage that asked, so an approved plan is not
+   re-planned; the `merge` gate re-enters `integrate` to do the landing it was
+   approving. Either way it may park at the next gate — go back to step 1.
+
+**Answer a waiting gate with `approve` or `reject`, never `resume`.**
+`awaiting_approval` is not a stage, and `resume` will refuse and tell you so.
+
+Rejecting ends that run: the decision is recorded, the task parks at
+`needs_human`, nothing continues. The gate can be answered again later — fix
+what was wrong, put the run back in front of it, and approve. `delegate resume
+--stage <stage>` restarts from a stage you name — `intake`, `classify`,
+`brainstorm`, `plan`, `implement`,
+`review`, `integrate`.
+
+**Never answer a gate the human has not answered.** Approving on their behalf
+because the run is sitting there turns the checkpoint into a formality, and it is
+the one thing here a later `resume` cannot undo.
+
+## Reading what happened
+
+The task directory is printed when `run` creates it and is the last column of
+`status`. It is readable while the run is still going.
+
+| File | Answers |
+|---|---|
+| `task.md` | What was asked, and the numbered acceptance criteria. |
+| `spec.md` | The design that was approved, when there was a design stage. |
+| `plan.md` | The approach, and one block per subtask with its file scope. |
+| `brief.md` | The last gate brief. Already written for a human. |
+| `reports/*.json` | One per agent per stage: what it did, what surprised it, what it could not do. |
+| `verify/*.json` | Build, test and lint output. |
+| `deviations.md`, `decisions.md`, `escalation.md` | Departures from the plan, decisions and their reasons, and why a subtask went back to the planner. |
+| `agent-logs/*.log` | Each agent's prompt and its output — where to look when one appears to have done nothing. |
+| `task.json` | Status, spend, gate history, which model ran what. Orchestrator-owned; never edit it. |
+
+Relay from these in prose. "The planner split it into three subtasks, two are
+done, the third is waiting on you to approve the merge" is the deliverable. A
+pasted `task.json` is not.

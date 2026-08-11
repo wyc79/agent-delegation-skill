@@ -88,8 +88,16 @@ def classify(agent_kind, res, now):
     # Ahead of the table, never after it: a timeout tells us nothing about the
     # provider's quota, and its output may quote a rate-limit message it was
     # merely waiting on.
+    #
+    # It is its own kind rather than `other`, because hopping and cooling are
+    # two different decisions and a timeout wants one of them, not both. A hung
+    # call should move to another seat -- the work is checkpointed and someone
+    # else can pick it up, which is the whole point of enrolling more than one
+    # provider. But it must NOT open a five-hour breaker: nothing here says the
+    # seat is out, only that this call did not come back, and cooling on that
+    # evidence hides a working provider for the rest of the afternoon.
     if (res or {}).get("settled") == "timeout":
-        return "other", None
+        return "timeout", None
     text = (res or {}).get("output") or ""
     code = (res or {}).get("error_code") or ""
     hit = str(code).lower() in ERROR_CODES

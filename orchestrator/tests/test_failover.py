@@ -62,19 +62,27 @@ class TestClassification(unittest.TestCase):
 
     def test_a_timeout_is_never_quota(self):
         # The rule with the sharpest edge: a generic timeout must not open a
-        # five-hour breaker on a provider that is fine.
-        kind, _ = quota.classify(
+        # five-hour breaker on a provider that is fine. It is now its own kind
+        # rather than `other`, so that a hung call can move the work to another
+        # seat -- but `Orchestrator.OPENS_THE_BREAKER` still excludes it, which
+        # is the half that matters here.
+        kind, at = quota.classify(
             "claude", {"settled": "timeout", "output": "", "code": None}, T0)
-        self.assertEqual(kind, "other")
+        self.assertEqual(kind, "timeout")
+        self.assertNotEqual(kind, "quota_exhausted")
+        self.assertIsNone(at, "a timeout must carry no reopen time")
+        from adg.machine import Orchestrator
+        self.assertNotIn(kind, Orchestrator.OPENS_THE_BREAKER)
+        self.assertIn(kind, Orchestrator.HOPS_TO_ANOTHER_SEAT)
 
-    def test_a_timeout_mentioning_rate_limits_is_still_other(self):
+    def test_a_timeout_mentioning_rate_limits_is_not_read_as_quota(self):
         # Deliberately not folded into the test above: this one fails the moment
         # the timeout check moves *after* the pattern table, which is the actual
         # regression to guard against.
         kind, _ = quota.classify("claude", {
             "settled": "timeout", "code": None,
             "output": "waiting on rate limit ..."}, T0)
-        self.assertEqual(kind, "other")
+        self.assertEqual(kind, "timeout")
 
     def test_success_is_not_a_failure_at_all(self):
         kind, _ = quota.classify("claude", {
@@ -447,14 +455,19 @@ class TestRuntimeClassification(unittest.TestCase):
                               kind="claude", now=T0)
         self.assertEqual(res["failure"], "quota_exhausted")
 
-    def test_local_timeout_is_other_not_quota(self):
+    def test_local_timeout_is_timeout_not_quota(self):
+        # This is the path a real hung agent takes -- subprocess.TimeoutExpired,
+        # never `quota.classify` -- so it has to agree with the classifier. While
+        # it hardcoded `other`, every classifier test passed and the hop still
+        # would not have fired on an actually stuck call.
         a = runtime.LocalAdapter()
         s = runtime.Session("implementer-local", ".")
         s.handle = {"argv": ["python3", "-c", "import time; time.sleep(30)"],
                     "env": dict(os.environ), "role": "implementer", "kind": "claude"}
         res = a.prompt(s, "hi", timeout=0.2)
         self.assertEqual(res["settled"], "timeout")
-        self.assertEqual(res["failure"], "other")
+        self.assertEqual(res["failure"], "timeout")
+        self.assertIsNone(res["reset_at"], "a timeout must carry no reopen time")
 
     def test_mock_adapter_can_inject_a_quota_failure(self):
         def implementer(env, cwd):
@@ -607,6 +620,40 @@ class TestMachineSelection(unittest.TestCase):
                   if c.model == "opus-class-strong"]
         return orch, strong[0]
 
+    def test_a_timeout_moves_the_work_but_leaves_the_seat_open(self):
+        """The whole point of splitting the two decisions.
+
+        A hung call should reach another seat -- the work is checkpointed and
+        someone else can pick it up, which is why more than one provider is
+        enrolled. But nothing about one call failing to return says the seat is
+        out, so the five-hour breaker must stay shut. Before the split these
+        were one decision, so a timeout could only do both or neither, and it
+        did neither.
+        """
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        before = cooldown.read(T0)[0]
+
+        timed_out = {"settled": "timeout", "output": "", "code": None,
+                     "failure": "timeout", "reset_at": None}
+        self.assertIn(timed_out["failure"], orch.HOPS_TO_ANOTHER_SEAT,
+                      "a timeout must move the work")
+        self.assertNotIn(timed_out["failure"], orch.OPENS_THE_BREAKER,
+                         "a timeout must not take the seat out of service")
+
+        # and the seat really is still there for everyone else
+        self.assertEqual(cooldown.read(T0)[0], before,
+                         "a timeout opened a breaker")
+        self.assertEqual(orch._pick("implementer").channel,
+                         _orch(self.reg, runtime.MockAdapter(), self.task)
+                         ._pick("implementer").channel)
+
+    def test_an_ordinary_crash_still_hops_nowhere(self):
+        """The negative control, as a unit. A failover that fires on any error
+        is worse than none: it hides real bugs behind provider changes."""
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        self.assertNotIn("other", orch.HOPS_TO_ANOTHER_SEAT)
+        self.assertNotIn("other", orch.OPENS_THE_BREAKER)
+
     def test_a_hop_after_an_escalation_keeps_the_rung(self):
         """Failover must not walk back down the ladder. Re-selecting on plain
         role requirements would hand escalated work to a weaker model and log it
@@ -702,6 +749,127 @@ class TestFailoverEndToEnd(unittest.TestCase):
         status = Orchestrator(task, self.reg, adapter, lambda k, x: True,
                               log=logs.append, clock=clock).run()
         return task, status, logs
+
+    def test_a_seat_without_room_to_finish_loses_to_one_that_has_it(self):
+        """Tested on the decision itself, not through the router.
+
+        Measured first: on the shipped registry the shadow price already moves
+        the implementer to `cursor-seat` at every draw where headroom would have
+        objected, so routing through `_pick` proves nothing about this rule --
+        it passes for the other mechanism's reasons. The preference only ever
+        binds where the shadow price has NOT already reordered the pool, which
+        is a custom registry's case, so that is what is exercised here.
+        """
+        task = store.Task.create(self.t.repo, "T-HR", "# t\n\n- **AC-1** — x\n", self.pol)
+        task.update(subtasks=[{"id": "st-%d" % i, "status": "pending"} for i in range(4)])
+        logs = []
+        orch = _orch(self.reg, runtime.MockAdapter({}), task, clock=lambda: T0, logs=logs)
+        need = orch._calls_remaining()
+        self.assertEqual(need, 6)
+
+        by_seat = {}
+        for c in orch.router.candidates("implementer", ceiling=orch.budget.ceiling()):
+            by_seat.setdefault(c.channel, c)
+        claude, cursor = by_seat["claude-seat"], by_seat["cursor-seat"]
+
+        # claude-seat nearly drawn down, cursor-seat fresh; claude offered first
+        util = {"claude-seat": 38 / 40.0, "cursor-seat": 0.0}
+        self.assertLess(orch._headroom("claude-seat", util), need)
+        picked = orch._prefer_by_headroom("implementer", [claude, cursor], util)
+        self.assertEqual(picked.channel, "cursor-seat")
+        self.assertTrue(any("headroom:" in x for x in logs), "the move was silent")
+
+    def test_headroom_does_not_second_guess_a_seat_that_can_finish(self):
+        """It must only act when the seat genuinely cannot finish. Otherwise it
+        is a second, quieter router fighting the shadow price."""
+        task = store.Task.create(self.t.repo, "T-HR4", "# t\n\n- **AC-1** — x\n", self.pol)
+        task.update(subtasks=[{"id": "st-1", "status": "pending"}])
+        logs = []
+        orch = _orch(self.reg, runtime.MockAdapter({}), task, clock=lambda: T0, logs=logs)
+        by_seat = {}
+        for c in orch.router.candidates("implementer", ceiling=orch.budget.ceiling()):
+            by_seat.setdefault(c.channel, c)
+        order = [by_seat["claude-seat"], by_seat["cursor-seat"]]
+        picked = orch._prefer_by_headroom("implementer", order, {"claude-seat": 0.1})
+        self.assertEqual(picked.channel, "claude-seat", "overrode a seat that had room")
+        self.assertFalse([x for x in logs if "headroom:" in x], "logged a non-event")
+
+    def test_an_unmetered_seat_is_not_treated_as_having_no_room(self):
+        """`None` headroom is "no meter", not "nothing left". Reading it as zero
+        would route away from every metered-key seat in the registry."""
+        task = store.Task.create(self.t.repo, "T-HR2", "# t\n\n- **AC-1** — x\n", self.pol)
+        orch = _orch(self.reg, runtime.MockAdapter({}), task, clock=lambda: T0)
+        chan = dict(self.reg["channels"]["claude-seat"])
+        chan.pop("quota", None)
+        self.reg["channels"]["claude-seat"] = chan
+        self.assertIsNone(orch._headroom("claude-seat", {}))
+        # and it is still selectable
+        self.assertEqual(orch._pick("planner").channel, "claude-seat")
+
+    def test_no_seat_with_room_still_starts_the_run(self):
+        """It must never refuse work. A wrong estimate that parks a runnable
+        task is worse than one that hops mid-run, because the hop already
+        works."""
+        for i in range(39):
+            cooldown.record_use("claude-seat", 5 * 3600, T0 - i)
+        for i in range(499):
+            cooldown.record_use("cursor-seat", 30 * 24 * 3600, T0 - i)
+        task = store.Task.create(self.t.repo, "T-HR3", "# t\n\n- **AC-1** — x\n", self.pol)
+        task.update(subtasks=[{"id": "st-%d" % i, "status": "pending"} for i in range(9)])
+        logs = []
+        orch = _orch(self.reg, runtime.MockAdapter({}), task,
+                     clock=lambda: T0, logs=logs)
+        self.assertIsNotNone(orch._pick("implementer"), "refused to start")
+        self.assertTrue(any("anyway" in x for x in logs), "started without saying why")
+
+    def test_the_two_skill_searches_do_not_diverge(self):
+        """`companions` and `winnow` both answer "is this skill installed", and
+        they had different answers. `winnow` searched project-local trees and
+        `plugins/marketplaces`; `companions` searched neither, so a superpowers
+        install `winnow.find()` could see reported "not installed" there — and
+        `_stage_brainstorm` silently dropped to the generic prompt.
+
+        Neither module has to own the list. What must not happen is the two
+        drifting apart again without anything noticing.
+        """
+        from adg import companions, winnow
+        home = {r for r in companions.ROOTS if r.startswith("~")}
+        for entry in winnow.SEARCH:
+            if not entry.startswith("~"):
+                continue
+            root = entry.split(os.sep + "code-winnow")[0]
+            self.assertIn(root, home, "winnow searches %s and companions does not" % root)
+        for root in winnow.PLUGIN_ROOTS:
+            self.assertIn(root, home,
+                          "winnow searches the plugin root %s and companions does not" % root)
+        self.assertTrue(companions.PROJECT_ROOTS,
+                        "companions cannot see a project-local install at all")
+
+    def test_a_timeout_on_every_seat_is_not_reported_as_a_quota_wall(self):
+        """The failure the split introduced, and that no test drove.
+
+        `_invoke` appends a timed-out seat to `cooled` so the next iteration
+        cannot hand the same call back to it. `_pick` then reported everything
+        in that list as "in a quota cooldown" -- so a run where both agents
+        merely hung parked with `reason: quota_all_exhausted` and **zero open
+        breakers**: `delegate status` said "waiting on quota", the brief told
+        the human their subscription was exhausted, and a provider wall that
+        never happened went into the record that exists to count them.
+        """
+        _, script = self._script(quota_first=False)
+        script["implementer"] = lambda env, cwd: {
+            "settled": "timeout", "output": "", "code": None}
+        task, status, logs = self._run(script)
+
+        self.assertEqual(status, "needs_human", "\n".join(logs))
+        park = task.state.get("park") or {}
+        self.assertNotEqual(park.get("reason"), "quota_all_exhausted",
+                            "a hung agent was recorded as a provider quota wall")
+        self.assertEqual(cooldown.read(T0)[0], {},
+                         "a timeout opened a breaker after all")
+        # and it says what actually happened
+        self.assertTrue(any("timed out on every enrolled seat" in x for x in logs),
+                        "\n".join(logs))
 
     def test_a_quota_wall_fails_over_and_the_task_still_finishes(self):
         _, script = self._script(quota_first=True)

@@ -7,6 +7,7 @@ without spending a token on a model.
 Run: python3 orchestrator/tests/test_orchestrator.py
 """
 
+import argparse
 import json
 import os
 import shutil
@@ -17,7 +18,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from adg import brief, limits, prompts, router, runtime, schema, store, verify, winnow, yamlite
+from adg import (brief, cli, limits, prompts, router, runtime, schema, store,
+                 verify, winnow, yamlite)
 from adg.machine import Halt, Orchestrator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -502,6 +504,46 @@ class TestClosedGaps(unittest.TestCase):
     def test_missing_cost_is_unknown_not_zero(self):
         from adg import runtime as rt
         self.assertIsNone(rt._result("plain text", "", 0)["cost_usd"])
+
+    def test_tokens_and_elapsed_survive_both_cli_shapes(self):
+        """Not every CLI reports money. Where one does not, `usd` is our own
+        price table applied to these counts, so the counts have to be on the
+        record too -- otherwise a run compares a measurement against an
+        estimate with nothing saying which is which."""
+        from adg import runtime as rt
+        claude = rt._result(json.dumps(
+            {"result": "ok", "total_cost_usd": 0.09, "duration_ms": 1789,
+             "usage": {"input_tokens": 2, "output_tokens": 4,
+                       "cache_read_input_tokens": 15953}}), "", 0)
+        self.assertEqual(claude["cost_usd"], 0.09)
+        self.assertEqual(claude["usage"], {"in": 15955, "out": 4})
+        self.assertEqual(claude["elapsed_ms"], 1789)
+
+        cursor = rt._result(json.dumps(
+            {"result": "ok", "duration_ms": 14298,
+             "usage": {"inputTokens": 12179, "outputTokens": 30,
+                       "cacheReadTokens": 5248}}), "", 0)
+        self.assertIsNone(cursor["cost_usd"], "cursor reports no cost today")
+        self.assertEqual(cursor["usage"], {"in": 17427, "out": 30})
+        self.assertEqual(cursor["elapsed_ms"], 14298)
+
+    def test_the_delegation_record_keeps_tokens_and_time(self):
+        task = store.Task.create(self.t.repo, "T-C5", "# t\n", self.pol)
+
+        class Metered(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                r = runtime.MockAdapter.prompt(self, session, text, timeout)
+                r["usage"], r["elapsed_ms"] = {"in": 100, "out": 20}, 4242
+                if session.handle["role"] == "classifier":
+                    r["output"] = "VERDICT: SIMPLE -- tiny"
+                return r
+
+        Orchestrator(task, self.reg, Metered({"implementer": lambda e, c: None}),
+                     lambda k, t: True, log=lambda *_: None).run()
+        history = task.state["delegation_history"]
+        self.assertTrue(history, "nothing was delegated")
+        self.assertEqual(history[0]["tokens"], {"in": 100, "out": 20})
+        self.assertEqual(history[0]["elapsed_ms"], 4242)
 
     def test_spend_accumulates_and_then_parks_the_run(self):
         task = store.Task.create(self.t.repo, "T-C1", "# t\n", dict(self.pol, max_cost_usd=0.5))
@@ -1011,7 +1053,7 @@ class TestWaveRaces(unittest.TestCase):
     def test_a_sibling_report_named_for_the_role_is_never_read_as_mine(self):
         """The wave defect's symptom, reachable with no timing at all.
 
-        SKILL.md permits `<stage>-<role-or-subtask>.json`, so
+        PROTOCOL.md permits `<stage>-<role-or-subtask>.json`, so
         `implement-implementer.json` is a legal name for a subtask's report.
         _collect_report accepted a file on `role in name` alone, and sorted()
         made that file win for *every* sibling — so the escalating subtask read
@@ -1025,7 +1067,7 @@ class TestWaveRaces(unittest.TestCase):
             if "st-1" in _tree_name(cwd):
                 with open(os.path.join(cwd, "alpha.py"), "w") as fh:
                     fh.write("A = 1\n")
-                # Legal under SKILL.md, and it sorts ahead of every sibling's.
+                # Legal under PROTOCOL.md, and it sorts ahead of every sibling's.
                 _report(td, "implement-implementer.json", {
                     "stage": "implement", "role": "implementer",
                     "subtask": "st-1-alpha", "status": "complete",
@@ -1700,7 +1742,10 @@ class TestSkillContract(unittest.TestCase):
     file that satisfied both, and nothing caught it because every fixture in
     this suite was hand-written to be valid."""
 
-    SKILL = os.path.join(REPO_ROOT, "agent-delegation")
+    # The dispatched-agent protocol, which moved under orchestrator/ when the
+    # repo-root `agent-delegation/` became the front-door skill for the
+    # user's own agent. Two audiences, two directories.
+    SKILL = os.path.join(REPO_ROOT, "orchestrator", "workflows", "default")
 
     def _card(self, name):
         with open(os.path.join(self.SKILL, "roles", "%s.md" % name)) as fh:
@@ -1764,26 +1809,37 @@ class TestSkillContract(unittest.TestCase):
                          "implementer.md restates the severity rule differently again")
 
     def test_task_md_authority_matches_what_the_planner_is_told(self):
-        skill = _slurp(os.path.join(self.SKILL, "SKILL.md"))
+        skill = _slurp(os.path.join(self.SKILL, "PROTOCOL.md"))
         self.assertNotIn("amended only by humans", skill)
         self.assertIn("planner may add criteria", skill)
         self.assertIn("missing entirely", self._card("planner"))
 
-    def test_the_skill_activates_on_a_role_not_on_a_path(self):
-        """A path says where files are. Triggering on it means any agent handed
-        a scratch directory loads this protocol -- including a foreign skill's
-        pass dispatched through the same runtime, which then holds two sets of
-        instructions naming different output files."""
-        desc = _slurp(os.path.join(self.SKILL, "SKILL.md")).split("---")[1]
-        self.assertIn("$AGENT_DELEGATION_ROLE", desc)
-        self.assertNotIn("$AGENT_DELEGATION_TASK_DIR", desc,
-                         "the task directory is a location, not an assignment")
+    def test_the_protocol_does_not_advertise_itself_as_an_installable_skill(self):
+        """It is data the orchestrator reads, handed to an agent by absolute
+        path, so it must not carry a skill identity.
+
+        This replaces a test that asserted the frontmatter description triggered
+        on `$AGENT_DELEGATION_ROLE` rather than on a path. That property is not
+        gone -- it moved. With no frontmatter there is no loader trigger at all,
+        which is the stronger form of the same guarantee, and what still
+        enlists an agent is `env_for` withholding the role variable (see
+        TestRoleMandate). What this guards now is the collision that replaced
+        it: two files in one repo both declaring `name: agent-delegation`, with
+        a loader free to pick either.
+        """
+        text = _slurp(os.path.join(self.SKILL, "PROTOCOL.md"))
+        self.assertFalse(text.startswith("---"),
+                         "the protocol still declares skill frontmatter")
+        self.assertNotIn("\nname: agent-delegation", text)
+        root_skill = _slurp(os.path.join(REPO_ROOT, "agent-delegation", "SKILL.md"))
+        self.assertTrue(root_skill.startswith("---"),
+                        "the front-door skill lost the frontmatter it needs")
 
     def test_the_skill_cites_nothing_outside_itself(self):
-        """README offers `agent-delegation/` as a copy-in install, so a citation
-        of DESIGN.md or orchestrator/ is a pointer that dangles for every user who
-        takes that path -- and it is invisible from inside this repo, where the
-        file it names is always there."""
+        """The protocol travels: an agent reads it from whatever machine the
+        orchestrator put it on, so a citation of DESIGN.md or the repo root is a
+        pointer that dangles wherever it is unpacked -- and it is invisible from
+        inside this repo, where the file it names is always there."""
         for base, _dirs, names in os.walk(self.SKILL):
             for name in names:
                 if not name.endswith((".md", ".json")):
@@ -1828,7 +1884,10 @@ class TestRoleMandate(unittest.TestCase):
     """`AGENT_DELEGATION_ROLE` is what enlists an agent into this protocol. Every
     role that carries it must have somewhere to go when the agent obeys."""
 
-    SKILL = os.path.join(REPO_ROOT, "agent-delegation")
+    # The dispatched-agent protocol, which moved under orchestrator/ when the
+    # repo-root `agent-delegation/` became the front-door skill for the
+    # user's own agent. Two audiences, two directories.
+    SKILL = os.path.join(REPO_ROOT, "orchestrator", "workflows", "default")
 
     def _task(self):
         d = tempfile.mkdtemp()
@@ -2631,6 +2690,269 @@ class TestEndToEnd(unittest.TestCase):
         status, task, _, _ = self._run(script, gate=lambda k, t: k != "merge")
         self.assertEqual(status, "needs_human")
         self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+    def test_a_declined_gate_is_recorded_not_only_the_approvals(self):
+        """A decline is the one moment the machine was about to be wrong. It
+        used to raise Halt without writing anything, so `gates` held approvals
+        only and nothing counting interventions could see a rejection."""
+        script, _ = self._script()
+        _, task, _, _ = self._run(script, gate=lambda k, t: k != "merge")
+        states = [(g["kind"], g["state"]) for g in task.state["gates"]]
+        self.assertIn(("merge", "declined"), states,
+                      "the rejection left no trace: %s" % states)
+
+    def test_a_gate_with_nobody_to_ask_parks_instead_of_declining(self):
+        """`no tty` is not `no`.
+
+        The old `_confirm` caught EOFError and returned False, which wrote a
+        rejection no human made into the one record that exists to count what
+        humans decided. It also makes the CLI unusable as a bridge: the caller
+        is now the user's own agent shelling out, and an agent has no tty
+        either, so every gate of every run would auto-decline.
+        """
+        from adg.machine import AwaitingApproval
+        script, _ = self._script()
+
+        def no_human(kind, text):
+            raise AwaitingApproval(kind, text, resume_status=None)
+
+        status, task, _, _ = self._run(script, gate=no_human)
+        self.assertEqual(status, "awaiting_approval",
+                         "a question with nobody to answer it is not a failure")
+        self.assertNotIn("declined", [g["state"] for g in task.state["gates"]],
+                         "recorded a rejection nobody made")
+        pend = task.state.get("pending_gate") or {}
+        self.assertTrue(pend.get("brief"), "parked without keeping the question")
+        self.assertTrue(pend.get("resume_status"),
+                        "parked without recording where to continue -- the "
+                        "caller knows the pipeline, the gate does not")
+
+    def test_an_answered_gate_is_not_asked_again_on_resume(self):
+        """`resume_status` has to land past the question, not on it.
+
+        The design and plan gates sit at the END of their stage, so resuming
+        the stage that asked would re-run the planner and re-author the tests
+        to put a question that has already been answered.
+        """
+        from adg.machine import AwaitingApproval
+        script, _ = self._script()
+        asked = []
+
+        def park(kind, text):
+            asked.append(kind)
+            raise AwaitingApproval(kind, text, resume_status=None)
+
+        status, task, _, _ = self._run(script, gate=park)
+        self.assertEqual(status, "awaiting_approval")
+        first, pend = asked[0], task.state["pending_gate"]
+
+        # the state `delegate approve` leaves behind
+        task.update(pending_gate=dict(pend, decision="approved", note="ship it"),
+                    status=pend["resume_status"])
+        Orchestrator(task, self.reg, runtime.MockAdapter(script), park,
+                     log=lambda *_: None).run()
+
+        self.assertEqual(asked.count(first), 1,
+                         "re-asked the %s gate after it was answered" % first)
+        # It parks again, at the NEXT gate -- which is the run making progress,
+        # not the answer being ignored. A run with more than one gate cannot end
+        # with an empty `pending_gate` while a human is still being asked things.
+        self.assertNotEqual((task.state.get("pending_gate") or {}).get("kind"), first,
+                            "still parked on the gate that was already answered")
+
+    def test_a_qualified_approval_reaches_the_agents_that_act_on_it(self):
+        """"Yes, but keep the old endpoint" is not a yes to what was proposed.
+
+        The note was recorded in `gates[]` and read by nobody, which makes it a
+        record of an instruction that never happened. It has to reach the
+        implementer, who builds the different thing, and the reviewer, who would
+        otherwise flag the retained endpoint as scope creep and reject work that
+        is doing exactly what the human asked.
+        """
+        script, _ = self._script()
+        task = store.Task.create(self.t.repo, "T-042", "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        task.update(gate_note={"kind": "plan", "note": "keep the old endpoint working"})
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                            lambda k, t: True, log=lambda *_: None)
+
+        note = orch._human_note()
+        self.assertIn("keep the old endpoint working", note)
+        self.assertIn("plan", note, "the agent is not told which gate this came from")
+
+        # folded into a prompt that already had content, and one that had none
+        self.assertIn("existing text", orch._with_note("existing text"))
+        self.assertIn("keep the old endpoint working", orch._with_note("existing text"))
+        self.assertEqual(orch._with_note(None), note)
+
+        # and it survives all the way into what an agent is actually handed
+        for role in ("implementer", "reviewer"):
+            text = prompts.compose(role, task, extra=orch._with_note(None))
+            self.assertIn("keep the old endpoint working", text,
+                          "the %s never sees the qualification" % role)
+
+    def test_no_qualification_adds_nothing_to_a_prompt(self):
+        """An unqualified yes must not append an empty paragraph to every
+        downstream prompt — `_with_note` has to be a no-op, not a formatter."""
+        script, _ = self._script()
+        task = store.Task.create(self.t.repo, "T-043", "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                            lambda k, t: True, log=lambda *_: None)
+        self.assertEqual(orch._human_note(), "")
+        self.assertEqual(orch._with_note("just this"), "just this")
+        self.assertIsNone(orch._with_note(None))
+        task.update(gate_note={"kind": "plan", "note": "   "})
+        self.assertEqual(orch._human_note(), "", "whitespace is not a qualification")
+
+    def test_a_later_unqualified_approval_clears_an_earlier_qualification(self):
+        """`_human_note` promises the note is "superseded by the next approval".
+        It was only written when non-empty, so approving the design with
+        "keep the old endpoint" and then the plan with nothing left the design's
+        qualification flowing into every prompt for the rest of the run."""
+        task = self._parked("T-053")
+        pend = task.state["pending_gate"]
+        cli.cmd_approve(self._args(task, "approve", note="keep the old endpoint",
+                                   no_continue=True))
+        self.assertEqual(task.state["gate_note"]["note"], "keep the old endpoint")
+
+        task.update(status="awaiting_approval",
+                    pending_gate=dict(pend, kind="merge", decision=None))
+        cli.cmd_approve(self._args(task, "approve", no_continue=True))
+        self.assertEqual(task.state["gate_note"]["note"], "",
+                         "the earlier qualification outlived the approval that "
+                         "was supposed to supersede it")
+
+    # --- the CLI half of the gate flow -------------------------------------
+    #
+    # These three drive `cmd_approve` / `cmd_reject` themselves. Every earlier
+    # gate test simulated the CLI by hand-writing `pending_gate`, so all three
+    # bugs below lived in the one code path nothing executed.
+
+    def _parked(self, task_id):
+        """A task parked at its first gate, via the real park path."""
+        from adg.machine import AwaitingApproval
+        script, _ = self._script()
+        task = store.Task.create(self.t.repo, task_id,
+                                 "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+
+        def park(kind, text):
+            raise AwaitingApproval(kind, text, resume_status=None)
+
+        Orchestrator(task, self.reg, runtime.MockAdapter(script), park,
+                     log=lambda *_: None).run()
+        self.assertEqual(task.state["status"], "awaiting_approval")
+        return task
+
+    def _args(self, task, decision, **kw):
+        fields = dict(repo=self.t.repo, registry=REGISTRY, id=task.state["id"],
+                      note="", adapter="mock", no_panes=False, dry_run=True,
+                      no_continue=False, decision=decision)
+        fields.update(kw)
+        return argparse.Namespace(**fields)
+
+    def test_a_rejected_gate_can_be_answered_again_after_the_fix(self):
+        """A decline is not the end of the task, only of that run.
+
+        The merge gate kept its pending decision unconditionally, so a reject
+        was permanent: the human's agent fixed the problem, called `approve`,
+        and got "already answered 'declined'" with no way back -- and a later
+        `--yes` run found the stale decline and threw the rework away at a gate
+        nobody was asked about.
+        """
+        task = self._parked("T-050")
+        kind = task.state["pending_gate"]["kind"]
+        cli.cmd_approve(self._args(task, "reject"))
+        self.assertEqual([g["state"] for g in task.state["gates"]], ["declined"])
+        self.assertIsNone(task.state.get("pending_gate"),
+                          "a decline left a decision behind that nothing consumes")
+        self.assertEqual(task.state["status"], "needs_human")
+
+        # the gate is answerable again once the run is put back in front of it
+        task.update(status="awaiting_approval",
+                    pending_gate={"kind": kind, "brief": "b", "resume_status": "implement"})
+        # --no-continue: what is under test is that the gate ACCEPTS a second
+        # answer, not what the run does afterwards.
+        cli.cmd_approve(self._args(task, "approve", no_continue=True))
+        self.assertEqual([g["state"] for g in task.state["gates"]],
+                         ["declined", "approved"],
+                         "the rework could not be approved after a decline")
+
+    def test_no_continue_leaves_a_task_that_can_still_be_resumed(self):
+        """It cleared `pending_gate` and left the status at `awaiting_approval`,
+        which nothing handles -- so `resume` halted with "no handler for stage"
+        and `approve` refused because no gate was pending. `resume_status` was
+        gone, and for a design gate the fallback guess is wrong: `needs_human`
+        resumes at `implement` and skips planning entirely."""
+        task = self._parked("T-051")
+        resume_at = task.state["pending_gate"]["resume_status"]
+        cli.cmd_approve(self._args(task, "approve", no_continue=True))
+        self.assertEqual(task.state["status"], resume_at,
+                         "the task was left on a status no stage handles")
+        self.assertNotEqual(task.state["status"], "awaiting_approval")
+
+    def test_resume_on_a_waiting_gate_says_to_answer_it(self):
+        """`awaiting_approval` is not a stage. Falling through gave
+        "no handler for stage 'awaiting_approval'", which reads as a crash for
+        an ordinary state: a question is waiting on a human."""
+        task = self._parked("T-052")
+        args = argparse.Namespace(repo=self.t.repo, registry=REGISTRY,
+                                  id=task.state["id"], stage=None, adapter="mock",
+                                  no_panes=False, dry_run=True, yes=False,
+                                  when_open=False)
+        with self.assertRaises(SystemExit) as cm:
+            cli.cmd_resume(args)
+        self.assertIn("approve", str(cm.exception))
+        self.assertEqual(task.state["status"], "awaiting_approval",
+                         "refusing to resume must not also mutate the task")
+
+    def test_an_implementer_is_told_the_scope_it_is_measured_against(self):
+        """The boundary in the prompt and the boundary in the check were two
+        different keys.
+
+        The planner writes `file_scope` in plan.md; `_read_plan_subtasks`
+        renames it to `planned_scope` on the way into task.json. `compose` read
+        `file_scope`, which a stored subtask never has — so every implementer
+        prompt printed the scope header with nothing under it, while
+        `verify.scope_violations` recorded violations of a boundary the agent
+        was never shown.
+        """
+        script, _ = self._script()
+        task = store.Task.create(self.t.repo, "T-060",
+                                 "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                     lambda k, t: True, log=lambda *_: None).run()
+        sub = task.state["subtasks"][0]
+        self.assertTrue(sub.get("planned_scope"),
+                        "the fixture plan declares no scope, so this proves nothing")
+
+        text = prompts.compose("implementer", task, subtask=sub)
+        # Asserted against the SCOPE SECTION, not against the whole prompt. The
+        # fixture's goal line is "Add a subtract function to app.py" and its
+        # scope is ["app.py"], so a bare `assertIn("app.py", text)` passes on
+        # the goal and proves nothing -- it passed against the unfixed code.
+        # That is the same substring-that-cannot-tell-two-things-apart mistake
+        # this repo has now made in four places.
+        after = text.split("Write scope", 1)
+        self.assertEqual(len(after), 2, "no scope section in the prompt at all")
+        section = after[1].split("Verification commands")[0].split("Budget for")[0]
+        for glob in sub["planned_scope"]:
+            self.assertIn("\n  %s" % glob, section,
+                          "the implementer was never shown %r, which "
+                          "scope_violations measures it against.\n%s" % (glob, section))
+
+    def test_an_unrestricted_subtask_says_so_rather_than_showing_a_bare_header(self):
+        """An empty scope means `**` to `scope_violations`. Printing "a hard
+        boundary:" with nothing under it reads as unspecified when it means
+        unrestricted."""
+        task = store.Task.create(self.t.repo, "T-061", "# t\n\nwhatever\n",
+                                 self.reg["policy"]["limits"])
+        text = prompts.compose("implementer", task,
+                               subtask={"id": "st-1", "goal": "g", "planned_scope": []})
+        self.assertIn("not restricted", text)
+        self.assertNotIn("a hard boundary", text)
 
     def test_unparseable_plan_parks_rather_than_guessing(self):
         script, _ = self._script()

@@ -85,9 +85,8 @@ the failing-run output in `evidence`.
 
 ## Your triggers
 
-Beyond the shared ones in `SKILL.md`, and only when the condition applies:
+Beyond the shared ones in `PROTOCOL.md`, and only when the condition applies:
 
 | Condition | Read |
 |---|---|
 | Before you write tests | `references/companions.md` |
-| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |
