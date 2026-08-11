@@ -2907,6 +2907,53 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(task.state["status"], "awaiting_approval",
                          "refusing to resume must not also mutate the task")
 
+    def test_an_implementer_is_told_the_scope_it_is_measured_against(self):
+        """The boundary in the prompt and the boundary in the check were two
+        different keys.
+
+        The planner writes `file_scope` in plan.md; `_read_plan_subtasks`
+        renames it to `planned_scope` on the way into task.json. `compose` read
+        `file_scope`, which a stored subtask never has — so every implementer
+        prompt printed the scope header with nothing under it, while
+        `verify.scope_violations` recorded violations of a boundary the agent
+        was never shown.
+        """
+        script, _ = self._script()
+        task = store.Task.create(self.t.repo, "T-060",
+                                 "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                     lambda k, t: True, log=lambda *_: None).run()
+        sub = task.state["subtasks"][0]
+        self.assertTrue(sub.get("planned_scope"),
+                        "the fixture plan declares no scope, so this proves nothing")
+
+        text = prompts.compose("implementer", task, subtask=sub)
+        # Asserted against the SCOPE SECTION, not against the whole prompt. The
+        # fixture's goal line is "Add a subtract function to app.py" and its
+        # scope is ["app.py"], so a bare `assertIn("app.py", text)` passes on
+        # the goal and proves nothing -- it passed against the unfixed code.
+        # That is the same substring-that-cannot-tell-two-things-apart mistake
+        # this repo has now made in four places.
+        after = text.split("Write scope", 1)
+        self.assertEqual(len(after), 2, "no scope section in the prompt at all")
+        section = after[1].split("Verification commands")[0].split("Budget for")[0]
+        for glob in sub["planned_scope"]:
+            self.assertIn("\n  %s" % glob, section,
+                          "the implementer was never shown %r, which "
+                          "scope_violations measures it against.\n%s" % (glob, section))
+
+    def test_an_unrestricted_subtask_says_so_rather_than_showing_a_bare_header(self):
+        """An empty scope means `**` to `scope_violations`. Printing "a hard
+        boundary:" with nothing under it reads as unspecified when it means
+        unrestricted."""
+        task = store.Task.create(self.t.repo, "T-061", "# t\n\nwhatever\n",
+                                 self.reg["policy"]["limits"])
+        text = prompts.compose("implementer", task,
+                               subtask={"id": "st-1", "goal": "g", "planned_scope": []})
+        self.assertIn("not restricted", text)
+        self.assertNotIn("a hard boundary", text)
+
     def test_unparseable_plan_parks_rather_than_guessing(self):
         script, _ = self._script()
         script["planner"] = lambda env, cwd: _spit(
