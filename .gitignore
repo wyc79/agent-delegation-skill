@@ -42,3 +42,4 @@ npm-debug.log*
 
 # Local agent/editor working docs (specs, plans, scratch) — never part of the repo
 .claude/
+.DS_Store

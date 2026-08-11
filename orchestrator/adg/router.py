@@ -37,25 +37,6 @@ class RoutingError(RuntimeError):
     pass
 
 
-def as_boost(hint):
-    """A plan's `capability_hint` as a `boost` mapping, or {}.
-
-    The planner writes difficulty in words (`{reasoning: high}`); `_meets` reads
-    floors as numbers. Unknown capabilities and unknown words are dropped rather
-    than guessed at -- a hint is the planner's read, and a typo in it must not be
-    able to raise a floor nothing can clear.
-    """
-    out = {}
-    for cap, level in (hint or {}).items():
-        if isinstance(level, bool):
-            continue
-        if isinstance(level, str):
-            level = _LEVELS.get(level.lower())
-        if isinstance(level, (int, float)):
-            out[cap] = int(level)
-    return out
-
-
 class NoModelAvailable(RoutingError):
     pass
 
@@ -131,8 +112,27 @@ class Router:
         self.reg = registry
 
     # --- gates ------------------------------------------------------------
-    def _enrolled(self, spec, role):
-        return role in (spec.get("enrolled_roles") or [])
+    # One profile serves every job, because there is one kind of job. `role`
+    # survives as the name of the instructions an agent reads, not of the model
+    # that runs it -- that is the job's `tier`.
+    PROFILE = "worker"
+
+    @staticmethod
+    def _enrolled(spec):
+        return bool(spec.get("enrolled"))
+
+    def _in_band(self, spec, tier):
+        """Does this model serve the band the job asked for?
+
+        An exact band, not a floor. A floor would be useless here: the profile
+        weights the workhorse above the cheap model on every axis that matters,
+        so `tier: t1` with a floor would route to t2 every time and the cheap
+        seat would never run. Asking for a band means getting that band.
+
+        No tier named means no constraint -- the caller did not care, so the
+        score decides among everything enrolled.
+        """
+        return tier is None or spec.get("tier") == tier
 
     def _within_ceiling(self, spec, ceiling):
         max_tier = (ceiling or {}).get("max_tier", "t3")
@@ -219,8 +219,8 @@ class Router:
         return score
 
     # --- selection --------------------------------------------------------
-    def candidates(self, role, ceiling=None, boost=None, cooldowns=(),
-                   utilization=None, ignore_reserve=False):
+    def candidates(self, role=None, ceiling=None, boost=None, cooldowns=(),
+                   utilization=None, ignore_reserve=False, tier=None):
         """All (model, channel) pairs legal for this role, best first.
 
         `cooldowns` is a set of channel names to filter exactly like
@@ -233,9 +233,9 @@ class Router:
         its own filters -- which model is actually installed -- leave nothing
         runnable, because only the caller knows that.
         """
-        profile = self.reg["profiles"].get(role)
+        profile = self.reg["profiles"].get(self.PROFILE)
         if profile is None:
-            raise RoutingError("no capability profile for role %r" % role)
+            raise RoutingError("registry has no %r profile" % self.PROFILE)
         ceiling = ceiling if ceiling is not None else self.reg["policy"].get("escalation_ceiling", {})
         boost = boost or {}
         cooldowns = set(cooldowns or ())
@@ -250,7 +250,9 @@ class Router:
                 spec = self.reg["models"].get(mname)
                 if spec is None:
                     continue
-                if not self._enrolled(spec, role):
+                if not self._enrolled(spec):
+                    continue
+                if not self._in_band(spec, tier):
                     continue
                 if not self._within_ceiling(spec, ceiling):
                     continue
@@ -262,7 +264,7 @@ class Router:
             # Only now: a malformed reserve_fraction on a channel this role can
             # never use is not this role's problem, and raising for it would
             # crash-park a run over a config error somewhere else entirely.
-            held = self._reserved_out(chan, role, u)
+            held = self._reserved_out(chan, role or self.PROFILE, u)
             for mname, spec in legal:
                 (reserved if held else out).append(
                     Choice(mname, cname, spec, chan,
@@ -275,8 +277,8 @@ class Router:
         chosen.sort(key=lambda c: (-c.score, c.model, c.channel))
         return chosen
 
-    def select(self, role, ceiling=None, boost=None, exclude=(), cooldowns=(),
-               utilization=None):
+    def select(self, role=None, ceiling=None, boost=None, exclude=(), cooldowns=(),
+               utilization=None, tier=None):
         """Best legal choice. The remaining sorted list is the fallback chain.
 
         Reserved seats are considered only once `exclude` has emptied the
@@ -284,25 +286,12 @@ class Router:
         rule `_pick` applies, evaluated after this method's own filter."""
         for reserved_pass in (False, True):
             for c in self.candidates(role, ceiling, boost, cooldowns, utilization,
-                                     ignore_reserve=reserved_pass):
+                                     ignore_reserve=reserved_pass, tier=tier):
                 if (c.model, c.channel) not in exclude and c.model not in exclude:
                     return c
         raise NoModelAvailable(
-            "no enrolled model for role %r within the ceiling (excluded: %s). "
-            "Enroll a model in registry.default.yaml or raise the ceiling -- "
-            "both are deliberate human edits." % (role, list(exclude)))
+            "no enrolled model%s within the ceiling (excluded: %s). Enroll a "
+            "model in registry.default.yaml or raise the ceiling -- both are "
+            "deliberate human edits."
+            % (" in tier %s" % tier if tier else "", list(exclude)))
 
-    def escalate(self, role, current, ceiling=None, cooldowns=(), utilization=None):
-        """One rung up: require stronger reasoning, still clamped to the
-        ceiling. Returns None when nothing legal is stronger, which is the
-        signal to stop climbing and replan instead of burning budget."""
-        cur_reasoning = int(current.spec.get("reasoning", 0)) if current else 0
-        try:
-            pick = self.select(role, ceiling, boost={"reasoning": cur_reasoning + 1},
-                               exclude=((current.model, current.channel),) if current else (),
-                               cooldowns=cooldowns, utilization=utilization)
-        except NoModelAvailable:
-            return None
-        if current and pick.spec.get("reasoning", 0) <= cur_reasoning:
-            return None
-        return pick

@@ -1,171 +1,145 @@
 ---
 name: agent-delegation
-description: Use when you are the agent a human is talking to and the work in front of you should be handed to other agents instead of done in this session — starting or advancing a task with the `delegate` CLI, answering a gate that parked waiting on a human, checking what a running task has produced, or telling the human where it got to. Covers which command to run, in what order, and how to read what comes back; the dispatched agents carry their own instructions and nothing here is about how they should work.
+description: Use when you have already decided what the work is and want it run by several agents at once across more than one provider — dispatching a decomposition you wrote with the `delegate` CLI, answering the merge gate, checking what a run produced, or reading back why one stopped. It runs jobs; it does not plan, review or judge them, and nothing here is about how the work should be done.
 ---
 
 # Agent delegation
 
-`delegate` places each stage of a task on whichever enrolled agent seat can do it
-— different providers, different models — meters the quota on each, and keeps the
-run going when one of them hits a wall.
+`delegate` takes jobs you have already decomposed and runs them across whichever
+enrolled agent seats can serve them — different providers, different models —
+each in an isolated git worktree, metering the quota on each and keeping going
+when one hits a wall.
 
-**You run it. You are not in it.** It spawns fresh single-role agents that read a
+**It is a wrapper, not a workflow.** It has no planner, no reviewer, no
+classifier. Deciding what the work is, whether the result is any good, and what
+to do about a job that got stuck are all yours — you have skills for that, and
+duplicating them here would mean competing with you using less context than you
+have.
+
+**You run it. You are not in it.** It spawns fresh single-job agents that read a
 task directory on disk; none of them sees your context and you never see theirs.
-You stay the operator: you type the commands, read what comes back, and stand
-between the run and the human.
 
-How the work gets planned, written, tested or reviewed belongs to the agents
-`delegate` spawns. They load their own instructions. This file has no opinion.
+## Before anything: is there more than one seat?
 
-## First decide whether to delegate at all
+Run `delegate init` and read the role assignments. **If every tier resolves to
+one provider, stop — do not delegate.** The whole value here is placing work
+across seats that empty at different times. On one seat you are paying for
+subprocess indirection and isolation you could get from your own subagents,
+more slowly and with no shared prompt cache.
 
-Delegation costs a classification call, a planning call, at least one gate
-round-trip through the human, and minutes of wall clock before a line changes.
-Most requests do not earn that.
+Measured, on a task with four independent jobs and no quota pressure: against
+the same work done by parallel subagents in one warm context, delegating cost
+**4.2× the money, 4.6× the wall clock and 4.4× the tokens for an identical
+result**. That is the honest price of isolation and cross-provider routing. Pay
+it when you are getting those; do not pay it otherwise.
 
-**Do the work yourself** when you can finish it in a handful of edits, when you
-already have the file open and know the change, when the request is a question
-rather than work, or when the human is still deciding what they want — a
-conversation delegates badly. A one-shot edit pushed through `delegate` is
-slower, costs more, and arrives with less of the human in it.
+**Delegate when** two or more providers are enrolled *and* at least one holds:
 
-**Delegate** when one of these holds:
+- The jobs are genuinely independent and would run in parallel worktrees.
+- Your own seat is the constraint — a quota wall you are about to hit, or work
+  better served by a model on another provider.
+- You want the jobs isolated from each other's context on purpose.
 
-- The work is larger than one session can hold, and is better as a written plan
-  and separate subtasks than as one long thread.
-- Subtasks are independent and would genuinely run in parallel worktrees.
-- You want a reviewer that has not already convinced itself the code is right,
-  or tests written by something that has not seen the implementation.
-- Your own seat is the constraint — a quota wall you are about to hit, or a
-  model better suited to part of the job than you are.
+**Do it yourself otherwise.** A handful of edits, a question, a conversation
+still settling what is wanted — all delegate badly.
 
-Run `init` before promising anything: it prints which agent CLIs are usable and
-which model gets which role. **If every role resolves to one seat, you are paying
-for indirection** — independence and parallelism are then the only reasons left.
-Say that rather than delegating anyway.
+## Writing the jobs
 
-## The commands
+Delegate reads a decomposition from a markdown file you write, passed with
+`--plan`. One fenced YAML block, one entry per job:
 
-Run them from the repository being changed, by absolute path. `delegate`
-identifies the project from `git rev-parse --git-common-dir`, so the working
-directory matters; `--repo <path>` overrides it.
+```yaml
+- id: st-1-buffers
+  goal: Implement initialize_render — allocate and initialise the colour and depth buffers.
+  file_scope: ["driver_state.cpp"]
+  tier: t1
+- id: st-2-raster
+  goal: Implement rasterize_triangle — barycentric interpolation, z-buffer, the three interpolation modes.
+  file_scope: ["raster.cpp"]
+  depends_on: []
+  tier: t3
+```
 
-| Command | Does |
+| Field | Does |
 |---|---|
-| `init [--write] [--force]` | Detected seats, role assignments, companion skills, verify config. Writes nothing without `--write`. |
-| `run <request>` | Create a task and drive it. `<request>` is text, or a path to a file holding it. |
-| `resume [--id] [--stage] [--when-open]` | Continue a parked task. `--stage` restarts at a named stage; `--when-open` sleeps out a quota window first. |
-| `approve [--id] --note "…"` | Answer a waiting gate yes, then continue the run. |
-| `reject [--id] --note "…"` | Answer it no. Records the decision and stops. |
-| `status` | One line per task for this project, ending in its task directory. |
-| `show [--id] [--brief]` | `--brief` prints the gate brief, already written for a human; without it, raw `task.json`. |
-| `channels [--clear NAME]` | Per-seat cooldowns and estimated quota draw. |
+| `id` | names the job, its branch and its worktree. Must be unique. |
+| `goal` | what the agent is told to do. This is the whole brief — it gets no plan. |
+| `file_scope` | its write boundary. **Measured, not enforced**: files touched outside it are recorded and reported back, never reverted. |
+| `tier` | which capability band runs it (below). Omit and it draws the ordinary worker. |
+| `depends_on` | job ids that must finish first. Ordering only. |
+| `reads`, `frozen_interfaces`, `hotspots`, `acceptance` | carried into the agent's prompt and the record. |
 
-`run` also takes `--id`, `--mode attended|autonomous`, `--adapter herdr|local|mock`,
-`--no-panes`, `--max-cost N`, `--review auto|always|never`,
-`--tier auto|simple|complex`, `--dry-run`, `--yes`.
+**Disjoint `file_scope` is what buys parallelism.** Two jobs whose scopes
+overlap are serialized, and a job left unscoped claims everything — which
+collapses a wave to one agent. This is the single most common way to get no
+parallelism while thinking you asked for it.
 
-`--tier` is the one to reach for once you have decided to delegate. `auto`
-spends a cheap call asking whether the work needs a plan; if you already know —
-you have just designed the decomposition, or the request is plainly one edit —
-say so and skip it. `complex` plans and decomposes, `simple` seeds one subtask
-and implements. It overrides a `hotspots:` entry in the project's `.adg.yaml`,
-which is the only thing it can silently make worse, so the run logs when it
-does.
-`resume`, `approve` and `reject` take the adapter flags too. `approve` also
-takes `--no-continue`, which records the decision and advances the task to the
-stage it would have resumed at, without running it — pick it up later with plain
-`delegate resume`. The flag is accepted by `reject` and does nothing there: a
-decline ends the run by definition and always parks at `needs_human`, so there
-is nothing to continue into.
-`--id` is optional only while the project has exactly one task.
+## Tiers, and which provider serves them
 
-Two to understand before using them:
+A job asks for a band; the registry decides the model and the seat. This is the
+one routing decision you make:
 
-- `--dry-run` walks the state machine with no agents and no spend. It is the
-  cheapest way to show a human the shape of a run.
-- `--yes` auto-approves **every** gate for the whole run. It exists for
-  unattended runs with nobody present. Never reach for it because a gate is
-  inconvenient — the gates are the human's only say in what gets built.
+| Tier | Model | Default provider | For |
+|---|---|---|---|
+| `t1` | `fast-cheap` | cursor-seat | mechanical, high volume, low judgement |
+| `t2` | `balanced-coder` | cursor-seat | the workhorse — most jobs |
+| `t3` | `opus-class-strong` | claude-seat | the hard one in the batch |
 
-## Exit code 1 does not mean it failed
+The provider column is this deployment's; `delegate init` prints the live table.
+It is a **preference, not a pin** — a cooled or drawn-down seat still yields to
+another, which is the entire point of the program.
 
-`run` and `resume` exit 0 only when the task reached `done`. Parked, waiting,
-declined and crashed all exit 1. **Read the status, not the exit code**, and read
-it again after every call — each one can park again.
+Mixing tiers within one batch is normal and is where this earns its cost: the
+hard job draws the strong model on one provider while the easy ones run
+concurrently on another.
 
-| Status | Means |
-|---|---|
-| `awaiting_approval` | A gate is waiting on the human. Below. |
-| `waiting on quota` (as `status` prints it) | Every seat for a role is cooling. `channels` says until when; `resume --when-open` waits it out. |
-| `needs_human` | The run stopped and something needs deciding or fixing. |
-| `done` | Finished. Attended mode leaves `integrate.patch` in the task directory for `git apply` — nothing was committed to the human's branch, and no mode merges. |
-| a stage name | Interrupted mid-flight; `resume` picks it up. |
+## Running it
 
-## A parked gate
+```bash
+delegate init                                  # seats, tiers, providers
+delegate run "<label>" --plan jobs.md          # dispatch
+delegate status                                # one line per task
+delegate show --brief                          # the merge-gate brief
+delegate approve --note "..."                  # answer the gate
+delegate resume --when-open                    # sleep out a quota window, then continue
+delegate channels --clear <seat>               # release a cooldown by hand
+```
 
-Three gates exist: `design`, `plan`, `merge`. Reaching one with nobody at a
-terminal does not decline it — the task parks, status `awaiting_approval`, and
-`task.json` grows a `pending_gate` holding `kind`, `brief` and `resume_status`.
-A question nobody answered is not a no, and the CLI will not record one as the
-other. Answering it is your job:
+Run from the repository being changed, by absolute path; `--repo <path>`
+overrides. Useful flags: `--no-panes` (trades herdr's visible agent panes for
+cost accounting, so `max_cost_usd` can bind), `--max-cost N` (lowers, never
+raises), `--dry-run`, `--yes`.
 
-1. **Read the brief.** `delegate show --id T-001 --brief`, the same text as
-   `pending_gate.brief`.
-2. **Put the question to the human in prose.** Not the JSON, and not the brief
-   pasted whole unless they ask. Say what is being decided, what it changes in
-   their repo, and what happens if they say no. Offer the plan or the diff.
-3. **Take their answer with its qualifications.** "Yes, but keep the old
-   endpoint" is not a yes.
-4. **Record it.** `delegate approve --id T-001 --note "keep the old endpoint
-   working"`, or `reject` with the same shape.
+**Exit code 1 does not mean it failed.** Only `done` exits 0; parked, waiting on
+quota, declined and crashed all exit 1. Read the status.
 
-   **`--note` is not just a record.** On an approval it is written into the
-   prompts of the planner, of every implementer, and of the reviewer, and it
-   stays there until a later approval carries a new one. The reviewer is the
-   one that matters most: without the note it sees a retained endpoint nobody
-   planned for, calls it scope creep, and rejects work that is doing exactly
-   what the human asked. So write **what they said**, not your summary of it —
-   you are writing an instruction, not a log line.
+## Reading what comes back
 
-   An approval with no note changes nothing downstream, and does not clear a
-   note an earlier gate set.
-5. **Approving continues the run in the same call.** For the `design` and `plan`
-   gates it resumes past the stage that asked, so an approved plan is not
-   re-planned; the `merge` gate re-enters `integrate` to do the landing it was
-   approving. Either way it may park at the next gate — go back to step 1.
+**A job that stopped hands you everything it knew** — its `signals` carry the
+type, the detail, the evidence and what it already tried. Nothing here will
+retry it on a dearer model or rewrite your plan; that decision is yours, and
+`superpowers:subagent-driven-development` has the procedure for making it. The
+worktree and its commits are left in place for whatever you decide.
 
-**Answer a waiting gate with `approve` or `reject`, never `resume`.**
-`awaiting_approval` is not a stage, and `resume` will refuse and tell you so.
+**Nothing reviewed the work.** The merge-gate brief says so plainly. What you
+get is: which files each job touched, which fell outside its declared scope, the
+output of the checks you configured, and what each seat cost. Judging the result
+against what you asked for is the step after this one.
 
-Rejecting ends that run: the decision is recorded, the task parks at
-`needs_human`, nothing continues. The gate can be answered again later — fix
-what was wrong, put the run back in front of it, and approve. `delegate resume
---stage <stage>` restarts from a stage you name — `intake`, `classify`,
-`brainstorm`, `plan`, `implement`,
-`review`, `integrate`.
+**The patch is the deliverable.** Attended mode writes `integrate.patch` and
+commits nothing to your branch.
 
-**Never answer a gate the human has not answered.** Approving on their behalf
-because the run is sitting there turns the checkpoint into a formality, and it is
-the one thing here a later `resume` cannot undo.
+## Checks
 
-## Reading what happened
+Optional `.adg.yaml` in the repository being worked on:
 
-The task directory is printed when `run` creates it and is the last column of
-`status`. It is readable while the run is still going.
+```yaml
+fast: ["make build"]          # after every attempt on a job
+slow: ["make test-all"]       # at stage boundaries
+ignore: ["build/*", "*.o"]    # generated paths, excluded from scope accounting
+hotspots: ["schema.sql"]      # files no two jobs may hold at once
+```
 
-| File | Answers |
-|---|---|
-| `task.md` | What was asked, and the numbered acceptance criteria. |
-| `spec.md` | The design that was approved, when there was a design stage. |
-| `plan.md` | The approach, and one block per subtask with its file scope. |
-| `brief.md` | The last gate brief. Already written for a human. |
-| `reports/*.json` | One per agent per stage: what it did, what surprised it, what it could not do. |
-| `verify/*.json` | Build, test and lint output. |
-| `deviations.md`, `decisions.md`, `escalation.md` | Departures from the plan, decisions and their reasons, and why a subtask went back to the planner. |
-| `agent-logs/*.log` | Each agent's prompt and its output — where to look when one appears to have done nothing. |
-| `task.json` | Status, spend, gate history, which model ran what. Orchestrator-owned; never edit it. |
-
-Relay from these in prose. "The planner split it into three subtasks, two are
-done, the third is waiting on you to approve the merge" is the deliverable. A
-pasted `task.json` is not.
+A check that always exits 0 is a check that always passes — make sure yours can
+fail. `ignore` matters more than it looks: without it, agents are charged with
+creating object files they did not write.

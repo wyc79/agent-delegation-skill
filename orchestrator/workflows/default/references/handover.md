@@ -6,9 +6,8 @@ part-way through.
 **You are not a second attempt.** A session can end for reasons that have nothing
 to do with the work — the provider's capacity ran out, the process died. When
 that happens the approach is still on trial, not on its last chance. No attempt
-budget was spent on you and no escalation rung has been climbed. Do not report
-the predecessor's stop as a failure of the plan, and do not treat the code you
-inherit as already suspect.
+budget was spent on you. Do not report the predecessor's stop as a failure of
+the work, and do not treat the code you inherit as already suspect.
 
 ## Step 1 — Find out what it actually left
 
@@ -22,14 +21,13 @@ to tidy up, so what you inherit is whatever it happened to be holding. **A clean
 `git log` does not mean nothing was done** — check the working tree before you
 conclude you are starting from zero.
 
-Then read `deviations.md`, `decisions.md` and `reports/` for entries under your
+Then read `reports/` for entries under your
 subtask. It may have logged some before it stopped.
 
 ## Step 2 — Decide what each piece is worth
 
 - **Committed work is yours to build on.** Do not restart it and do not revert
   it — reverting another agent's committed work is never an acceptable deviation
-  at any severity (`references/deviations.md`).
 - **Uncommitted work is unproven.** Read it, keep what is right, and commit it as
   your own checkpoint once you have verified it. If it is incoherent, repairing
   it is a departure worth logging, not a silent cleanup.
@@ -40,7 +38,7 @@ subtask. It may have logged some before it stopped.
 
 ## Step 3 — Share the subtask's id namespace
 
-`deviations.md` and `decisions.md` ids are namespaced by **subtask**, not by
+Report ids are namespaced by **subtask**, not by
 agent, and you are the second agent inside that namespace. Continue numbering
 from the highest entry already there for your subtask; do not restart at 1.
 
@@ -48,5 +46,5 @@ from the highest entry already there for your subtask; do not restart at 1.
 
 Your report replaces the predecessor's. It must describe the subtask's full
 state, and say plainly in the summary which part you inherited and which part you
-verified yourself. A reviewer reads the diff as one agent's work — your summary
+verified yourself. Whoever dispatched you reads the diff as one agent's work — your summary
 is the only place that fact survives.

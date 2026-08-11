@@ -322,7 +322,7 @@ class TestRouterCooldowns(unittest.TestCase):
         self.r = router.Router(self.reg)
 
     def test_a_cooled_channel_is_filtered_exactly_like_disabled(self):
-        before = {c.channel for c in self.r.candidates("implementer")}
+        before = {c.channel for c in self.r.candidates()}
         self.assertIn("claude-seat", before)
         after = {c.channel for c in self.r.candidates(
             "implementer", cooldowns={"claude-seat"})}
@@ -532,7 +532,7 @@ class TestMachineSelection(unittest.TestCase):
         first, other = _seats(self.reg)[:2]
         cooldown.open_breaker(first, "quota", T0 + 3600, T0)
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
-        self.assertEqual(orch._pick("implementer").channel, other)
+        self.assertEqual(orch._pick().channel, other)
 
     def test_pick_uses_a_cooled_channel_again_once_it_reopens(self):
         # AC-2: expiry is on read, so no command has to remember to sweep.
@@ -548,18 +548,18 @@ class TestMachineSelection(unittest.TestCase):
         cooldown.open_breaker("cursor-seat", "quota", T0 + 7200, T0)
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
         with self.assertRaises(router.AllChannelsCooled) as cm:
-            orch._pick("implementer")
+            orch._pick()
         self.assertEqual(cm.exception.reopen_at, T0 + 3600, "earliest reopen wins")
         self.assertIn("claude-seat", cm.exception.channels)
 
-    def test_an_unenrolled_role_is_still_a_plain_no_model_error(self):
+    def test_an_unenrolled_model_is_still_a_plain_no_model_error(self):
         # Not every empty candidate list is a quota problem, and saying so would
         # send the user to `delegate channels` for a registry mistake.
         cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
-        self.reg["profiles"]["nobody"] = {"require": {"reasoning": 9}, "weights": {}}
+        self.reg["profiles"]["worker"]["require"] = {"reasoning": 9}
         with self.assertRaises(router.NoModelAvailable) as cm:
-            orch._pick("nobody")
+            orch._pick()
         self.assertNotIsInstance(cm.exception, router.AllChannelsCooled)
 
     def test_a_corrupt_channels_file_is_logged_and_ignored(self):
@@ -569,38 +569,8 @@ class TestMachineSelection(unittest.TestCase):
             fh.write("[[[")
         logs = []
         orch = _orch(self.reg, runtime.MockAdapter(), self.task, logs=logs)
-        self.assertEqual(orch._pick("implementer").channel, _seats(self.reg)[0])
+        self.assertEqual(orch._pick().channel, _seats(self.reg)[0])
         self.assertTrue(any("unreadable" in x for x in logs), logs)
-
-    def test_an_optional_role_going_dark_mid_call_degrades_instead_of_parking(self):
-        """A seat that dies *during* a cosmetic call must degrade exactly like a
-        seat that was already cooled before it. Parking a finished task because
-        the brief could not be prettified is absurd, and the guard around
-        `_pick` alone did not cover the call that follows it.
-
-        No breaker is opened up front on purpose: `fast-cheap` is the only model
-        enrolled for this role and only cursor-seat exposes it, so pre-cooling
-        would fail at the pick -- the path that was already guarded -- and prove
-        nothing about the call after it."""
-
-        def reporter(env, cwd):
-            return blocked(QUOTA_MSG)
-
-        orch = _orch(self.reg, runtime.MockAdapter({"reporter": reporter},
-                                                   now=lambda: T0), self.task)
-        original = "# T-001 — Merge\n\nA plain brief that is long enough to keep." * 3
-        self.assertEqual(orch._polish(original), original,
-                         "the template fallback was skipped")
-
-    def test_an_optional_role_going_dark_does_not_park_the_run(self):
-        def classifier(env, cwd):
-            return blocked(QUOTA_MSG)
-
-        orch = _orch(self.reg, runtime.MockAdapter({"classifier": classifier},
-                                                   now=lambda: T0), self.task)
-        tier, why, by = orch._ask_classifier("Add a subtract function")
-        self.assertEqual(tier, "complex", "the fail-safe classification was lost")
-        self.assertEqual(by, "fallback")
 
     def test_a_reserved_seat_is_handed_back_when_the_alternative_is_not_installed(self):
         """Regression. The reserve fallback used to be decided inside the router,
@@ -617,7 +587,7 @@ class TestMachineSelection(unittest.TestCase):
 
         logs = []
         orch = _orch(self.reg, OnlyClaude(), self.task, logs=logs)
-        choice = orch._pick("implementer")
+        choice = orch._pick()
         self.assertEqual(choice.channel, "claude-seat")
         self.assertTrue(choice.demoted)
         self.assertTrue(any("reserve:" in x for x in logs), logs)
@@ -627,19 +597,19 @@ class TestMachineSelection(unittest.TestCase):
         for i in range(29):
             cooldown.record_use("claude-seat", 5 * 3600, T0 - i)
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
-        self.assertEqual(orch._pick("implementer").channel, "cursor-seat")
+        self.assertEqual(orch._pick().channel, "cursor-seat")
 
     def _escalated_choice(self, seats):
         """A registry where a strong implementer is enrolled on `seats`, and the
         Choice an escalation would have produced."""
-        self.reg["models"]["opus-class-strong"]["enrolled_roles"].append("implementer")
+        self.reg["models"]["opus-class-strong"]["enrolled"].append("implementer")
         for name, chan in self.reg["channels"].items():
             if name not in seats and "opus-class-strong" in (chan.get("exposes") or []):
                 chan["exposes"] = [m for m in chan["exposes"] if m != "opus-class-strong"]
             if name in seats and "opus-class-strong" not in (chan.get("exposes") or []):
                 chan["exposes"] = list(chan["exposes"]) + ["opus-class-strong"]
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
-        strong = [c for c in orch.router.candidates("implementer")
+        strong = [c for c in orch.router.candidates()
                   if c.model == "opus-class-strong"]
         return orch, strong[0]
 
@@ -666,9 +636,9 @@ class TestMachineSelection(unittest.TestCase):
         # and the seat really is still there for everyone else
         self.assertEqual(cooldown.read(T0)[0], before,
                          "a timeout opened a breaker")
-        self.assertEqual(orch._pick("implementer").channel,
+        self.assertEqual(orch._pick().channel,
                          _orch(self.reg, runtime.MockAdapter(), self.task)
-                         ._pick("implementer").channel)
+                         ._pick().channel)
 
     def test_an_ordinary_crash_still_hops_nowhere(self):
         """The negative control, as a unit. A failover that fires on any error
@@ -677,32 +647,9 @@ class TestMachineSelection(unittest.TestCase):
         self.assertNotIn("other", orch.HOPS_TO_ANOTHER_SEAT)
         self.assertNotIn("other", orch.OPENS_THE_BREAKER)
 
-    def test_a_hop_after_an_escalation_keeps_the_rung(self):
-        """Failover must not walk back down the ladder. Re-selecting on plain
-        role requirements would hand escalated work to a weaker model and log it
-        as an ordinary failover — the run reads as still climbing while it is
-        descending."""
-        orch, strong = self._escalated_choice(["claude-seat", "cursor-seat"])
-        nxt = orch._replacement("implementer", strong, [strong.channel])
-        self.assertNotEqual(nxt.channel, strong.channel)
-        self.assertGreaterEqual(int(nxt.spec.get("reasoning", 0)),
-                                int(strong.spec.get("reasoning", 0)),
-                                "the replacement is weaker than the seat it replaced")
-
-    def test_dropping_below_the_rung_is_allowed_but_never_silent(self):
-        # Continuing weaker beats parking, but the log must say it happened.
-        logs = []
-        orch, strong = self._escalated_choice(["claude-seat"])
-        orch.log = logs.append
-        nxt = orch._replacement("implementer", strong, [strong.channel])
-        self.assertEqual(nxt.channel, "cursor-seat")
-        self.assertLess(int(nxt.spec.get("reasoning", 0)),
-                        int(strong.spec.get("reasoning", 0)))
-        self.assertTrue(any("weaker" in x for x in logs), logs)
-
     def test_invocations_are_metered_against_the_window(self):
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
-        choice = orch._pick("implementer")
+        choice = orch._pick()
         orch._meter(choice)
         orch._meter(choice)
         _, usage, _ = cooldown.read(T0)
@@ -766,6 +713,7 @@ class TestFailoverEndToEnd(unittest.TestCase):
     def _run(self, script, clock=None):
         task = store.Task.create(self.t.repo, "T-001",
                                  "# t\n\n- **AC-1** — subtract exists\n", self.pol)
+        task.write_text("plan.md", PLAN_MD)
         logs = []
         clock = clock or (lambda: T0)
         adapter = runtime.MockAdapter(script, now=clock)
@@ -826,8 +774,9 @@ class TestFailoverEndToEnd(unittest.TestCase):
         chan.pop("quota", None)
         self.reg["channels"]["claude-seat"] = chan
         self.assertIsNone(orch._headroom("claude-seat", {}))
-        # and it is still selectable
-        self.assertEqual(orch._pick("planner").channel, "claude-seat")
+        # and it is still selectable — asked for the tier that seat serves,
+        # since a tier is a band and the workhorse lives elsewhere.
+        self.assertEqual(orch._pick(tier="t3").channel, "claude-seat")
 
     def test_no_seat_with_room_still_starts_the_run(self):
         """It must never refuse work. A wrong estimate that parks a runnable
@@ -842,7 +791,7 @@ class TestFailoverEndToEnd(unittest.TestCase):
         logs = []
         orch = _orch(self.reg, runtime.MockAdapter({}), task,
                      clock=lambda: T0, logs=logs)
-        self.assertIsNotNone(orch._pick("implementer"), "refused to start")
+        self.assertIsNotNone(orch._pick(), "refused to start")
         self.assertTrue(any("anyway" in x for x in logs), "started without saying why")
 
     def test_the_two_skill_searches_do_not_diverge(self):

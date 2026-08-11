@@ -9,8 +9,8 @@ reconciliation is unreviewed work entering the branch through a side door.
 
 ## Step 1 — Understand both sides before touching anything
 
-Read `plan.md` (both subtasks' blocks, and the interface it froze between them),
-`deviations.md`, and both implementers' reports. The reports often explain a
+Read `plan.md` (both jobs' blocks, and any interface frozen between them) and
+both workers' reports. The reports often explain a
 conflict directly: two agents made incompatible assumptions and both said so.
 
 Then read the conflict itself. Name, in one sentence, what each side was trying
@@ -21,9 +21,9 @@ to achieve. If you cannot, you are not ready to resolve it.
 In order:
 
 1. **The plan decides.** When one side matches `plan.md` and the other departed,
-   keep the plan-conforming side unless its deviation was logged and justified.
-2. **A logged deviation outranks an unlogged one.** Someone who recorded their
-   reasoning gets the benefit of the doubt over someone who did not.
+   keep the plan-conforming side unless the departure is explained in its report.
+2. **An explained departure outranks an unexplained one.** Someone who recorded
+   their reasoning gets the benefit of the doubt over someone who did not.
 3. **Preserve both intents when they are compatible.** Most conflicts are two
    correct changes to adjacent lines, not a genuine disagreement.
 4. **Never resolve by deleting one side's work** to make the conflict go away.
@@ -44,14 +44,13 @@ a `blocked` report, not an invitation to redesign.
 
 ## Step 4 — Record the reconciliation
 
-Append to `decisions.md` — this is the entry a confused reader will need most:
+Say it in your report — this is the part a confused reader will need most:
 
 ```text
-D-int-1 | integrator | st-2 and st-4 both registered the poison handler. Kept st-4's
-     registration (plan.md:L61 assigns wiring to st-4); removed st-2's duplicate.
+st-2 and st-4 both registered the poison handler. Kept st-4's registration
+(plan.md assigns wiring to st-4); removed st-2's duplicate.
 ```
 
-Log a `deviations.md` entry too if the resolution departed from the plan.
 
 ## Step 5 — Report
 
@@ -79,5 +78,4 @@ Beyond the shared ones in `PROTOCOL.md`, and only when the condition applies:
 
 | Condition | Read |
 |---|---|
-| Before you write code | `references/companions.md` |
 | You are reconciling work from concurrent worktrees | `references/parallelism.md` |

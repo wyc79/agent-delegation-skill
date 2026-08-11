@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import signal
 import sys
 import time
 
@@ -213,10 +214,6 @@ def cmd_run(args):
     body = request if request.lstrip().startswith("#") else \
         "# Task %s\n\n## Request (verbatim)\n\n%s\n" % (task_id, request.strip())
     task = store.Task.create(repo, task_id, body, merged, mode=args.mode)
-    if args.review != "auto":
-        task.update(review=args.review)
-    if getattr(args, "tier", "auto") != "auto":
-        task.update(tier=args.tier)
     if getattr(args, "plan", None):
         # The caller brought its own decomposition, so there is nothing for a
         # planner to decide. Written where the planner would have written it,
@@ -457,7 +454,26 @@ def cmd_show(args):
     print(json.dumps(task.state, indent=2))
 
 
+def _die_like_ctrl_c(signum, frame):
+    """Turn a SIGTERM into the interrupt the machine already handles.
+
+    `run()` drains every live agent session in a `finally`, and a `finally` runs
+    for KeyboardInterrupt but not for a signal Python installs no handler for --
+    the default SIGTERM disposition kills the interpreter outright and leaves
+    the agent subprocesses to be reparented. Raising here means `kill <pid>` and
+    Ctrl-C take the same path: sessions torn down, task left resumable.
+    """
+    raise KeyboardInterrupt("terminated (signal %s)" % signum)
+
+
 def main(argv=None):
+    try:
+        signal.signal(signal.SIGTERM, _die_like_ctrl_c)
+    except (ValueError, OSError, AttributeError):
+        # Not the main thread, or a platform without SIGTERM. The drain in
+        # `run()` still covers every in-process path; only the signal shortcut
+        # is unavailable, and refusing to start over it would be absurd.
+        pass
     p = argparse.ArgumentParser("delegate", description="Multi-agent task delegation.")
     p.add_argument("--repo", default=".", help="repository (default: cwd)")
     p.add_argument("--registry", default=None, help="path to registry.default.yaml")
@@ -483,13 +499,6 @@ def main(argv=None):
                         "can actually bind")
     r.add_argument("--max-cost", type=float, help="lower the cost cap for this task")
     r.add_argument("--dry-run", action="store_true", help="drive the machine without agents")
-    r.add_argument("--tier", choices=["auto", "simple", "complex"], default="auto",
-                   help="auto (default): a cheap model judges whether the work "
-                        "needs a plan. simple|complex states it outright and "
-                        "skips that call — for a caller that has already decided")
-    r.add_argument("--review", choices=["auto", "always", "never"], default="auto",
-                   help="auto (default): independent LLM review for complex work, "
-                        "deterministic checks alone for simple work")
     r.add_argument("--plan", metavar="FILE",
                    help="a decomposition you already have, in plan.md's subtask "
                         "format. Pair with `--workflow orchestrator/workflows/"
