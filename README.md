@@ -1,45 +1,58 @@
 # Agent delegation
 
-**`delegate` places each stage of a task on whichever enrolled agent seat can do
-it — different providers, different models — meters the quota on each, and keeps
-the run going when one of them hits a wall.**
+**`delegate` runs jobs you have already decomposed across seats that empty at
+different times** — different providers, different models — each in an isolated
+git worktree, metering the quota on each and moving work when one hits a wall.
+
+It is a **wrapper, not a workflow**. There is no planner, no reviewer, no
+classifier. A skill or agent that has already decided what the work is hands it
+a decomposition; it decides which seat serves each job, runs them, and merges
+what comes back. Judging the result is the caller's, and so is deciding what to
+do about a job that got stuck.
 
 It is a command line program, not a model and not a prompt. It spawns agent CLIs
 (`claude`, `codex`, `cursor-agent`, `gemini` today) as subprocesses, hands each
-one a role and a task directory on disk, and decides what runs next, on which
-seat, and whether it is allowed to. The state graph and its guards are authored
-code; LLMs choose among edges the graph already offers, through schema-validated
-outputs.
+one a job and a task directory on disk, and decides what runs where. The state
+graph and its guards are authored code; LLMs choose among edges the graph
+already offers, through schema-validated outputs.
 
-Two pieces ship here, with very different sizes:
+Two pieces ship here:
 
 - **[`orchestrator/`](orchestrator/) — the runtime.** Seat registry and
-  enrollment, capability router, escalation ceiling, usage metering and a quota
-  shadow price, cooldown breakers, failover with checkpoint reuse, and three
-  adapters: `local` (plain subprocesses), `herdr` (the same agents in visible
-  panes), and `mock` (scripted, for the tests). This is the product.
+  enrollment, tier-based routing, usage metering and a quota shadow price,
+  cooldown breakers, failover with checkpoint reuse, isolated worktrees and
+  dependency waves, and three adapters: `local` (plain subprocesses), `herdr`
+  (the same agents in visible panes), and `mock` (scripted, for the tests).
 - **[`agent-delegation/SKILL.md`](agent-delegation/SKILL.md) — the front door.**
-  One file, for the agent a human is talking to: when to call `delegate`, which
-  command comes next, how to answer a gate that parked. It teaches nothing about
-  how to do the work.
+  One file, for the agent deciding whether to reach for this: when it is worth
+  the cost, how to write the jobs, and how to read what comes back.
 
 [`orchestrator/README.md`](orchestrator/README.md) is the reference for what is
 actually built and why each decision went the way it did.
 
-## Why the claim here is continuity, not quality
+## Why this is a wrapper and not a workflow
 
-This project used to carry a second claim: that its role protocol produces
-better output than working without one. **That claim is retired.** An ablation
-measured it and a stock agent one-shot the complex fixture task — 11 of 11
-acceptance criteria, one call, thirteen minutes. A claim whose baseline improves
-with every model release is not one worth defending, it is a crowded lane, and it
-was never the reason this was built.
+This repo used to run a role protocol: a planner decomposed, a test author wrote
+tests from the requirements blind to the implementation, a reviewer ruled
+against the plan. Two measurements retired it.
+
+The first was an ablation on a fixture task, where a stock agent one-shot the
+work. The second was harder and decisive. On a real assignment — implementing
+four stages of a software rasterizer, graded by the course's own script against
+26 reference images — the protocol and a caller using parallel subagents in one
+warm context **both scored 31/31**. The protocol cost **4.2x the money, 4.6x the
+wall clock and 4.4x the tokens** to get there.
+
+A claim whose baseline improves with every model release is not worth defending,
+and a caller that already has planning and review skills does not need worse
+copies of them behind a subprocess boundary. So they were removed rather than
+defended.
 
 What does not improve with model releases is the seat that empties at 3pm while
-another sits idle. That gets *worse*, because stronger models are metered harder.
-Routing across providers, metering the draw on each, and moving a half-finished
-subtask onto another seat is the part of this repo no model release makes
-redundant.
+another sits idle. That gets *worse*, because stronger models are metered
+harder. Routing across providers, metering the draw on each, and moving a
+half-finished job onto another seat is the part no model release makes
+redundant, and it is what this is now.
 
 Correctness is still checked, but as a **control rather than a claim**: if
 routing a task across two providers costs correctness, that is a bug in the
@@ -50,7 +63,8 @@ demo would ever show it.
 
 ## How a person uses it
 
-**You talk to your own agent. That agent runs `delegate`.**
+**You talk to your own agent. That agent decides whether to delegate, and if it
+does, it writes the jobs and runs `delegate`.**
 
 Not: `delegate` launches an orchestrator agent that talks to you. That was
 considered and rejected — it puts the orchestrator *inside* a provider, so the
@@ -59,26 +73,23 @@ wall. State lives on disk instead, which makes the human the recovery path: if
 your provider dies, open another agent, point it at the same repo, and continue.
 
 ```text
-you  →  your agent    "add a subtract endpoint, and plan it before you write it"
-        your agent    delegate run "add a subtract endpoint"
-        delegate      planner on claude-seat → plan.md → parks at the plan gate
-        your agent    reads the brief, puts the question to you in prose
-you  →  your agent    "yes, but keep the old endpoint working"
-        your agent    delegate approve --note "keep the old endpoint working"
-        delegate      implementers in isolated worktrees, verify, review, patch
+you  →  your agent    "implement the four driver stages"
+        your agent    (decides the decomposition itself, writes jobs.md)
+        your agent    delegate run "driver stages" --plan jobs.md
+        delegate      4 jobs across 2 providers, isolated worktrees, merged
+        your agent    reads what each job touched and what the checks said
+        your agent    reviews the result itself, then tells you
 ```
 
-**Gates park; they never prompt.** Reaching `design`, `plan` or `merge` with
-nobody at a terminal does not decline the gate — the task stops with status
-`awaiting_approval` and a `pending_gate` holding the question and a
-human-readable brief. A question nobody answered is not a no, and the CLI will
-not record one as the other.
+**The first question is whether there are two seats.** `delegate init` prints the
+tier-to-provider table. If everything resolves to one provider, delegating buys
+subprocess indirection and nothing else — do the work with your own subagents
+instead. The skill says so in as many words.
 
-**`--note` is an instruction, not a log line.** On an approval it is written into
-the prompts of the planner, of every implementer, and of the reviewer. The
-reviewer is the one that matters most: without the note it sees a retained
-endpoint nobody planned for, calls it scope creep, and rejects work that is doing
-exactly what the human asked.
+**Nothing reviews the work.** The merge-gate brief says that plainly rather than
+letting "complete, checks pass" read as "something looked at this". What you get
+is which files each job touched, which fell outside its declared scope, the
+output of the checks you configured, and what each seat cost.
 
 **Exit code 1 does not mean it failed.** `run` and `resume` exit 0 only when the
 task reached `done`; parked, waiting on quota, declined and crashed all exit 1.
@@ -97,23 +108,24 @@ git clone https://github.com/wyc79/agent-delegation-skill.git
 export ADG="$PWD/agent-delegation-skill/orchestrator/delegate"
 
 cd /path/to/your/repo          # the repo to be changed
-$ADG init                      # what's detected, who gets which role
-$ADG run "fix the failing auth test"
+$ADG init                      # what's detected, and which seat serves which tier
+$ADG run "add the endpoints" --plan jobs.md
 ```
 
 `init` prints the project key, the state directory, which agent CLIs are usable,
-which model gets which role, which companion skills were found, and what it will
-do about verification. It writes nothing without `--write`. (`--repo` overrides
-the default of the current directory, if you would rather not `cd`.)
+and the tier-to-provider table. Read that table first: **if every tier resolves
+to one provider, do not delegate** — you would be paying for subprocess
+indirection and nothing else. It writes nothing without `--write`. (`--repo`
+overrides the default of the current directory.)
 
 **2. The front door.** Copy `agent-delegation/` into your agent's skills
-directory, so the agent you talk to knows when to reach for delegation and what
-to do with a parked gate. **This is not sufficient on its own** — the skill
+directory, so the agent you talk to knows when delegating is worth it, how to
+write the jobs, and how to read what comes back. **This is not sufficient on its own** — the skill
 describes a program, and without the clone above that program is not on disk.
 Installing it without the CLI leaves an agent with instructions it cannot follow.
 
 No model configuration is needed for either half. Agents never choose models;
-they receive a role and read artifacts. Model routing belongs to the runtime, and
+they receive a job and read artifacts. Routing belongs to the runtime, and
 `registry.default.yaml` is the file it reads (`--registry` points at another).
 
 ## The commands
@@ -124,7 +136,7 @@ from `git rev-parse --git-common-dir`, so the working directory matters.
 | Command | Does |
 |---|---|
 | `init [--write] [--force]` | Detected seats, role assignments, companion skills, verify config. |
-| `run <request>` | Create a task and drive it. `<request>` is text, or a path to a file holding it. |
+| `run <request> --plan FILE` | Create a task from the jobs in `FILE` and run them. |
 | `resume [--id] [--stage] [--when-open]` | Continue a parked task. `--when-open` sleeps out a quota window first. |
 | `approve [--id] --note "…"` | Answer a waiting gate yes, then continue the run. |
 | `reject [--id] --note "…"` | Answer it no. Records the decision and stops. |
@@ -133,15 +145,13 @@ from `git rev-parse --git-common-dir`, so the working directory matters.
 | `channels [--clear NAME]` | Per-seat cooldowns and estimated quota draw. |
 
 `run` also takes `--id`, `--mode attended|autonomous`,
-`--adapter herdr|local|mock`, `--no-panes`, `--max-cost N`,
-`--review auto|always|never`, `--tier auto|simple|complex`, `--dry-run` and
-`--yes`. `--tier` is how a caller that has already decided says so: `auto`
-spends a cheap call judging whether the work needs a plan, and naming the tier
-skips it. Two more worth understanding
-before use: `--dry-run` walks the state machine with no agents and no spend,
-which is the cheapest way to see the shape of a run; `--yes` auto-approves
-**every** gate for the whole run, which exists for unattended runs and should
-never be reached for because a gate is inconvenient.
+`--adapter herdr|local|mock`, `--no-panes`, `--max-cost N`, `--dry-run` and
+`--yes`. Three worth understanding before use: `--plan FILE` is not optional in
+practice — a task with no jobs does nothing; `--dry-run` walks the state machine
+with no agents and no spend, which is the cheapest way to see the shape of a
+run; and `--yes` auto-approves **every** gate for the whole run, which exists
+for unattended runs and should never be reached for because a gate is
+inconvenient.
 
 Two modes, and the difference is who answers the gates:
 
@@ -176,7 +186,7 @@ same task state with no configuration. The runtime also injects
 `$AGENT_DELEGATION_TASK_DIR` so the normal path is a single env read.
 
 **This is what makes cross-provider handoff possible at all.** Nobody passes a
-transcript. A cursor implementer picks up a claude planner's work by reading
+transcript. A cursor worker picks up a claude worker's work by reading
 `plan.md`, and a replacement agent after a failover reads what its predecessor
 committed. Without a deterministic shared path and a validated report shape there
 is no handoff, and multi-provider delegation stops being a thing that can happen.
@@ -184,7 +194,7 @@ is no handoff, and multi-provider delegation stops being a thing that can happen
 | File | Holds | Authority |
 |---|---|---|
 | `task.md` | The request and its numbered acceptance criteria | **What was asked** — outranks everything |
-| `plan.md` | Approach plus one YAML block per subtask | **How it is being done** |
+| `plan.md` | One YAML block per job — supplied by the caller with `--plan` | **What was asked for** |
 | `spec.md` | The approved design, when there was a design stage | Settled approach |
 | `brief.md` | The last gate brief, written for a human | — |
 | `deviations.md` | Append-only log of departures from the plan | Amends `plan.md` |
@@ -222,7 +232,7 @@ orchestrator/
     ├── references/       depth loaded only when its trigger fires: task-dir,
     │                     escalation, deviations, parallelism, handover,
     │                     companions, scratch-files
-    ├── schemas/          JSON Schema for reports, verdicts, subtask blocks
+    ├── schemas/          JSON Schema for reports and job blocks
     └── templates/        starting points for task/plan/deviations
 
 registry.default.yaml     model capability scores, role→capability profiles,
@@ -241,45 +251,45 @@ the wrong document, and an invitation to recurse.
 the budget that matters is per role rather than per repo. `PROTOCOL.md` is read
 by all five roles, so a line there costs five times a line in a card, and a
 reference loads only when its stated trigger fires ("tests failed 3 times → read
-`references/escalation.md`"). A reviewer never loads the parallelism rules,
+`references/scratch-files.md`"). A worker never loads the conflict rules,
 because it never writes code or shares a worktree. Moving those rows out of the
 shared entry point lengthened the cards and made every individual role cheaper.
 
-## The default workflow
-
-The bundled workflow is the role protocol this project used to *be*. It is one
-workflow among several now:
+## The graph, and how a job finds a seat
 
 ```text
-intake → classify        simple work skips straight to implementation
-       → brainstorm      complex attended work only — a spec you approve first
-       → plan            a strong seat writes a durable plan, not chat
-       → implement       one subtask each, isolated worktrees, checks after
-                         every attempt
-       → review          requirements → plan → diff → evidence, then a verdict
-       → integrate       merge in dependency order, re-verify at each step
+implement → waves of jobs whose write scopes are disjoint, each in its own
+            worktree on its own branch; checks after every attempt
+integrate → merge each branch into the task branch, re-verifying at each step,
+            then write the patch
 ```
 
-There is deliberately no `verify` stage: checks run *inside* `implement` and
-`review` rather than beside them, so no LLM review is ever paid for to discover a
-compile error.
+Two stages, because the caller owns the rest. There is deliberately no `verify`
+stage either: checks run *inside* `implement` rather than beside it.
 
-Roles are matched to seats by capability, never by tier arithmetic.
-`registry.default.yaml` declares what each model scores and what each role
-requires — `planner: {reasoning: 5, ctx: 150000}`, `implementer: {coding: 4,
-tool: 4}` — and the router picks from the seats that clear the floor. Swapping
-providers is an edit to that file and nowhere else.
+A job names a **tier**; the registry says which model serves that band and which
+seat prefers it:
 
-On the shipped two-seat registry that produces a genuine split as the quota
-drains. At zero draw the two seats price identically and everything runs on the
-claude seat; from its first recorded invocation the implementer and test-author
-price out to the cursor seat, because a subscription's marginal cost rises with
-how drawn it is and the emptier seat is then strictly cheaper. Past 70% drawn
-(`1 − reserve_fraction`) the reservation withholds the claude seat from them
-outright. The planner and reviewer stay on it either way: the only model
-enrolled for those two roles is exposed by that seat alone, and they are the
-roles in its `reserve_for` list. Nobody configured that split; it falls out of
-the shadow price, the reservation and the capability floors.
+| Tier | Model | Seat | For |
+|---|---|---|---|
+| `t1` | `fast-cheap` | cursor-seat | mechanical, high volume |
+| `t2` | `balanced-coder` | cursor-seat | the workhorse — most jobs |
+| `t3` | `opus-class-strong` | claude-seat | the hard one in the batch |
+
+Swapping providers is an edit to `registry.default.yaml` and nowhere else.
+
+**One model per band is load-bearing.** While two models shared t2, `tier: t2`
+named both, the score took the cheaper every time, and "the default provider for
+t2" had no answer. And selection is an exact band, never a floor: with a floor,
+`tier: t1` resolves to t2 — the workhorse outranks the cheap model on every axis
+the profile weighs — and the cheap seat never runs at all.
+
+The seat preference is a preference, not a pin. A cooled or drawn-down seat
+still yields to another, which is the entire point of the program. Underneath it
+the shadow price keeps working: a subscription with headroom costs ~0, the same
+seat at 90% drawn prices itself above a metered key, and `reserve_for` withholds
+a declared share — unless that would leave a job with nowhere to go, in which
+case it gets the seat anyway and the demotion is logged.
 
 ## Design choices worth knowing before you adopt it
 
@@ -299,132 +309,85 @@ the shadow price, the reservation and the capability floors.
   emptier seat before anything hits a wall.
 - **Limits fail closed.** A missing or unparseable limit parks the task rather
   than meaning "unlimited". The top model tier needs two switches — enrollment
-  *and* the escalation ceiling — so reaching it takes two deliberate edits rather
-  than one runaway ladder.
-- **Escalation triggers on objective signals** — consecutive failed checks, or a
-  signal the agent raised with an artifact citation and real output attached —
-  not on self-reported confidence, which is a tiebreaker and cannot move anything
-  on its own. An honest `escalate` is routed, never punished: if stopping at the
-  threshold ever ends up worse than failing in silence, agents learn that.
+  *and* the escalation ceiling — so reaching it takes two deliberate edits.
+- **A stuck job is handed back, not guessed at.** An agent reporting `escalate`
+  ends its job and its `signals` reach the caller whole — type, detail,
+  evidence, what it already tried. Nothing here summarises them away, retries on
+  a dearer model, or rewrites the plan. An honest `escalate` must never leave an
+  agent worse off than failing in silence, or agents learn that.
 - **Parallelism is pessimistic.** Disjoint declared write scopes in separate
   worktrees, with unmergeable files locked to one agent. A merge conflict in a
   binary scene has no good resolution.
-- **Review is an evidence chain**, not a vibe check: every acceptance criterion
-  gets a row and a verdict, and every blocking finding must cite a requirement, a
-  plan line, or real output.
+- **Nothing here reverts a hunk.** Scope is *measured*, and files outside it are
+  recorded and reported. A prompt that threatens an automatic revert would be
+  found out by the first agent that tests it.
+- **No agent process outlives the run.** Sessions are tracked and drained in a
+  `finally`, and SIGTERM is turned into the interrupt that triggers it — an
+  agent is a billed subprocess, and a leaked one keeps costing after the run has
+  stopped.
 
-## Companion skills
+## Where it sits beside other skills
 
-Optional, detected once per run, each attached where it belongs. Missing ones are
-reported as missing rather than silently skipped.
+It does not compete with them, and that is deliberate. The caller brings the
+judgement:
 
-- **[code-winnow](https://github.com/wyc79/code-winnow-skill)** — only its
-  deterministic scanner is used: stdlib, sub-second, no model call, run at the
-  review stage alongside build/test/lint and on tasks that skip LLM review too.
-  Its findings are advisory. Its six *judgment* passes are a separate, unwired
-  thing — [`orchestrator/winnow-passes.md`](orchestrator/winnow-passes.md) is the
-  design for routing them across seats, and it ends by saying nothing happens
-  until an operator enrolls the roles.
-- **[`andrej-karpathy-skills:karpathy-guidelines`](https://github.com/multica-ai/andrej-karpathy-skills)**
-  — the mistakes that make generated code fail review (overcomplication,
-  unrequested scope, unstated assumptions). Read by agents *before* they write.
-- **[superpowers](https://github.com/obra/superpowers)** — `brainstorming`
-  supplies the discipline for the design stage on complex attended tasks, writing
-  `spec.md`, which is gated to you and then handed to the planner as a settled
-  approach. Its `writing-plans` is deliberately *not* used — a plan here is a
-  machine-enforced contract, not prose
-  ([`companions.md`](orchestrator/workflows/default/references/companions.md)).
+- **[superpowers](https://github.com/obra/superpowers)** decides what the work
+  is (`brainstorming`, `writing-plans`), whether to parallelise it at all
+  (`dispatching-parallel-agents`), and what to do about a job that came back
+  stuck (`subagent-driven-development`, which already says never to "force the
+  same model to retry without changes"). `delegate` is what it can call when
+  more than one provider is enrolled and the jobs are genuinely independent.
+- **[code-winnow](https://github.com/wyc79/code-winnow)** runs as a
+  deterministic chaff scan over the diff at the merge gate, if installed. No
+  model reads it and nothing routes on it — it is a pass over the change whose
+  output the brief prints.
 
-Authority stays with the acceptance criteria, the plan, and the deterministic
-checks.
+The line is: anything about *how to do software work well* belongs to the
+caller. What belongs here is what only this can do — placing work on seats and
+keeping it moving when one empties.
 
 ## Status
 
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 246 tests, no tokens spent
-python3 orchestrator/tests/test_failover.py      # 104 more, same
+python3 orchestrator/tests/test_orchestrator.py  # 170 tests, no tokens spent
+python3 orchestrator/tests/test_failover.py      # 100 more, same
 ```
 
 They drive the real state machine over a real git repository with a scripted
-adapter, so the whole pipeline — plan, isolated implementation, verify, review,
-integrate — is exercised without an agent CLI installed and without spending
+adapter, so dispatch, isolated worktrees, waves, verify, failover and
+integration are exercised without an agent CLI installed and without spending
 anything.
 
-**Built and exercised:** the full pipeline; parallel subtasks in separate
-worktrees; the Integrator on merge conflicts; an independent Test Author on
-complex tasks; cost and elapsed time recorded per delegation from the CLI's own
-JSON; autonomous mode ending at an opened PR; quota-aware failover with
-per-channel cooldowns shared across repos; the utilization shadow price;
-signal-routed escalation from an agent's own report; and gates that park and are
-answered out of band. Multi-provider placement is exercised against the shipped
-registry rather than a fixture one: the suites run on `registry.default.yaml`,
-and cooling the claude seat routes the implementer to the cursor seat.
+**Exercised with real agents, once.** Four jobs across two providers on a real
+assignment, graded by that course's own script: **31/31, first attempt, no human
+correction**, one attempt per job, zero scope violations. The wave ran three
+jobs concurrently and a second wave of one, and it crossed providers without
+being told to — the plan marked one job `t3`, and only one seat serves that
+band, so a strong model on one provider worked alongside two on another.
 
-**In progress on the branch this README sits on:** the stage manifest — the work
-that makes the stage list *declared* instead of hardcoded in `machine.STAGES`
-and `prompts.compose`. That pair is the only reason this has been a workflow
-rather than a workflow host, since there was no way to point a stage at somebody
-else's method. `workflow.yaml` and the code that reads it are landing now, and
-**nothing on this branch should be read as a promise that hosting a foreign
-workflow works yet** — no workflow this repo did not write has been run through
-it. Note also what the manifest deliberately will *not* do: it cannot invent a
-stage. `implement` runs worktrees, waves, an escalation ladder and a rework loop
-while `classify` parses one line of text; listing them as interchangeable data
-would be a lie that fails on the first non-default workflow. The graph stays
-authored code, which is the property that makes a run replayable.
+**Built and exercised:** dependency waves in isolated worktrees; scope measured
+per job; the Integrator on merge conflicts; cost and elapsed time recorded per
+delegation from the CLI's own JSON; autonomous mode ending at an opened PR;
+quota-aware failover with per-channel cooldowns shared across repos; the
+utilization shadow price; tier-to-provider routing; gates that park and are
+answered out of band; and teardown that leaves no agent process behind whatever
+ends the run. Multi-provider placement is exercised against the shipped registry
+rather than a fixture one.
 
-**Not done, and it is the headline acceptance test:** one run whose design stage
-uses superpowers on provider A, whose implement stage runs a stock agent on
-provider B, and whose review stage runs code-winnow's judgment passes split
-across both, with a provider killed mid-run. **That run has not been performed**,
-and its third leg is not even wired — `winnow-passes.md` is a design for routing
-those passes, not an implementation. Treat "hosts superpowers and code-winnow end
-to end" as a target, not a capability.
+**Not yet exercised with real agents**, because the conditions have not arisen
+in a live run: failover on an actual quota wall, and the Integrator on a real
+merge conflict. Both are covered by deterministic tests; neither has been seen
+in the wild.
 
-**Also absent:** *live* quota metering (the draw above is estimated from
-invocation counts, not read from a provider), weekly-cap modelling,
-telemetry-driven registry recalibration, container isolation, and a
-before-dispatch check that can *refuse* work — the feasibility check warns when
-no seat can finish, and never parks a runnable task.
-
-**Two honest weaknesses.** Parallel waves are enabled (`max_parallel_agents: 3`)
-on the strength of deterministic tests — the long-intermittent wave failure was
-the test harness's own path matching rather than a race, and every attribution
-defect found on the way is fixed and pinned. But those tests were about
-*attribution*, and a later cold read found a second family underneath them,
-about **continuity** — what a finished subtask leaves behind, and what the next
-one is handed. A wave that partially failed stranded its green siblings'
-branches; a second wave was cut from the task's base commit rather than the
-integration branch, so a dependant could not see what it depended on and the
-Test Author's tests were invisible; the first subtask to go green cleared the
-review findings addressed to all the others; and a sequential subtask was
-credited with its predecessors' files. Later cold passes, each told to attack the
-fix rather than confirm it, found further defects of the same shape inside it.
-All of it is fixed and pinned in `TestSubtaskContinuity` and
-`TestSecondColdRead`, every test mutation-checked by reverting its fix and
-watching it fail; none of it was a race, each defect reproducing on the first
-run and every run. The write-up is in
-[`orchestrator/README.md`](orchestrator/README.md). No wave has yet run with
-real agent CLIs, so treat the first as a shakedown. And cross-provider *dollars* are
-weaker than cross-provider tokens: not every CLI returns a cost figure, so where
-one reports usage but not money the spend is this project's own price table
-applied to token counts, carried as `usd_estimated` rather than passed off as
-measured. Under herdr's visible panes there is no cost at all — which is what
-`--no-panes` trades back, and why `max_cost_usd` cannot bind while panes are on.
-Lead with continuity; read the dollars as an estimate.
-
-[`orchestrator/README.md`](orchestrator/README.md) has the configuration, the
-full scope boundary, and the defect write-up.
-
-`DESIGN.md` — the initial design, written before any code existed — was removed
-on 2026-08-10. It described the workflow-quality thesis retired above, so keeping
-it at the root would have made the repo's most prominent document its most
-out-of-date one. Its reasoning either sits inline in the code it explains, or
-moved to `orchestrator/README.md`; the section citations that pointed at it were
-removed with it, because a pointer into a deleted file costs a reader a lookup
-and returns nothing.
+**Two honest weaknesses.** Cross-provider *dollars* are weaker than
+cross-provider tokens: not every CLI returns a cost figure, so where one reports
+usage but not money the spend is this project's own price table applied to token
+counts, carried as `usd_estimated` rather than passed off as billed. And there
+is no cross-process lock on the breaker file — writes merge under an in-process
+lock, so a breaker lost between two `delegate` processes is recoverable but the
+file is not safe for simultaneous writers in the strict sense.
 
 ## License
 
