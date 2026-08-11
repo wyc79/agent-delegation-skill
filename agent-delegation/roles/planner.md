@@ -123,6 +123,5 @@ Beyond the shared ones in `SKILL.md`, and only when the condition applies:
 
 | Condition | Read |
 |---|---|
-| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |
 | You are deciding whether subtasks may run concurrently | `references/parallelism.md` |
 | Nobody ran a design stage and you are producing `spec.md` yourself | `references/companions.md` |

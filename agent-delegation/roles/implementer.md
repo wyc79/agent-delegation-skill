@@ -105,4 +105,3 @@ Beyond the shared ones in `SKILL.md`, and only when the condition applies:
 |---|---|
 | Before you write code | `references/companions.md` |
 | You share files with another running agent, or hit a merge conflict | `references/parallelism.md` |
-| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |

@@ -90,4 +90,3 @@ Beyond the shared ones in `SKILL.md`, and only when the condition applies:
 | Condition | Read |
 |---|---|
 | Before you write tests | `references/companions.md` |
-| The repo is a Godot / Unity / Unreal project | `references/engines/<engine>.md` |
