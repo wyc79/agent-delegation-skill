@@ -32,7 +32,8 @@ npm-debug.log*
 
 # NOTE: there is deliberately no `.task/` entry here.
 # Orchestration state lives outside the repository entirely, in
-# $XDG_STATE_HOME/agent-delegation/ — see DESIGN.md §4.0. None of this system's
+# $XDG_STATE_HOME/agent-delegation/ — see workflows/default/references/task-dir.md.
+# None of this system's
 # state reaches the working tree, so there is nothing to ignore. A companion
 # skill that writes its own directory excludes it itself; that is not ours.
 

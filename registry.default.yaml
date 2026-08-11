@@ -141,7 +141,11 @@ profiles:
 #
 #   adapter    which runtime adapter runs it (DESIGN.md §4.6): herdr | local
 #   agent_kind which agent CLI to launch — adapter-independent
-#   session    herdr adapter only: the pre-authenticated session to attach to
+#
+# There is deliberately no `session` key. The herdr adapter starts an agent from
+# `agent_kind` alone (adg/runtime.py HerdrAdapter.start_agent) and never attaches
+# to a named pre-authenticated session, so one declared here would be read by
+# nothing while reading like the seat's identity.
 #
 # Swapping `adapter: herdr` for `adapter: local` must change nothing except who
 # spawns the process. If it changes the workflow, the boundary has leaked.
@@ -155,7 +159,6 @@ channels:
     type: subscription
     adapter: herdr
     agent_kind: claude
-    session: claude                    # herdr adapter only; ignored by local
     exposes: [opus-class-strong, balanced-coder]
     quota: {window: 5h, est_capacity: 40, weekly_cap: true}
     reserve_for: [planner, reviewer]   # keep headroom for the calls only this seat can make
@@ -165,7 +168,6 @@ channels:
     type: subscription
     adapter: herdr
     agent_kind: cursor
-    session: cursor
     exposes: [balanced-coder, fast-cheap]
     quota: {window: monthly, est_capacity: 500}
 
@@ -182,17 +184,23 @@ channels:
 # ---------------------------------------------------------------------------
 
 policy:
-  # A SELECTION bound, not a runtime guard. Both entries below filter which
-  # (model, channel) slots the router will choose; neither reaches the process.
+  # A SELECTION bound, not a runtime guard. `max_tier` filters which
+  # (model, channel) slots the router will choose; it never reaches the process.
   # The adapter launches an agent CLI by kind and does not pin a model
   # (adg/runtime.py LAUNCH), so what actually executes is whatever that CLI is
   # configured to use. Lowering max_tier cannot stop a heavy model your CLI
   # already defaults to, and raising it cannot summon one it does not have.
   # The bound that does hold at runtime is `limits.max_cost_usd`, which is
   # checked against the cost the CLI reports back per call.
+  #
+  # `max_marginal_cost_per_call: 2.50` sat here and was read by nothing --
+  # `router._within_ceiling` reads max_tier and stops -- while the paragraph
+  # above claimed both entries filtered selection. That is the same failure mode
+  # as the gates removed from `human_approval_required` below: a policy naming a
+  # control that does not exist reads as protection and is not. Add it back in
+  # the same commit that makes the router price a slot against it.
   escalation_ceiling:
     max_tier: t2                      # ultra tier is out of the ladder's reach
-    max_marginal_cost_per_call: 2.50  # on the slot's list price, before the call
   # Deployment defaults for task.json `limits` (DESIGN.md §4.2).
   # A task may lower any of these; never raise. Missing/invalid -> fail closed.
   limits:
@@ -206,12 +214,21 @@ policy:
     # orchestrator/README.md. Every attribution defect found on the way, in
     # product and harness both, is fixed and held by a deterministic test.
     max_parallel_agents: 3
-    human_approval_required: [design, plan, merge, dependency_change, destructive_op]
+    # The three gates the machine actually has. `dependency_change` and
+    # `destructive_op` were listed here and implemented nowhere -- a policy
+    # naming a control that does not exist reads as protection and is not,
+    # which is the same failure mode as a `max_cost_usd` that cannot bind.
+    # Add them back in the same commit that adds the gates.
+    human_approval_required: [design, plan, merge]
   escalation_thresholds:
     test_stuck_attempts: 3
     edit_churn_rewrites: 4
     scope_overrun_extra_files: 5
-  mode: attended                      # attended | autonomous  (DESIGN.md §9.2)
+  # No `mode:` key. attended/autonomous is a per-task decision: `delegate run
+  # --mode` (default attended, adg/cli.py) writes it into task.json, and nothing
+  # consults a deployment-wide default. One declared here read as the switch for
+  # the whole deployment and moved nothing -- including, silently, `autonomous`,
+  # which is the setting whose failure mode is a pushed branch nobody asked for.
   # auto: independent LLM review for complex work; deterministic checks alone
   # for simple work. A simple task still gets reviewed if a check fails or a
   # file was touched outside its declared scope -- both mean something happened

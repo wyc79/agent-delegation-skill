@@ -8,10 +8,19 @@ companions are recorded as absent rather than omitted -- "we did not check" and
 
 import os
 
-# name -> the path fragment that proves it is installed
+# name -> the path fragment that proves it is installed, relative to a *skills
+# directory*. `_present` also probes it one level down under a `skills/` of its
+# own, which is the layout a plugin uses.
+#
+# These fragments used to start with `skills/` themselves, and every root below
+# already ends in one -- so `~/.claude/skills` was probed for
+# `~/.claude/skills/skills/brainstorming/SKILL.md` and could never match. Only
+# the nested plugin layouts were ever detected, while `winnow.find()` found the
+# exactly-parallel `.claude/skills/code-winnow/scripts/scan.py`. That is the
+# same one-directional divergence the note below says was closed.
 KNOWN = {
-    "karpathy-guidelines": os.path.join("skills", "karpathy-guidelines", "SKILL.md"),
-    "superpowers": os.path.join("skills", "brainstorming", "SKILL.md"),
+    "karpathy-guidelines": os.path.join("karpathy-guidelines", "SKILL.md"),
+    "superpowers": os.path.join("brainstorming", "SKILL.md"),
 }
 
 # Home-directory installs. Kept deliberately in step with `winnow.SEARCH` and
@@ -37,6 +46,17 @@ PROJECT_ROOTS = (
 )
 
 
+def _at(base, fragment):
+    """Is the skill here, either directly or under this level's own `skills/`?
+
+    Both are real installs: a plain skill sits at `<skills dir>/<name>/SKILL.md`,
+    and a plugin carries `<plugin>/skills/<name>/SKILL.md`. Probing only one
+    shape is what made a flat install invisible.
+    """
+    return (os.path.exists(os.path.join(base, fragment))
+            or os.path.exists(os.path.join(base, "skills", fragment)))
+
+
 def _present(fragment, repo=None):
     roots = ROOTS
     if repo:
@@ -45,23 +65,24 @@ def _present(fragment, repo=None):
         base = os.path.expanduser(root)
         if not os.path.isdir(base):
             continue
-        if os.path.exists(os.path.join(base, fragment)):
+        if _at(base, fragment):
             return True
         # plugin caches nest as <marketplace>/<plugin>/<version>/...
         for depth1 in os.listdir(base):
             d1 = os.path.join(base, depth1)
             if not os.path.isdir(d1):
                 continue
-            if os.path.exists(os.path.join(d1, fragment)):
+            if _at(d1, fragment):
                 return True
             for depth2 in os.listdir(d1):
                 d2 = os.path.join(d1, depth2)
-                if os.path.isdir(d2) and os.path.exists(os.path.join(d2, fragment)):
+                if not os.path.isdir(d2):
+                    continue
+                if _at(d2, fragment):
                     return True
-                if os.path.isdir(d2):
-                    for depth3 in os.listdir(d2):
-                        if os.path.exists(os.path.join(d2, depth3, fragment)):
-                            return True
+                for depth3 in os.listdir(d2):
+                    if _at(os.path.join(d2, depth3), fragment):
+                        return True
     return False
 
 

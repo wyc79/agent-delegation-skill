@@ -1,10 +1,14 @@
 # delegate — MVP orchestrator
 
-The deterministic half of the system. The skill tells agents *how to behave*;
-this program decides *what runs next, on which model, and whether it is allowed
-to*. **This file is what is actually built**; the `§` citations throughout point
-in git history at `DESIGN.md`, the initial design, for why a decision went
-the way it did — start at its §15.
+The product. It decides *what runs next, on which model, on whose seat, and
+whether it is allowed to* — and keeps deciding when a provider walls or hangs.
+A **workflow** tells the agents it dispatches how to behave, and which workflow
+is a `--workflow` away: the bundled one in `workflows/default/` is a default,
+not the only option.
+
+**This file is what is actually built**; the `§` citations throughout point in
+git history at `DESIGN.md`, the initial design, for why a decision went the way
+it did — start at its §15.
 
 **`adg`** is short for *agent delegation*. It is the Python package name, and the
 prefix on everything this tool creates so it is greppable and never mistaken for
@@ -130,7 +134,9 @@ provider gave.
 
 | File | Role |
 |---|---|
+| `adg/cli.py` | The commands themselves. `orchestrator/delegate` is six lines that call its `main`. |
 | `adg/machine.py` | The state machine. Every transition lives here. |
+| `adg/workflow.py` | The manifest in force: which stages are enabled, which card a role reads, which discipline a stage borrows from an installed skill. |
 | `adg/store.py` | Task state outside the repo; project key from the git common dir. |
 | `adg/router.py` | Capability scoring, enrollment, escalation ceiling, quota shadow price. |
 | `adg/quota.py` | Quota-exhaustion classification per agent kind; reset and window parsing. |

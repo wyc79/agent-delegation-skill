@@ -30,8 +30,11 @@ anything irreversible. Omit the section if there are none — do not write "N/A"
 
 ## Subtasks
 
-Machine-readable; validated against `schemas/subtask.schema.json`. Every `AC-n`
-in `task.md` must be claimed by at least one subtask.
+Machine-readable, and the orchestrator parses it: `schemas/subtask.schema.json`
+is the shape it expects, but nothing validates your block against that file —
+a missing field is silently read as its default rather than rejected, so an
+omitted `file_scope` becomes "no write boundary" instead of an error. Every
+`AC-n` in `task.md` must be claimed by at least one subtask.
 
 ```yaml
 - id: st-1-<slug>

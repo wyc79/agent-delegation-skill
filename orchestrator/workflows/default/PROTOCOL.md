@@ -6,6 +6,12 @@ orchestrator hands an agent this directory's absolute path in
 unpacked. The installable skill in this repo is `agent-delegation/` at the
 root, which has a different audience: the agent a human is talking to.
 
+**Every `references/…` path below is relative to THIS FILE'S directory —
+`$AGENT_DELEGATION_SKILL_DIR` — not to your working directory.** Your working
+directory is the repository you are changing, and nothing in this protocol lives
+there. Resolving one of these against the repo finds nothing, which reads as
+"the page is missing" rather than as a path mistake.
+
 # Agent Delegation
 
 You are **one role in a pipeline**, not the whole system. Another agent planned

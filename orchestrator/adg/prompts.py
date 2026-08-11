@@ -10,6 +10,8 @@ Deliberately absent: any model name, any routing logic, any provider detail.
 
 import os
 
+from . import schema, workflow
+
 # The protocol dispatched agents follow, relative to `orchestrator/`. It lives
 # here rather than at the repo root because it is orchestrator-internal: it is
 # the bundled DEFAULT WORKFLOW, one of several the runtime will eventually be
@@ -30,27 +32,37 @@ TEXT_REPLY_ROLES = frozenset({"classifier", "intake", "reporter"})
 
 
 def skill_path():
-    """Where the dispatched-agent protocol lives.
+    """Where the workflow in force lives.
 
     Still called `skill_path`, and still exported to agents as
     `AGENT_DELEGATION_SKILL_DIR`, because that name is the contract: the role
     cards and `references/task-dir.md` both name the variable, and agents on
     other providers read those files. Renaming the path is free; renaming the
     thing agents look for is not.
+
+    It is no longer a fixed directory. `--workflow` and $AGENT_DELEGATION_WORKFLOW
+    both move it, which is what lets a deployment host a workflow this repo did
+    not write.
     """
-    orchestrator = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(orchestrator, WORKFLOW_DIR)
+    return workflow.current().path
 
 
 def compose(role, task, subtask=None, extra=None, verify_cfg=None):
-    skill = skill_path()
-    lines = [
-        "You are the **%s** in a delegated development workflow." % role.upper(),
-        "",
-        "Read and follow this protocol before anything else:",
-        "  %s/PROTOCOL.md" % skill,
-        "Then read your role card:",
-        "  %s/roles/%s.md" % (skill, role),
+    wf = workflow.current()
+    skill = wf.path
+    lines = ["You are the **%s** in a delegated development workflow." % role.upper(), ""]
+    # Both are asked of the manifest rather than assembled from a naming
+    # convention. A workflow whose stages are foreign skills has no protocol of
+    # its own and no card for the role -- and pointing an agent at a file that
+    # does not exist sends it hunting instead of working.
+    protocol = wf.protocol()
+    if protocol:
+        lines += ["Read and follow this protocol before anything else:",
+                  "  %s" % protocol]
+    card = wf.card(role)
+    if card:
+        lines += ["Then read your role card:", "  %s" % card]
+    lines += [
         "",
         "Task directory (already exists; all task artifacts go here, never in the repo):",
         "  %s" % task.path,
@@ -121,7 +133,11 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
         "",
         "Finish by writing your report to:",
         "  %s/reports/" % task.path,
-        "It must validate against %s/schemas/report.schema.json." % skill,
+        # The runtime's schemas directory, not the workflow's: the report
+        # envelope is how this program reads a result, so it does not move
+        # with --workflow and a hosted workflow need not ship a copy.
+        "It must validate against %s." % os.path.join(
+            schema.schemas_dir(), "report.schema.json"),
     ]
     found = {k: v for k, v in (state.get("companions") or {}).items() if v}
     if found:

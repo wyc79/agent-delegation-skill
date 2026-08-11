@@ -16,7 +16,8 @@ import subprocess
 import time
 
 from . import (brief, companions, cooldown, limits as lim, prompts, quota,
-               router as routing, schema, verify, winnow, yamlite)
+               router as routing, schema, verify, winnow, workflow as wf,
+               yamlite)
 from .store import git
 
 # Statuses the machine can actually be resumed at -- `cli.cmd_resume` validates
@@ -155,6 +156,10 @@ class Orchestrator:
         self.task = task
         self.reg = registry
         self.router = routing.Router(registry)
+        # The workflow in force. Read once per run and held, because two stages
+        # of one task reading different manifests would be two different
+        # workflows wearing one task id.
+        self.workflow = wf.current()
         self.adapter = adapter
         self.gate = gate            # callable(kind, brief_text) -> bool
         self.log = log
@@ -175,6 +180,17 @@ class Orchestrator:
                 status = self.task.state["status"]
                 if status in TERMINAL:
                     return status
+                # Switched off by the manifest. Checked here rather than inside
+                # each handler because the handlers choose their own successor
+                # -- `_stage_classify` sends simple work straight past
+                # `brainstorm` -- so this only decides which of the
+                # destinations they name is actually switched on.
+                if status in self.workflow.stages and not self.workflow.enabled(status):
+                    nxt = self.workflow.next_enabled(status)
+                    self.log("%s: disabled by workflow %r — skipping to %s"
+                             % (status, self.workflow.data.get("name", "?"), nxt))
+                    self.task.update(status=nxt)
+                    continue
                 handler = getattr(self, "_stage_" + status, None)
                 if handler is None:
                     raise Halt("needs_human", "no handler for stage %r" % status)
@@ -403,13 +419,13 @@ a planner does that next, from your design.
             self.log("brainstorm: skipped — %s" % e)
             self.task.update(status="plan")
             return
-        installed = (self.task.state.get("companions") or {}).get("superpowers")
-        discipline = ("Use the `superpowers:brainstorming` skill's discipline for this: "
-                      "explore the code first, then reason about purpose, constraints and "
-                      "success criteria before proposing anything. Ignore its instructions "
-                      "about where to save files and about committing."
-                      if installed else
-                      "Explore the code before proposing anything.")
+        # Asked of the manifest, not decided here. This was a hardcoded `if
+        # superpowers installed` with both texts inline -- which meant hosting
+        # any other design discipline was a patch to this function rather than
+        # a workflow edit, and that is precisely what stopped this project being
+        # a runtime that hosts a method instead of one that owns it.
+        discipline = self.workflow.discipline(
+            "brainstorm", self.task.state.get("companions"))
         self.log("brainstorm: %s via %s" % (choice.model, choice.channel))
         self._run_once(
             "planner", choice, cwd=self.repo,
@@ -581,6 +597,28 @@ a planner does that next, from your design.
             self.task.update(status="review")
             return
         wave = self._wave(state["subtasks"])
+        if not wave:
+            # Nothing is ready and nothing is running: every pending subtask is
+            # waiting on a dependency that will never complete -- a cycle, or a
+            # `depends_on` naming an id the plan never defines. The planner
+            # writes those ids, so this is an ordinary bad plan, and indexing
+            # the empty wave below turned it into `IndexError: list index out of
+            # range` and a crash.log. Say which subtask waits on what instead:
+            # the fix is an edit to plan.md, and the reader has to know that.
+            # `_wave` is empty only when `_ready` is, so every pending subtask
+            # here has at least one dependency outstanding -- no empty-list case
+            # to write around.
+            done = {s["id"] for s in state["subtasks"] if s.get("status") == "complete"}
+            known = {s["id"] for s in state["subtasks"]}
+            stuck = ["%s waits on %s" % (s["id"], ", ".join(
+                d if d in known else "%s (no such subtask)" % d
+                for d in (s.get("depends_on") or []) if d not in done))
+                for s in pending]
+            raise Halt("needs_human",
+                       "no subtask can start: every pending one is blocked by a "
+                       "dependency that will never complete (%s). Fix depends_on "
+                       "in plan.md, then `delegate resume --stage implement`."
+                       % "; ".join(stuck))
         if len(wave) > 1:
             self.log("implement: %d subtasks in parallel (%s)"
                      % (len(wave), ", ".join(t["id"] for t in wave)))
@@ -1078,12 +1116,23 @@ a planner does that next, from your design.
             "  %s\n"
             "Quote from it rather than re-running. If you do re-run something, "
             "say so and say why.\n\n"
-            "Write your verdict to reports/review-reviewer.json, matching "
+            # The envelope, not the payload. `roles/reviewer.md` step 6, both
+            # schemas and `_collect_report` all agree that a verdict rides
+            # inside an ordinary report as `role_data.verdict` -- one envelope,
+            # one thing to validate. This prompt was the last copy still naming
+            # the verdict schema as the file to write, so a reviewer that obeyed
+            # its prompt rather than its card produced a bare verdict object,
+            # which `schema.validate_report` then rejected for every required
+            # field it does not have. The card is pinned by a test; this string
+            # was not, which is exactly how the two drifted.
+            "Write reports/review-reviewer.json as an ordinary report matching "
+            "%s/schemas/report.schema.json, carrying your verdict under "
+            "role_data.verdict, which must itself match "
             "%s/schemas/verdict.schema.json."
             % (self.task.state["repo"].get("base_commit", "HEAD"),
                result.summary(),
                self.task.file("verify", result.run_id + ".json"),
-               prompts.skill_path()))
+               prompts.skill_path(), prompts.skill_path()))
         chaff = winnow.as_text(self.task.state.get("winnow"))
         if chaff:
             extra += ("\n\n%s\nRead these after the diff, not before. They may only "
@@ -1172,11 +1221,29 @@ a planner does that next, from your design.
             return extra
         return "%s\n\n%s" % (extra, note) if extra else note
 
+    @staticmethod
+    def _owned_by(owner, subtask_id):
+        """Does a reviewer's `suggested_owner` name this subtask?
+
+        The schema documents the field as "Subtask id that should own the fix,
+        e.g. impl:st-2", so the id may arrive bare or behind a `role:` prefix --
+        which is why this was a substring test. But `"st-1" in "st-11"` is true,
+        so a finding against `st-11` also reopened `st-1` and sent green work
+        back to be rebuilt. Same defect class as the report-filename collision
+        the protocol already guards against, arriving through the one field a
+        reviewer writes by hand.
+
+        Compared on the last `:`-separated token, which accepts both documented
+        forms and neither more nor less.
+        """
+        return (owner or "").strip().split(":")[-1].strip() == subtask_id
+
     def _findings_brief(self, sub):
         """What the reviewer rejected, for the implementer that has to fix it."""
         findings = self.task.state.get("pending_findings") or []
         mine = [f for f in findings
-                if not f.get("suggested_owner") or sub["id"] in f.get("suggested_owner", "")]
+                if not f.get("suggested_owner")
+                or self._owned_by(f.get("suggested_owner"), sub["id"])]
         if not mine:
             return None
         lines = ["A reviewer rejected the previous attempt. Address these before "
@@ -1195,7 +1262,7 @@ a planner does that next, from your design.
         def reopen(state):
             hit = False
             for s in state["subtasks"]:
-                named = owners and any(s["id"] in o for o in owners)
+                named = owners and any(self._owned_by(o, s["id"]) for o in owners)
                 if not owners or named:
                     s["status"] = "pending"
                     hit = True

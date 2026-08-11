@@ -1,0 +1,78 @@
+# The bundled default workflow: the role protocol this project used to BE.
+#
+# It is one workflow among several now, not the only one. Everything the
+# orchestrator used to hardcode about it lives here -- which stages run, which
+# role each dispatches, where that role's instructions are, and which installed
+# skill supplies a stage's method.
+#
+# What this file cannot do is invent a stage. The state machine is code on
+# purpose: `implement` runs worktrees, waves, an escalation ladder and a rework
+# loop, while `classify` is one line of text the program parses. Listing them as
+# if they were interchangeable data would be a lie that fails on the first
+# non-default workflow. A manifest enables a stage, disables it, repoints its
+# instructions, or hands its discipline to a foreign skill.
+
+name: default
+description: >
+  The role protocol: a planner decomposes, implementers work one subtask each in
+  isolated worktrees, a test author writes from requirements blind to the
+  implementation, and a reviewer rules against the plan.
+
+# Read by every dispatched agent before its role card.
+protocol: PROTOCOL.md
+
+stages:
+
+  # --- the two text-reply stages ------------------------------------------
+  # No role card, no report, no task id: these are one-shot questions this
+  # program parses, not roles in the protocol. `prompts.TEXT_REPLY_ROLES` is
+  # what stops them being conscripted, and it stays code -- an agent handed a
+  # mandate it has no card for writes a `blocked` report instead of answering.
+
+  intake:
+    role: intake
+
+  classify:
+    role: classifier
+
+  # --- design -------------------------------------------------------------
+
+  brainstorm:
+    role: planner
+    card: roles/planner.md
+    # The whole compatibility story, in one block. This decision used to be
+    # hardcoded in `machine._stage_brainstorm` for exactly one skill; pointing
+    # the stage somewhere else is now a manifest edit rather than a patch.
+    discipline:
+      skill: superpowers:brainstorming
+      text: >
+        Use the `superpowers:brainstorming` skill's discipline for this: explore
+        the code first, then reason about purpose, constraints and success
+        criteria before proposing anything. Ignore its instructions about where
+        to save files and about committing.
+      fallback: Explore the code before proposing anything.
+
+  # --- the rest -----------------------------------------------------------
+
+  plan:
+    role: planner
+    card: roles/planner.md
+
+  implement:
+    role: implementer
+    card: roles/implementer.md
+
+  review:
+    role: reviewer
+    card: roles/reviewer.md
+
+  integrate:
+    role: integrator
+    card: roles/integrator.md
+
+# Roles a stage dispatches alongside its own. The test author is not a stage:
+# it runs inside `plan`, before any implementation exists, which is the property
+# that makes it able to encode what was ASKED rather than what was built.
+extra_roles:
+  test-author:
+    card: roles/test-author.md

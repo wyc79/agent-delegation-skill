@@ -63,10 +63,12 @@ directory matters; `--repo <path>` overrides it.
 
 `run` also takes `--id`, `--mode attended|autonomous`, `--adapter herdr|local|mock`,
 `--no-panes`, `--max-cost N`, `--review auto|always|never`, `--dry-run`, `--yes`.
-`resume`, `approve` and `reject` take the adapter flags too; `approve` and
-`reject` also take `--no-continue`, which records the decision and advances the
-task to the stage it would have resumed at, without running it. Pick it up later
-with plain `delegate resume`.
+`resume`, `approve` and `reject` take the adapter flags too. `approve` also
+takes `--no-continue`, which records the decision and advances the task to the
+stage it would have resumed at, without running it — pick it up later with plain
+`delegate resume`. The flag is accepted by `reject` and does nothing there: a
+decline ends the run by definition and always parks at `needs_human`, so there
+is nothing to continue into.
 `--id` is optional only while the project has exactly one task.
 
 Two to understand before using them:

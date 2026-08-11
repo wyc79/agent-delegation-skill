@@ -15,6 +15,7 @@
   "properties": {
     "stage": {
       "enum": [
+        "brainstorm",
         "classify",
         "plan",
         "test",

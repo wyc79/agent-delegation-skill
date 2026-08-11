@@ -13,15 +13,25 @@ import json
 import os
 import re
 
-from . import prompts
+from . import workflow
 
-# Derived, never rebuilt. This module used to compute the path itself, and when
-# the protocol moved under `orchestrator/workflows/default/` the copy in
-# `prompts` was updated and this one was not -- so every schema load broke while
-# `prompts.skill_path()` resolved correctly. Same shape as the timeout bug two
-# commits back: duplicated behaviour means a fix to one copy proves nothing
-# about the other. One resolver, imported.
-_SKILL = os.path.join(prompts.skill_path(), "schemas")
+
+def schemas_dir():
+    """Where the report and verdict schemas live.
+
+    The BUNDLED directory, deliberately, and not the workflow in force. The
+    report envelope is how this program reads an agent's result -- it is the
+    runtime's contract, not the workflow's, and a hosted workflow should not
+    have to ship a copy of it to be loadable.
+
+    Resolving it against `--workflow` was worse than wrong, it was invisible:
+    this module froze the path at import time, so a workflow directory with no
+    `schemas/` still validated against the bundled copy and only failed under
+    the real CLI, where `_collect_report` would raise FileNotFoundError into the
+    generic handler and report CRASHED. Computed on each call now, so there is
+    no import-order dependency left to be lucky about.
+    """
+    return os.path.join(workflow.default_dir(), "schemas")
 
 _TYPES = {
     "object": dict, "array": list, "string": str,
@@ -36,7 +46,7 @@ class Invalid(ValueError):
 
 
 def load(name):
-    with open(os.path.join(_SKILL, name), encoding="utf-8") as fh:
+    with open(os.path.join(schemas_dir(), name), encoding="utf-8") as fh:
         return json.load(fh)
 
 
