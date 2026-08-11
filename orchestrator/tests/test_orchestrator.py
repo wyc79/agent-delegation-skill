@@ -268,7 +268,7 @@ class TestRouter(unittest.TestCase):
 
     def test_a_boost_raises_a_floor_the_profile_never_declared(self):
         # The implementer profile requires coding and tool, not reasoning, and
-        # rung 2 of the ladder (DESIGN §6.2) is exactly a reasoning+1 re-route.
+        # rung 2 of the ladder is exactly a reasoning+1 re-route.
         # Applying the boost only to declared requirements made that rung a
         # no-op for the one role that climbs it most.
         self.assertNotIn("reasoning", self.reg["profiles"]["implementer"]["require"])
@@ -861,7 +861,7 @@ class TestParallelEndToEnd(unittest.TestCase):
 
 
 class TestRungThree(unittest.TestCase):
-    """DESIGN §6.2 rung 3. Rung 2 is "skipped entirely if nothing enrolled sits
+    """Rung 3. Rung 2 is "skipped entirely if nothing enrolled sits
     above the current model", and the rung after it is the planner. The code
     went straight to needs_human, so a deployment whose implementer has nothing
     stronger enrolled -- which is the shipped registry -- had a ladder that
@@ -947,7 +947,7 @@ class TestRungThree(unittest.TestCase):
         self.assertIn("I believe this is right", bundle,
                       "the implementer's own account was dropped")
         self.assertIn("disposition", bundle.lower(),
-                      "§12: a replan that cannot see finished work re-plans it")
+                      ": a replan that cannot see finished work re-plans it")
 
     def test_rung_four_is_reached_by_exhausting_rung_three_not_skipping_it(self):
         status, task, logs = self._run()
@@ -2363,7 +2363,7 @@ class TestAgentRaisedSignals(unittest.TestCase):
         return status, task, logs
 
     def test_a_test_stuck_signal_climbs_to_a_stronger_model(self):
-        # §6.2 rung 2. The shipped registry enrols opus-class-strong for
+        # rung 2. The shipped registry enrols opus-class-strong for
         # implementer precisely so this rung has somewhere to go.
         status, task, logs = self._run([{
             "type": "test_stuck", "detail": "test_alpha fails on the third fix",
@@ -2376,7 +2376,7 @@ class TestAgentRaisedSignals(unittest.TestCase):
                         "no rung was climbed\n%s" % "\n".join(logs))
 
     def test_a_plan_conflict_reaches_the_planner_not_the_human(self):
-        # §6.2: plan_conflict enters at rung 3 directly -- a stronger
+        # : plan_conflict enters at rung 3 directly -- a stronger
         # implementer cannot fix a plan that is wrong about reality.
         status, task, logs = self._run([{
             "type": "plan_conflict",
@@ -2506,7 +2506,7 @@ class TestResourceHygiene(unittest.TestCase):
 
 
 class TestEndToEnd(unittest.TestCase):
-    """Milestone 1 (DESIGN.md §15.1)."""
+    """Milestone 1."""
 
     def setUp(self):
         self.t = TempRepo()
@@ -2591,10 +2591,44 @@ class TestEndToEnd(unittest.TestCase):
         status, task, _, logs = self._run(script)
         self.assertEqual(status, "done", "\n".join(logs))
         wt = task.state["worktree"]
-        self.assertTrue(os.path.isdir(wt))
+        self.assertTrue(wt, "no worktree was ever recorded")
+        self.assertFalse(wt.startswith(os.path.realpath(self.t.repo) + os.sep),
+                         "the worktree was inside the user's checkout")
         self.assertNotIn("def subtract", _slurp(os.path.join(self.t.repo, "app.py")),
                          "change leaked into the user's checkout")
-        self.assertIn("def subtract", _slurp(os.path.join(wt, "app.py")))
+        # The work itself is on the branch, which outlives the worktree -- the
+        # directory is reaped on `done`, and asserting it still exists was
+        # asserting the leak this program now cleans up.
+        show = subprocess.run(["git", "show", "%s:app.py" % task.state["branch"]],
+                              cwd=self.t.repo, capture_output=True, text=True)
+        self.assertIn("def subtract", show.stdout, show.stderr)
+
+    def test_a_finished_task_does_not_leave_its_worktrees_behind(self):
+        """`.adg-worktrees/` grew one directory per subtask per task forever
+        while two READMEs called them throwaway."""
+        script, _ = self._script()
+        status, task, _, logs = self._run(script)
+        self.assertEqual(status, "done", "\n".join(logs))
+        left = [p for p in [task.state.get("worktree")]
+                + [s.get("worktree") for s in task.state.get("subtasks") or []]
+                if p and os.path.isdir(p)]
+        self.assertEqual(left, [], "worktrees survived a finished task")
+
+    def test_a_parked_task_keeps_its_worktree(self):
+        """The salvage point. A parked or crashed task's worktree holds the
+        checkpointed work a human resumes from — reaping on any terminal state
+        would delete exactly the cases where the files still matter."""
+        script, _ = self._script()
+        script["reviewer"] = lambda env, cwd: None
+        task = store.Task.create(self.t.repo, "T-KEEP",
+                                 "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: k != "merge",     # decline the merge
+                              log=lambda *_: None).run()
+        self.assertEqual(status, "needs_human")
+        self.assertTrue(os.path.isdir(task.state["worktree"]),
+                        "the salvage point was deleted from under a parked task")
 
     def test_attended_mode_produces_a_patch_and_never_commits(self):
         script, _ = self._script()

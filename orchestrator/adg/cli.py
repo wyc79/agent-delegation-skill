@@ -1,4 +1,4 @@
-"""`delegate` — the MVP orchestrator CLI (DESIGN.md §15)."""
+"""`delegate` — the MVP orchestrator CLI."""
 
 import argparse
 import os

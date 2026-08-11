@@ -1,4 +1,4 @@
-"""Quota-exhaustion classification (DESIGN.md §5.4, §5.5).
+"""Quota-exhaustion classification.
 
 A provider says "you are out" in prose, and every provider says it differently.
 This module turns that prose into two facts -- is this a quota wall, and when
@@ -50,7 +50,7 @@ PATTERNS = {
     ],
 }
 
-# herdr reports failures as a JSON error code rather than prose (§4.6).
+# herdr reports failures as a JSON error code rather than prose.
 ERROR_CODES = {"rate_limited", "quota_exceeded", "usage_limit_reached",
                "agent_rate_limited", "insufficient_quota"}
 
@@ -76,7 +76,7 @@ _NUMBER = re.compile(r"^\s*(\d+(?:\.\d+)?)")
 
 def failed(res):
     """Did this invocation fail? `settled` is the adapter's own verdict and the
-    only one every adapter agrees on (§4.6)."""
+    only one every adapter agrees on."""
     return (res or {}).get("settled") != "idle"
 
 
@@ -194,7 +194,7 @@ def parse_window(text, default=5 * 3600.0):
 
 
 def parse_capacity(text):
-    """`40`, `40u`, `500req` -> float. DESIGN.md §5.4 writes all three."""
+    """`40`, `40u`, `500req` -> float. writes all three."""
     if isinstance(text, (int, float)) and not isinstance(text, bool):
         return float(text) if text > 0 else None
     m = _NUMBER.match(str(text or ""))

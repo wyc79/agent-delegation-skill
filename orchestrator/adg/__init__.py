@@ -1,2 +1,2 @@
-"""Agent-delegation orchestrator (DESIGN.md §15)."""
+"""Agent-delegation orchestrator."""
 __version__ = "0.1.0"

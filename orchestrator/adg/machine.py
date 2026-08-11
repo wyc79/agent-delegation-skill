@@ -1,4 +1,4 @@
-"""The task state machine (DESIGN.md §2).
+"""The task state machine.
 
 Deterministic control flow. LLMs choose among edges the graph already offers,
 through validated outputs -- they never invent a transition. Every run is
@@ -6,7 +6,7 @@ replayable from task.json.
 
 Scope: the full pipeline, including parallel subtasks in separate worktrees, the
 Integrator, and an independent Test Author. The ladder walks rungs 0, 2, 3 and 4
-(§6.2) -- rung 1, "a different model at the same tier", is not built: the router
+ -- rung 1, "a different model at the same tier", is not built: the router
 escalates by raising a capability floor, which has no same-tier expression.
 """
 
@@ -30,7 +30,7 @@ STAGES = ["intake", "classify", "brainstorm", "plan", "implement",
           "review", "integrate", "done"]
 TERMINAL = {"done", "abandoned", "needs_human"}
 
-# DESIGN.md §6.2, signal -> the rung the ladder enters at. Only agent-raised
+# , signal -> the rung the ladder enters at. Only agent-raised
 # signals reach this table; the counter-driven ones are read off verify.
 #
 # `low_confidence` is deliberately absent rather than mapped high. D4 makes it a
@@ -131,7 +131,7 @@ class AwaitingApproval(Exception):
 
 
 class Replan(Exception):
-    """Rung 3 (§6.2): the model ladder is spent, so the plan is the suspect.
+    """Rung 3: the model ladder is spent, so the plan is the suspect.
 
     Deliberately not a Halt. Rung 2 is documented as "skipped entirely if
     nothing enrolled sits above the current model", and the rung after it is
@@ -233,7 +233,7 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001 -- see below
             # An unexpected failure must park the task, not crash the process:
             # all progress so far is on disk and resumable, and a traceback on
-            # stderr is not a state the user can act on (§12).
+            # stderr is not a state the user can act on.
             import traceback
             self.task.write_text("crash.log", traceback.format_exc())
             self.task.update(status="needs_human")
@@ -319,7 +319,7 @@ admits only one sensible reading.
         return "\n".join(lines)
 
     def _stage_classify(self):
-        """A cheap model judges; only facts override it (§2.2)."""
+        """A cheap model judges; only facts override it."""
         text = self.task.read_text("task.md", "")
         hotspots = [h for h in (self.vcfg.get("hotspots") or []) if h and h in text]
         if hotspots:
@@ -678,7 +678,7 @@ a planner does that next, from your design.
             failure = "\n".join(
                 "$ %s\n%s" % (f["cmd"], f["output"][-1500:]) for f in result.failures())
             # Signal: test_stuck. Escalate one rung rather than letting the
-            # same model try the same idea a fourth time (§6).
+            # same model try the same idea a fourth time.
             threshold = int((self.reg["policy"].get("escalation_thresholds") or {})
                             .get("test_stuck_attempts", 3))
             if attempts >= threshold:
@@ -717,7 +717,7 @@ a planner does that next, from your design.
 
     def _entry_rung(self, report):
         """Which rung an agent's own `escalate` enters at, and the signals that
-        decided it (§6.2).
+        decided it.
 
         **Highest rung wins.** An agent reporting `test_stuck` *and*
         `missing_dependency` needs the human; climbing to a stronger model first
@@ -804,7 +804,7 @@ a planner does that next, from your design.
         return "\n".join(out) or None
 
     def _write_escalation_bundle(self, sub, attempts, result, report, signals=None):
-        """§6.3. Escalation without context just repeats the failure expensively.
+        """Escalation without context just repeats the failure expensively.
 
         Append-only, like `deviations.md`: `max_replans` can exceed one, and the
         second replan needs to see that the first already tried something.
@@ -812,7 +812,7 @@ a planner does that next, from your design.
         The completed-work inventory is the part that is easy to leave out and
         expensive to omit. `_stage_plan` resets every subtask to pending from
         the new plan, so a planner that does not know what is already green will
-        cheerfully re-plan work that is finished (§12).
+        cheerfully re-plan work that is finished.
 
         `signals` is present when the agent raised the escalation itself. The
         headline has to follow it: reporting an agent's `plan_conflict` under a
@@ -946,6 +946,41 @@ a planner does that next, from your design.
                 raise Halt("needs_human", "%s failed: %s" % (sub["id"], outcome))
         self._integrate_wave(wave)
 
+    def _reap_worktrees(self):
+        """Remove this task's worktrees, once and only once it is done.
+
+        Nothing removed them before, so `.adg-worktrees/<project-key>/` grew one
+        directory per subtask per task forever while two READMEs called them
+        throwaway. On a repo of any size that is the largest thing this program
+        leaves behind.
+
+        **Only on `done`.** A parked or crashed task's worktree holds the
+        salvaged, checkpointed work an agent was interrupted mid-way through --
+        it is what a human resumes from, and what `_salvage` commits into before
+        a failover hop. Reaping on any terminal state would delete exactly the
+        cases where the files still matter. Landing has already happened by
+        here: `_land` writes the patch out of the integration worktree before
+        the status moves.
+
+        Best-effort by construction. `remove_worktree` is documented as
+        deferring to `git worktree prune` on Windows, where engines and
+        antivirus hold locks, so a failure is logged and never raised -- a task
+        that finished must not be reported as broken because a directory
+        survived it.
+        """
+        state = self.task.state
+        paths = [state.get("worktree")]
+        paths += [s.get("worktree") for s in (state.get("subtasks") or [])]
+        removed = 0
+        for path in [p for p in paths if p]:
+            try:
+                self.adapter.remove_worktree(self.repo, path)
+                removed += 1
+            except Exception as e:            # noqa: BLE001 -- see the docstring
+                self.log("  worktree: left %s in place (%s)" % (path, e))
+        if removed:
+            self.log("worktree: removed %d, the task is done" % removed)
+
     def _subtask_worktree(self, sub):
         state = self.task.state
         branch = "adg/%s/%s" % (state["id"], sub["id"])
@@ -954,6 +989,14 @@ a planner does that next, from your design.
                             "%s-%s" % (state["id"], sub["id"]))
         self.adapter.create_worktree(self.repo, branch,
                                      state["repo"].get("base_commit", "HEAD"), path)
+        # Persisted, because `_wave` holds these in a local dict that is gone
+        # long before the task reaches `done` -- and a reaper that cannot name
+        # what it created is a reaper that leaves everything behind.
+        def _record(st):
+            for t in st.get("subtasks") or []:
+                if t.get("id") == sub["id"]:
+                    t["worktree"] = path
+        self.task.mutate(_record)
         return path
 
     def _integrate_wave(self, wave):
@@ -1281,6 +1324,7 @@ a planner does that next, from your design.
         if decided:
             self._land()
             self.task.update(status="done")
+            self._reap_worktrees()
             return
 
         state = self.task.state
@@ -1320,10 +1364,11 @@ a planner does that next, from your design.
                 raise Halt("needs_human", "merge declined by human")
         self._land()
         self.task.update(status="done")
+        self._reap_worktrees()
 
     def _land(self):
         """attended: write the diff as a patch for the human to apply. The
-        orchestrator has no path that commits to the user's branch (§9.2)."""
+        orchestrator has no path that commits to the user's branch."""
         state = self.task.state
         wt = state.get("worktree")
         if not wt or self.dry_run:
@@ -1346,7 +1391,7 @@ a planner does that next, from your design.
 
     def _push_and_open_pr(self, branch):
         """Autonomous mode ends at an opened PR. There is deliberately no merge
-        path here (§9.2) -- the credential may even be branch-restricted."""
+        path here -- the credential may even be branch-restricted."""
         import shutil as _shutil
         push = subprocess.run(["git", "push", "-u", "origin", branch],
                               cwd=self.repo, capture_output=True, text=True)
@@ -1526,7 +1571,7 @@ a planner does that next, from your design.
         return fits[0]
 
     def _meter(self, choice):
-        """Count one invocation against the channel's window (§5.4). An
+        """Count one invocation against the channel's window. An
         estimate by construction -- no provider exposes a meter -- kept so the
         router drifts off a filling seat before it hits the wall."""
         window = quota.parse_window((choice.chan_spec.get("quota") or {}).get("window"))
@@ -1626,7 +1671,7 @@ a planner does that next, from your design.
 
     def _direct(self, role, choice, text, timeout=180, pick_as=None, cooled=()):
         """One prompt, one answer, no report file -- the text-reply roles
-        (§4.6). Shares the metering, billing and quota failover that `_invoke`
+       Shares the metering, billing and quota failover that `_invoke`
         gives every other role, which three hand-rolled copies of this dance
         did not. `pick_as` is the capability profile to re-route on, for roles
         whose name is not a profile (see `_optional`)."""
@@ -1739,7 +1784,7 @@ a planner does that next, from your design.
                         ", reopens %s" % _stamp(at) if at else ", seat not cooled"))
             # A fresh session on the new seat, in the *same* worktree: every
             # checkpoint commit is still there, so the replacement continues
-            # from the last one rather than restarting the subtask (§5.5).
+            # from the last one rather than restarting the subtask.
             # From the caller's `extra`, never from the previous hop's: on a
             # second hop, feeding the note back in appended it to a string that
             # already ended with it, and the replacement read the paragraph twice.
@@ -1898,7 +1943,7 @@ a planner does that next, from your design.
     def _collect_report(self, role, subtask, before=None):
         """Find and validate this role's report from *this* invocation.
         Liveness is not success -- an agent can settle idle having done
-        nothing (§4.6), so the report is the evidence, not the exit code.
+        nothing, so the report is the evidence, not the exit code.
 
         `before` is `_report_state()` from the start of the turn."""
         for name, data in sorted(self.task.reports().items()):

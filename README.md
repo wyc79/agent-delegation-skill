@@ -151,6 +151,12 @@ Two modes, and the difference is who answers the gates:
 branch in this codebase — checkpoint commits happen only inside throwaway
 worktrees.
 
+Worktrees live under `.adg-worktrees/<project-key>/` and are removed when the
+task reaches `done` — **only** then. A parked or crashed task keeps its
+worktree, because that is the salvage point a human resumes from and where
+`_salvage` commits an interrupted agent's work before a failover hop. The
+branch outlives the directory either way, so nothing is lost by the reaping.
+
 ## Where the state lives
 
 Agents never message each other. Everything moves through files in a task
@@ -398,8 +404,10 @@ full scope boundary, and the defect write-up.
 `DESIGN.md` — the initial design, written before any code existed — was removed
 on 2026-08-10. It described the workflow-quality thesis retired above, so keeping
 it at the root would have made the repo's most prominent document its most
-out-of-date one. Code comments still cite it by section (`DESIGN.md §5.4`); those
-resolve through git history, where the file remains.
+out-of-date one. Its reasoning either sits inline in the code it explains, or
+moved to `orchestrator/README.md`; the section citations that pointed at it were
+removed with it, because a pointer into a deleted file costs a reader a lookup
+and returns nothing.
 
 ## License
 

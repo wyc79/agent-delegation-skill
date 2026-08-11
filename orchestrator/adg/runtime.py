@@ -1,4 +1,4 @@
-"""Runtime adapters (DESIGN.md §4.6).
+"""Runtime adapters.
 
 The orchestrator never touches a runtime directly; it calls this interface.
 `local` spawns an agent CLI as a subprocess and always works. `herdr` uses
@@ -62,7 +62,7 @@ def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
 
 def classify(res, kind, now=None, text=None):
     """Attach `failure` and `reset_at` to an adapter result. One seam, so every
-    adapter answers the quota question the same way (§5.5)."""
+    adapter answers the quota question the same way."""
     probe = dict(res, output=text if text is not None else res.get("output"))
     failure, reset_at = quota.classify(
         kind, probe, now if now is not None else time.time())
@@ -140,7 +140,7 @@ class LocalAdapter(Adapter):
     # Non-interactive invocation per agent CLI. Prompt arrives on argv.
     # Permission mode: agents work inside a throwaway git worktree and hold no
     # git credentials, so the isolation boundary is the worktree, not the
-    # prompt (DESIGN.md §11). A mode that blocks running tests would make TDD
+    # prompt. A mode that blocks running tests would make TDD
     # and self-verification impossible, which is worse than useless.
     # --output-format json so the run reports what it cost. Without it
     # max_cost_usd is a limit that can never bind, which is worse than no limit
@@ -154,7 +154,7 @@ class LocalAdapter(Adapter):
     }
 
     # Some agent CLIs confine file access to the working directory. Both the
-    # task directory (DESIGN.md §4.0) and the skill directory live outside the
+    # task directory and the skill directory live outside the
     # repo, so where that confinement exists it must be lifted explicitly --
     # otherwise the agent cannot read the protocol it is being told to follow,
     # and cannot write its report.
@@ -228,7 +228,7 @@ class LocalAdapter(Adapter):
 
     def remove_worktree(self, repo, path):
         # Best-effort: engines and antivirus hold file locks on Windows, so a
-        # failure here is deferred to `worktree prune`, never forced (§4.4b).
+        # failure here is deferred to `worktree prune`, never forced (b).
         p = subprocess.run(["git", "worktree", "remove", "--force", path],
                            cwd=str(repo), capture_output=True, text=True)
         if p.returncode != 0:

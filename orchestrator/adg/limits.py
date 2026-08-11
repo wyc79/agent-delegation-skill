@@ -1,4 +1,4 @@
-"""Hard limits, enforced before the action that would consume them (§4.2).
+"""Hard limits, enforced before the action that would consume them.
 
 Fails closed by construction: a limit that is missing, unparseable, or out of
 range raises rather than defaulting to "unlimited". Agents never read or write
@@ -46,7 +46,7 @@ def validate(limits):
 
 def merge(defaults, overrides):
     """Compose downward only: a task may lower a deployment default, never
-    raise it (§5.3b). Silently ignoring an attempted raise would hide intent,
+    raise it (b). Silently ignoring an attempted raise would hide intent,
     so it is clamped and reported by the caller reading the returned notes."""
     out = dict(defaults or {})
     notes = []

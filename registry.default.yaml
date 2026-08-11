@@ -1,10 +1,10 @@
 # Default model registry — orchestrator-side config, NOT part of the skill.
 #
-# Agents never read this file. Only the router does. See DESIGN.md §5.
+# Agents never read this file. Only the router does. 
 #
 # Two things live here and they are different:
 #   * Capability scores + tier bands  -> reference data, the same for everyone.
-#     Inherit these; do not hand-tune them without evidence from §5.6 telemetry.
+#     Inherit these; do not hand-tune them without evidence from telemetry.
 #   * enrolled_roles + policy         -> yours. `delegate init` proposes them by
 #     detecting which agent CLIs are signed in; you confirm once.
 #
@@ -139,7 +139,7 @@ profiles:
 # Access channels — how models are actually reachable. Written by
 # `delegate init` from detected agent CLIs; edit if detection is wrong.
 #
-#   adapter    which runtime adapter runs it (DESIGN.md §4.6): herdr | local
+#   adapter    which runtime adapter runs it: herdr | local | mock
 #   agent_kind which agent CLI to launch — adapter-independent
 #
 # There is deliberately no `session` key. The herdr adapter starts an agent from
@@ -201,7 +201,7 @@ policy:
   # the same commit that makes the router price a slot against it.
   escalation_ceiling:
     max_tier: t2                      # ultra tier is out of the ladder's reach
-  # Deployment defaults for task.json `limits` (DESIGN.md §4.2).
+  # Deployment defaults for task.json `limits`.
   # A task may lower any of these; never raise. Missing/invalid -> fail closed.
   limits:
     max_cost_usd: 15

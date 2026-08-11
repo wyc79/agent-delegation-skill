@@ -1,4 +1,4 @@
-"""Human-facing briefs (DESIGN.md §9.4).
+"""Human-facing briefs.
 
 Humans never see raw internal artifacts. Everything at a gate is rendered into
 plain language for a competent programmer who has never seen this repo.

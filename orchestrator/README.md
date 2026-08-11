@@ -6,9 +6,9 @@ A **workflow** tells the agents it dispatches how to behave, and which workflow
 is a `--workflow` away: the bundled one in `workflows/default/` is a default,
 not the only option.
 
-**This file is what is actually built**; the `§` citations throughout point in
-git history at `DESIGN.md`, the initial design, for why a decision went the way
-it did — start at its §15.
+**This file is what is actually built**, and it is the design document: the
+reasoning for a decision lives either here or in a comment beside the code it
+explains, never in a separate spec that can drift out of step unnoticed.
 
 **`adg`** is short for *agent delegation*. It is the Python package name, and the
 prefix on everything this tool creates so it is greppable and never mistaken for
@@ -72,8 +72,8 @@ reported as a misconfiguration rather than quietly reported as "not installed".
 
 Subscription seats run out. When an agent CLI fails with its provider's
 usage-limit shape — a 429, `usage limit reached`, `RESOURCE_EXHAUSTED` — the
-orchestrator treats it as a *routing event*, not a failure (DESIGN.md §5.4,
-§5.5): it opens a cooldown on that channel, re-selects the same role on another
+orchestrator treats it as a *routing event*, not a failure: it opens a cooldown
+on that channel, re-selects the same role on another
 enrolled channel, and carries on in the same worktree, so every checkpoint
 commit the first agent made is still there.
 
@@ -114,7 +114,7 @@ silent.
 
 Utilization is **not** metered. Providers expose no counter, so the orchestrator
 counts one invocation as one unit against `quota.est_capacity` inside the
-window. That estimate drives the §5.4 shadow price — a subscription with
+window. That estimate drives the shadow price — a subscription with
 headroom costs ~0, and the same seat at 90% drawn prices itself above a metered
 key — so cost-sensitive roles drift to the emptier seat before anything hits a
 wall. `reserve_for` / `reserve_fraction` keep the declared share of a seat free
@@ -161,7 +161,8 @@ provider gave.
 - **Attended mode never commits to your branch**, and no mode merges. The
   terminal state is a patch file or a pushed branch. There is no commit path to
   the user's branch in this codebase — checkpoint commits happen only inside
-  throwaway worktrees.
+  worktrees, which are removed when the task reaches `done` and deliberately
+  kept when it parks, because a parked worktree is the salvage point.
 - **Limits fail closed.** A missing or unparseable limit parks the task rather
   than meaning "unlimited".
 - **The top model tier needs two switches**: enrollment *and* the ceiling.
@@ -222,7 +223,7 @@ should not be able to stop a run.
 
 Still absent: *live* quota metering (the draw above is estimated from invocation
 counts, not read from a provider), weekly-cap modelling, telemetry-driven
-registry recalibration, and container isolation. Rung 1 of the §6.2 ladder — "a
+registry recalibration, and container isolation. Rung 1 of the ladder — "a
 different model at the same tier" — is not built either: the router escalates by
 raising a capability floor, which has no same-tier expression. `parallel_group`
 is not read: waves are formed from `depends_on` plus disjoint write scopes and

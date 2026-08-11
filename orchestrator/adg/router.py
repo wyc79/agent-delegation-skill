@@ -1,9 +1,9 @@
-"""Deterministic capability router (DESIGN.md §5).
+"""Deterministic capability router.
 
 Pure scoring over a config file: no LLM, no network, no side effects, so a
 routing decision is reproducible and explainable after the fact.
 
-Two independent gates keep the heaviest tier out of reach (§5.3b): a model must
+Two independent gates keep the heaviest tier out of reach (b): a model must
 be *enrolled* for the role, and it must sit at or below the escalation ceiling.
 Both must pass; flipping one alone does nothing.
 """
@@ -141,7 +141,7 @@ class Router:
 
     # --- scoring ----------------------------------------------------------
     def _cost(self, spec, chan, utilization=0.0):
-        """Marginal cost (§5.4). A subscription seat with headroom is ~free, so
+        """Marginal cost. A subscription seat with headroom is ~free, so
         list price is the wrong signal for it -- but a prepaid seat is not free,
         it is *capped*, so its effective price rises with how much of the window
         is already gone:
@@ -159,7 +159,7 @@ class Router:
 
     def _reserved_out(self, chan, role, utilization):
         """Does this channel's headroom reservation exclude this role right now?
-        (§5.4: 'keep >=30% of the strong window free for planner/reviewer'.)"""
+        (: 'keep >=30% of the strong window free for planner/reviewer'.)"""
         roles = chan.get("reserve_for") or []
         raw = chan.get("reserve_fraction")
         if not roles or raw is None or role in roles:

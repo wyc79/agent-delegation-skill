@@ -1,4 +1,4 @@
-"""Deterministic verification (DESIGN.md §2.2, D5).
+"""Deterministic verification.
 
 Runs the project's own commands. No LLM: this is the ground truth every agent
 and reviewer argues from, and it runs before any review so we never pay
@@ -26,7 +26,7 @@ DEFAULT = {
 }
 
 # Build output and caches are not authored changes. Counting them produces
-# phantom scope violations and inflates churn signals (DESIGN.md §10).
+# phantom scope violations and inflates churn signals.
 ALWAYS_IGNORE = [
     "__pycache__/*", "*.pyc", "*.pyo", ".pytest_cache/*",
     "node_modules/*", "dist/*", "build/*", "target/*",
@@ -115,7 +115,7 @@ def is_ignored(path, extra=()):
 
 def changed_files(repo, cwd, base_ref, ignore=()):
     """Actual files touched, from git rather than self-report -- this is what
-    the mechanical scope check compares against the plan (§4.4). Generated
+    the mechanical scope check compares against the plan. Generated
     output is filtered out so it cannot masquerade as an authored change."""
     p = subprocess.run(["git", "diff", "--name-only", base_ref],
                        cwd=cwd, capture_output=True, text=True)
@@ -129,7 +129,7 @@ def changed_files(repo, cwd, base_ref, ignore=()):
 def scope_violations(files, allowed_globs, case_insensitive=None):
     """Files outside every declared scope. Case-insensitive on Windows and
     macOS, where Foo.cs and foo.cs are one file and a case-sensitive compare
-    would silently grant two agents write access to it (§4.4b)."""
+    would silently grant two agents write access to it (b)."""
     import fnmatch
     import sys
     if case_insensitive is None:

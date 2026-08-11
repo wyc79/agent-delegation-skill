@@ -1,4 +1,4 @@
-"""Detect installed companion skills (DESIGN.md §3.2, references/companions.md).
+"""Detect installed companion skills.
 
 Declared, not discovered: the orchestrator looks once and writes the result into
 task.json, so agents never spend a turn hunting the filesystem. Absent

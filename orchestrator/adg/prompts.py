@@ -1,4 +1,4 @@
-"""Prompt composition (DESIGN.md §3.2).
+"""Prompt composition.
 
 The orchestrator injects *only* dynamic facts: which role, which task
 directory, which scope, which budget. The protocol itself is the skill, which

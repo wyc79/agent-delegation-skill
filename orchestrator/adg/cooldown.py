@@ -1,4 +1,4 @@
-"""Per-channel circuit breakers and the invocation meter (DESIGN.md §5.4, §5.5).
+"""Per-channel circuit breakers and the invocation meter.
 
 State lives in `$XDG_STATE_HOME/agent-delegation/channels.json`, beside
 `projects/` rather than inside one: a quota belongs to a *seat*, not to a

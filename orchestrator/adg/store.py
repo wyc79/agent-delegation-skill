@@ -1,4 +1,4 @@
-"""Task state living outside the repository (DESIGN.md §4).
+"""Task state living outside the repository.
 
 Nothing here ever writes into the working tree. The project key is derived from
 the git *common* directory, which is identical for a main checkout and all of

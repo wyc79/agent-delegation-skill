@@ -1,4 +1,4 @@
-"""Tests for quota-aware provider failover (DESIGN.md §5.4, §5.5).
+"""Tests for quota-aware provider failover.
 
 Every clock is injected and every provider is a mock: this suite must never
 sleep, never reach the network, and never need a vendor CLI on PATH.
@@ -148,7 +148,7 @@ class TestWindowAndCapacityParsing(unittest.TestCase):
         self.assertEqual(quota.parse_window("30m"), 30 * 60)
 
     def test_capacity_tolerates_the_units_design_md_uses(self):
-        # DESIGN.md §5.4 writes these as `40u` and `500req`.
+        # writes these as `40u` and `500req`.
         self.assertEqual(quota.parse_capacity(40), 40.0)
         self.assertEqual(quota.parse_capacity("40u"), 40.0)
         self.assertEqual(quota.parse_capacity("500req"), 500.0)
@@ -339,7 +339,7 @@ class TestRouterCooldowns(unittest.TestCase):
 
 
 class TestShadowPrice(unittest.TestCase):
-    """§5.4: a subscription seat with headroom is ~free; as its window fills it
+    """: a subscription seat with headroom is ~free; as its window fills it
     prices itself above a metered key."""
 
     def setUp(self):
@@ -1076,7 +1076,7 @@ class TestFailoverEndToEnd(unittest.TestCase):
                          "the wave path lost the park record: %s" % "\n".join(logs))
 
     def test_the_replacement_inherits_a_commit_not_a_dirty_tree(self):
-        """§5.5: the replacement resumes from a *checkpoint*.
+        """: the replacement resumes from a *checkpoint*.
 
         The old version of this asserted only that `partial.py` still existed,
         which the same worktree path guarantees whether or not anything was ever

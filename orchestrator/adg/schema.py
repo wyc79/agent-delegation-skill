@@ -1,4 +1,4 @@
-"""Just enough JSON Schema to validate agent reports (§3.4).
+"""Just enough JSON Schema to validate agent reports.
 
 Covers the keywords the skill's schemas actually use: type, required,
 properties, additionalProperties, enum, items, pattern, minLength, minItems.
