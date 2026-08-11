@@ -2682,6 +2682,65 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn(("merge", "declined"), states,
                       "the rejection left no trace: %s" % states)
 
+    def test_a_gate_with_nobody_to_ask_parks_instead_of_declining(self):
+        """`no tty` is not `no`.
+
+        The old `_confirm` caught EOFError and returned False, which wrote a
+        rejection no human made into the one record that exists to count what
+        humans decided. It also makes the CLI unusable as a bridge: the caller
+        is now the user's own agent shelling out, and an agent has no tty
+        either, so every gate of every run would auto-decline.
+        """
+        from adg.machine import AwaitingApproval
+        script, _ = self._script()
+
+        def no_human(kind, text):
+            raise AwaitingApproval(kind, text, resume_status=None)
+
+        status, task, _, _ = self._run(script, gate=no_human)
+        self.assertEqual(status, "awaiting_approval",
+                         "a question with nobody to answer it is not a failure")
+        self.assertNotIn("declined", [g["state"] for g in task.state["gates"]],
+                         "recorded a rejection nobody made")
+        pend = task.state.get("pending_gate") or {}
+        self.assertTrue(pend.get("brief"), "parked without keeping the question")
+        self.assertTrue(pend.get("resume_status"),
+                        "parked without recording where to continue -- the "
+                        "caller knows the pipeline, the gate does not")
+
+    def test_an_answered_gate_is_not_asked_again_on_resume(self):
+        """`resume_status` has to land past the question, not on it.
+
+        The design and plan gates sit at the END of their stage, so resuming
+        the stage that asked would re-run the planner and re-author the tests
+        to put a question that has already been answered.
+        """
+        from adg.machine import AwaitingApproval
+        script, _ = self._script()
+        asked = []
+
+        def park(kind, text):
+            asked.append(kind)
+            raise AwaitingApproval(kind, text, resume_status=None)
+
+        status, task, _, _ = self._run(script, gate=park)
+        self.assertEqual(status, "awaiting_approval")
+        first, pend = asked[0], task.state["pending_gate"]
+
+        # the state `delegate approve` leaves behind
+        task.update(pending_gate=dict(pend, decision="approved", note="ship it"),
+                    status=pend["resume_status"])
+        Orchestrator(task, self.reg, runtime.MockAdapter(script), park,
+                     log=lambda *_: None).run()
+
+        self.assertEqual(asked.count(first), 1,
+                         "re-asked the %s gate after it was answered" % first)
+        # It parks again, at the NEXT gate -- which is the run making progress,
+        # not the answer being ignored. A run with more than one gate cannot end
+        # with an empty `pending_gate` while a human is still being asked things.
+        self.assertNotEqual((task.state.get("pending_gate") or {}).get("kind"), first,
+                            "still parked on the gate that was already answered")
+
     def test_unparseable_plan_parks_rather_than_guessing(self):
         script, _ = self._script()
         script["planner"] = lambda env, cwd: _spit(

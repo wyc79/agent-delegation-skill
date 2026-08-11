@@ -97,6 +97,38 @@ class Halt(Exception):
         self.status = status
 
 
+class AwaitingApproval(Exception):
+    """A gate has nobody to ask right now, so the task parks holding the
+    question rather than answering it.
+
+    Distinct from a decline, and the distinction is the whole point. `_confirm`
+    used to hit `EOFError` with no tty, print "declining", and return False --
+    which recorded a rejection the human never made and killed the run. That was
+    tolerable while `delegate` was driven by a person at a terminal. It is fatal
+    once the caller is the user's own agent shelling out, because an agent has
+    no tty either: every gate would auto-decline.
+
+    Parking instead turns the gate from a prompt into a return value. The CLI
+    exits holding the brief and the question, the user's agent renders it in
+    whatever way reads well, the human answers in prose, and `delegate approve
+    --note "..."` / `reject --note "..."` writes the decision back. The note
+    then flows into the next stage's prompt, which is strictly more than y/N
+    ever carried.
+
+    `resume_status` is where the run continues once approved, and it is not
+    always the stage that asked: the design and plan gates sit at the END of
+    their stage, so re-entering it would re-run the planner and re-author the
+    tests for a question that has already been answered. The merge gate is
+    mid-stage -- `_land()` follows it -- so that one does re-enter, and
+    `_stage_integrate` consumes the recorded decision before building a brief
+    it no longer needs.
+    """
+
+    def __init__(self, kind, brief, resume_status):
+        super().__init__("awaiting approval at the %s gate" % kind)
+        self.kind, self.brief, self.resume_status = kind, brief, resume_status
+
+
 class Replan(Exception):
     """Rung 3 (§6.2): the model ladder is spent, so the plan is the suspect.
 
@@ -153,6 +185,18 @@ class Orchestrator:
                     # run at the plan stage, and catching it out there would end
                     # the run instead -- the very thing this rung exists to stop.
                     self._rung3(r)
+        except AwaitingApproval as a:
+            # Not a Halt: `needs_human` means the run is over and something is
+            # wrong, and a question waiting to be answered is neither. Keeping
+            # them apart is what lets `delegate status` say "waiting on you"
+            # instead of "broken", and what stops `resume` from restarting at
+            # `implement` the way it does for a genuine park.
+            self.task.update(status="awaiting_approval",
+                             pending_gate={"kind": a.kind, "brief": a.brief,
+                                           "resume_status": a.resume_status,
+                                           "at": self.clock()})
+            self.log("\n== AWAITING APPROVAL: %s gate" % a.kind)
+            return "awaiting_approval"
         except routing.AllChannelsCooled as q:
             # Ahead of the generic handler: this is not a crash and not a
             # registry mistake, and reporting it as either sends the reader to
@@ -380,7 +424,7 @@ a planner does that next, from your design.
             return
         self._gate("design", "Approve this design before a plan is written from it? "
                              "Answer any open questions below, or accept the "
-                             "defaults by approving.")
+                             "defaults by approving.", resume_status="plan")
         self.task.update(status="plan")
 
     def _stage_plan(self):
@@ -419,7 +463,7 @@ a planner does that next, from your design.
         self._author_tests(subtasks)
         if self.budget.requires_approval("plan"):
             self._gate("plan", "Approve this plan? It splits the work into %d step(s)."
-                       % len(subtasks))
+                       % len(subtasks), resume_status="implement")
         self.task.update(status="implement")
 
     def _author_tests(self, subtasks):
@@ -1124,6 +1168,18 @@ a planner does that next, from your design.
         self.task.mutate(reopen)
 
     def _stage_integrate(self):
+        # Before anything expensive. Unlike the other two gates this one sits
+        # MID-stage -- `_land()` follows it -- so an approved run re-enters here,
+        # and re-entry must not re-run the verification or rebuild a brief
+        # through `_polish` to ask a question that is already answered.
+        decided = self._decision_already_made("merge")
+        if decided is False:
+            raise Halt("needs_human", "merge declined by human")
+        if decided:
+            self._land()
+            self.task.update(status="done")
+            return
+
         state = self.task.state
         files = sorted({f for s in state["subtasks"] for f in s.get("actual_files", [])})
         result = verify.run(self.task, self.repo, self._ensure_worktree(), "fast")
@@ -1151,7 +1207,11 @@ a planner does that next, from your design.
             # never used: the merge gate carries a brief the others do not. Both
             # outcomes are written, so `gates` is a complete account of what a
             # human decided rather than a list of the times they said yes.
-            approved = self.gate("merge", text)
+            try:
+                approved = self.gate("merge", text)
+            except AwaitingApproval as a:
+                a.resume_status = "integrate"
+                raise
             self.task.record_gate("merge", "approved" if approved else "declined")
             if not approved:
                 raise Halt("needs_human", "merge declined by human")
@@ -1696,7 +1756,36 @@ Rules:
             return text
         return out
 
-    def _gate(self, kind, question):
+    def _decision_already_made(self, kind):
+        """Consume a decision written by `delegate approve` / `reject`.
+
+        True, False, or None when nobody has answered yet. Consumed *before* any
+        brief is built, which is what keeps re-entry cheap: a brief goes through
+        `_polish`, an LLM call, and rebuilding one to ask a question that has
+        already been answered would spend a model call on nothing.
+
+        The decision is NOT written to the gate history here. `delegate
+        approve` already wrote it, at the moment the human actually made it --
+        and that has to be the single recording site, because the design and
+        plan gates resume *past* the stage that asked, so this method is never
+        reached for them and an approval recorded only here would vanish. Which
+        it did, until a test asked where it went.
+        """
+        pend = self.task.state.get("pending_gate") or {}
+        if pend.get("kind") != kind or not pend.get("decision"):
+            return None
+        decision, note = pend["decision"], pend.get("note", "")
+        self.task.update(pending_gate=None)
+        self.log("gate %s: %s (answered out of band)%s"
+                 % (kind, decision, " — %s" % note if note else ""))
+        return decision == "approved"
+
+    def _gate(self, kind, question, resume_status):
+        decided = self._decision_already_made(kind)
+        if decided is not None:
+            if decided:
+                return
+            raise Halt("needs_human", "%s declined by human" % kind)
         files = sorted({f for s in self.task.state["subtasks"] for f in s.get("actual_files", [])})
         extra = None
         if kind == "design":
@@ -1705,7 +1794,15 @@ Rules:
                                      extra=extra, polish=self._polish)
         for p in problems:
             self.log("  brief lint: %s" % p)
-        if not self.gate(kind, text):
+        try:
+            approved = self.gate(kind, text)
+        except AwaitingApproval as a:
+            # The injected gate keeps its `(kind, text) -> bool` signature: it
+            # knows how to reach a human and nothing about the pipeline, so it
+            # cannot know where the run continues afterwards. The caller does.
+            a.resume_status = resume_status
+            raise
+        if not approved:
             # Recorded before the raise. A decline is the most informative thing
             # a human does to a run -- it is the one place the machine was about
             # to be wrong -- and logging only approvals left every rejection

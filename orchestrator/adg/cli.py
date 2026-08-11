@@ -35,8 +35,20 @@ def _confirm(kind, text):
     try:
         return input("Approve %s? [y/N] " % kind).strip().lower() in ("y", "yes")
     except EOFError:
-        print("(no tty — declining; re-run interactively to approve)")
-        return False
+        # Park, never decline. There is a real difference between "the human
+        # said no" and "there was no human to ask", and recording the first when
+        # the second happened puts a rejection nobody made into the permanent
+        # gate history -- the one record that exists to count what humans
+        # actually decided.
+        #
+        # It is also what makes the CLI usable as a bridge. The caller is now
+        # expected to be the user's own agent shelling out, and an agent has no
+        # tty either, so declining here would auto-reject every gate of every
+        # run. Parking hands the question back instead: `delegate show` prints
+        # it, the agent puts it to the user in prose, and `delegate approve` /
+        # `reject` answers it -- with a note, which y/N never carried.
+        from .machine import AwaitingApproval
+        raise AwaitingApproval(kind, text, resume_status=None)
 
 
 def _new_id(repo):
@@ -228,6 +240,58 @@ def _default_adapter(reg):
     return "local"
 
 
+def cmd_approve(args):
+    """Answer a gate that parked, then carry on.
+
+    This is the other half of turning a gate from a prompt into a return value.
+    `run` exits holding the question; the user's agent shows it to the human in
+    whatever form reads well; this writes the answer back and continues.
+
+    The decision is written to `pending_gate` rather than straight to the gate
+    history because the machine has to *consume* it -- that is what lets an
+    approved run skip past a question already answered instead of asking it
+    again, and it is why `--note` survives into the record either way.
+    """
+    repo = _repo(args.repo)
+    task = store.Task.open(repo, args.id)
+    pend = task.state.get("pending_gate") or {}
+    if not pend.get("kind"):
+        sys.exit("task %s is not waiting on a gate (status: %s)"
+                 % (task.state["id"], task.state["status"]))
+    if pend.get("decision"):
+        sys.exit("the %s gate was already answered %r" % (pend["kind"], pend["decision"]))
+
+    decision = "approved" if args.decision == "approve" else "declined"
+    # Recorded HERE, and only here. This is the moment the human decided, and
+    # it is the only site every gate passes through: the design and plan gates
+    # resume past the stage that asked them, so a machine-side recording would
+    # silently lose those approvals entirely.
+    task.record_gate(pend["kind"], decision, args.note)
+    task.update(pending_gate=dict(pend, decision=decision, note=args.note))
+    print("%s gate: %s%s" % (pend["kind"], decision,
+                             " — %s" % args.note if args.note else ""))
+    if decision == "declined":
+        # A decline ends the run by definition, so there is nothing to continue
+        # into. The machine still consumes the pending decision on the next
+        # resume, which is what puts it in the gate history.
+        task.update(status="needs_human")
+        print("task parked at needs_human; `delegate resume --stage <stage>` to redirect")
+        return 0
+    if args.no_continue:
+        print("recorded; not resuming (--no-continue)")
+        return 0
+
+    resume_at = pend.get("resume_status")
+    if not resume_at:
+        sys.exit("the parked gate recorded no resume point; "
+                 "use `delegate resume --stage <stage>`")
+    task.update(status=resume_at)
+    return cmd_resume(argparse.Namespace(
+        repo=args.repo, registry=args.registry, id=args.id, stage=None,
+        adapter=args.adapter, no_panes=args.no_panes, dry_run=args.dry_run,
+        yes=False, when_open=False))
+
+
 def cmd_resume(args):
     repo = _repo(args.repo)
     reg = routing.load_registry(args.registry)
@@ -339,6 +403,20 @@ def main(argv=None):
                     help="if the task is waiting on a quota window, sleep here "
                          "until it reopens and then resume")
     rs.set_defaults(func=cmd_resume)
+
+    for name, helptext in (("approve", "answer a waiting gate with yes"),
+                           ("reject", "answer a waiting gate with no")):
+        g = sub.add_parser(name, help=helptext)
+        g.add_argument("--id")
+        g.add_argument("--note", default="",
+                       help="what the human actually said; carried into the "
+                            "gate record and, on approval, into the run")
+        g.add_argument("--adapter", choices=["herdr", "local", "mock"])
+        g.add_argument("--no-panes", action="store_true")
+        g.add_argument("--dry-run", action="store_true")
+        g.add_argument("--no-continue", action="store_true",
+                       help="record the decision without resuming the run")
+        g.set_defaults(func=cmd_approve, decision=name)
 
     st = sub.add_parser("status", help="list tasks for this project")
     st.set_defaults(func=cmd_status)
