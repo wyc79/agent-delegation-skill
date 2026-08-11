@@ -26,7 +26,7 @@ that path would show up in `git status`, in the diff, and in the PR.
 - **Do not edit `.gitignore`.** Adding an entry is a change to the project, it
   lands in the diff, and it is exactly the pollution this convention prevents.
   If the repo has no suitable ignored location, raise it as a `blocked_command`
-  signal and stop. That signal stops the run for a human, who can add an entry
+  signal and stop. That stops the run for whoever dispatched you, who can add an entry
   to `.git/info/exclude` — uncommitted, and shared by every worktree. Nothing
   in the orchestrator does it for you, so do not stop expecting it to be fixed
   underneath you.
@@ -42,7 +42,7 @@ Prefer, in order:
 1. A scratch subdirectory the project already ignores for this purpose (many
    repos ignore `tmp/`, `scratch/`, `.cache/`, or `*.local.*`).
 2. A path the orchestrator gave you explicitly in your prompt.
-3. Nothing — escalate instead.
+3. Nothing — stop and report instead.
 
 Whatever you choose, treat it as **ephemeral**: assume it can vanish between
 sessions. `git clean -xdf`, a fresh worktree, or a tool's own cleanup will

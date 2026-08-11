@@ -110,7 +110,14 @@ class Task:
         task.write_json("task.json", {
             "id": task_id,
             "mode": mode,
-            "status": "intake",
+            # The graph's first stage. Spelled here rather than imported
+            # because `machine` imports this module, not the other way round --
+            # and asserted by a test, so the two cannot drift apart silently.
+            # It used to be "intake", which stopped being a stage: a task
+            # created at a status the graph does not contain has no position in
+            # it, so `next_enabled` correctly reported no next stage and the run
+            # went straight to `done` having done nothing.
+            "status": "implement",
             "project_key": project_key(repo),
             "repo": {"path": os.path.abspath(repo), "common_dir": common_dir(repo)},
             "limits": limits,

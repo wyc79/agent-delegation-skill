@@ -53,7 +53,7 @@ stages:
 
   implement:
     role: implementer
-    card: roles/implementer.md
+    card: roles/worker.md
 
   # Kept: this is the stage that merges the branches and writes the patch.
   # Disabling it would end the run with the work stranded on subtask branches.
