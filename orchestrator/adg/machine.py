@@ -50,26 +50,6 @@ TERMINAL = {"done", "abandoned", "needs_human"}
 # patch.
 IDENTITY = ["-c", "user.email=orchestrator@agent-delegation", "-c", "user.name=adg"]
 
-# , signal -> the rung the ladder enters at. Only agent-raised
-# signals reach this table; the counter-driven ones are read off verify.
-#
-# `low_confidence` is deliberately absent rather than mapped high. D4 makes it a
-# tiebreaker, so on its own it carries no routing information -- and an absent
-# key falls through to "nothing to route on", which is the honest answer.
-# `merge_conflict_cross` is the Integrator's signal; arriving from an
-# implementer it means something the implementer cannot fix either.
-ENTRY_RUNG = {
-    "test_stuck": 2,            # more capability on the same understanding
-    "edit_churn": 2,
-    "scope_overrun": 2,
-    "plan_conflict": 3,         # a stronger implementer cannot fix a wrong plan
-    "ambiguous_requirement": 3, # the planner owns it; rung 4 is reached by
-                                # exhausting rung 3, never by skipping it
-    "blocked_command": 4,       # no model and no plan lifts a sandbox refusal
-    "missing_dependency": 4,    # ... or installs a package
-    "merge_conflict_cross": 4,
-}
-
 class Halt(Exception):
     """Stop cleanly and leave the task resumable."""
 
@@ -542,18 +522,16 @@ admits only one sensible reading.
                 raise Halt("needs_human", "%s reported blocked: %s" % (
                     sub["id"], (report or {}).get("summary", "")[:200]))
             if claimed == "escalate":
-                rung, signals = self._entry_rung(report)
-                named = ", ".join(s.get("type", "?") for s in signals)
-                if rung >= 4:
-                    raise Halt("needs_human", "%s reported escalate (%s): %s" % (
-                        sub["id"], named or "no signal to route on",
-                        (report or {}).get("summary", "")[:200]))
-                self.log("  %s: escalate on %s — entering the ladder at rung %d"
-                         % (sub["id"], named, rung))
-                role_choice, attempts, session = self._climb(
-                    sub, rung, role_choice, attempts, result, report, session, signals)
-                failure = self._signal_context(signals)
-                continue
+                # Handed straight back, with the signals intact. This used to
+                # enter a ladder -- a stronger model, then a re-plan -- which is
+                # the caller's decision and one it already makes:
+                # `superpowers:subagent-driven-development` assesses a BLOCKED
+                # report and is explicit that you must "never ignore an
+                # escalation or force the same model to retry without changes".
+                # A wrapper that runs its own ladder is competing with the
+                # skill that called it, and doing it with less context.
+                self._close(session)
+                raise Halt("needs_human", self._escalated(sub, report))
             if result.ok and not sub.get("actual_files") and not self._touched(base, sub):
                 # Only for a subtask that has never produced anything. Now that
                 # the diff base follows the tree, a rework round that changes
@@ -571,16 +549,43 @@ admits only one sensible reading.
                 self._close(session)
                 self._checkpoint(base, ("adg %s: %s" % (sub["id"], sub.get("goal", "")))[:72])
                 break
+            # Retried on the same seat, with what broke. Bounded by
+            # `max_attempts_per_subtask`, which the caller sets: the checks are
+            # the caller's, so how many times to re-run them is the caller's
+            # too. What does NOT happen is a climb to a dearer model -- that is
+            # a judgement about the work, and the caller owns it.
             failure = "\n".join(
                 "$ %s\n%s" % (f["cmd"], f["output"][-1500:]) for f in result.failures())
-            # Signal: test_stuck. Escalate one rung rather than letting the
-            # same model try the same idea a fourth time.
-            threshold = int((self.reg["policy"].get("escalation_thresholds") or {})
-                            .get("test_stuck_attempts", 3))
-            if attempts >= threshold:
-                role_choice, attempts, session = self._climb(
-                    sub, 2, role_choice, attempts, result, report, session)
         self._finish_subtask(sub, base)
+
+    @staticmethod
+    def _escalated(sub, report):
+        """The agent's own account of being stuck, passed through whole.
+
+        Signals survive the cut that removed the ladder. They stopped being
+        something this program routes on and went back to being what the schema
+        always called them -- evidence -- because the caller is the one that can
+        act: it wrote the decomposition, it knows what else is in flight, and
+        `superpowers:subagent-driven-development` already has the procedure for
+        assessing a BLOCKED report. Summarising them away here would leave that
+        procedure with nothing to read.
+        """
+        signals = [x for x in ((report or {}).get("signals") or [])
+                   if isinstance(x, dict)]
+        named = ", ".join(x.get("type", "?") for x in signals)
+        out = ["%s stopped and asked for help%s"
+               % (sub["id"], " (%s)" % named if named else "")]
+        summary = (report or {}).get("summary", "").strip()
+        if summary:
+            out.append(summary[:300])
+        for x in signals:
+            detail = (x.get("detail") or "").strip()
+            if detail:
+                out.append("%s: %s" % (x.get("type", "?"), detail[:200]))
+            for a in (x.get("attempted") or [])[:6]:
+                out.append("  already tried: %s" % str(a)[:120])
+        out.append("Its worktree and checkpoints are left in place.")
+        return " | ".join(out)
 
     def _pick_implementer(self, sub):
         """The implementer for one subtask, raised by its `capability_hint`.
@@ -610,102 +615,6 @@ admits only one sensible reading.
                      "running on %s (%s)"
                      % (sub["id"], sub.get("capability_hint"), choice.model, e))
             return choice
-
-    def _entry_rung(self, report):
-        """Which rung an agent's own `escalate` enters at, and the signals that
-        decided it.
-
-        **Highest rung wins.** An agent reporting `test_stuck` *and*
-        `missing_dependency` needs the human; climbing to a stronger model first
-        spends a seat on a package that is still not installed.
-
-        **No routable signal is rung 4, deliberately.** `escalate` means "a
-        stronger model, a re-plan, or a human" and the signals are what say
-        which. With nothing to read, the orchestrator cannot pick on the agent's
-        behalf, and guessing spends real money on a guess. This is also what
-        keeps D4 honest: `low_confidence` is not in ENTRY_RUNG, so a report
-        carrying only that lands here rather than escalating on a feeling."""
-        signals = [s for s in ((report or {}).get("signals") or [])
-                   if isinstance(s, dict)]
-        routable = [s for s in signals if s.get("type") in ENTRY_RUNG]
-        if not routable:
-            return 4, signals
-        return max(ENTRY_RUNG[s["type"]] for s in routable), routable
-
-    def _climb(self, sub, rung, role_choice, attempts, result, report, session,
-               signals=None):
-        """One ladder for both entrances: the counter that fires `test_stuck`
-        off verify, and an agent that reports the same thing itself. They differ
-        in what noticed, never in where the ladder goes.
-
-        Returns the next (choice, attempts, session), or halts when the ladder
-        is spent.
-
-        The ladder ends here now. Rung 3 was "the plan is the suspect, send it
-        back to the planner" -- and there is no planner: the caller wrote the
-        decomposition and is the only thing that can revise it. Halting names
-        that plainly instead of a run that quietly rebuilds work nobody asked
-        for. `_write_escalation_bundle` went with it; the evidence a caller
-        needs is the halt message, its subtask id, and the checkpoints left in
-        the worktree, which is not reaped on a park."""
-        if rung <= 2:
-            _, cooled, util, _ = self._channel_state()
-            stronger = self.router.escalate("implementer", role_choice,
-                                            ceiling=self.budget.ceiling(),
-                                            cooldowns=cooled, utilization=util)
-            if stronger is not None:
-                # Naming the new slot alone overstated this. Registry model
-                # names are capability slots, and the runtime launches a CLI by
-                # agent kind without pinning a model (runtime.LAUNCH), so
-                # escalating within one agent kind changes the bookkeeping and
-                # the session -- not the model that actually runs. Say which
-                # happened: on a single-seat deployment it is always the latter,
-                # and "escalating to <stronger model>" promised a heavier read
-                # that nothing delivered.
-                self.log("  escalating to %s via %s — %s"
-                         % (stronger.model, stronger.channel,
-                            "a different agent"
-                            if stronger.agent_kind != role_choice.agent_kind else
-                            "same agent kind, so this is a fresh session rather "
-                            "than a heavier model"))
-                # A stronger model starts clean: the point of escalating is a
-                # different approach, not more of the same context. This half
-                # happens either way, and is what makes the rung worth taking
-                # when the model cannot change.
-                self._close(session)
-                return stronger, 0, None
-            why = ("%s still failing after %d attempts and nothing stronger is "
-                   "enrolled within the ceiling" % (sub["id"], attempts))
-        else:
-            why = ("%s raised %s, which no stronger worker can fix"
-                   % (sub["id"], ", ".join(s.get("type", "?")
-                                           for s in (signals or []))))
-        self._close(session)
-        # Its worktree stays: `_reap_worktrees` only runs on `done`, so the
-        # checkpoints this agent committed are what the caller picks up from.
-        raise Halt("needs_human",
-                   "%s — the decomposition is the suspect now, and only the "
-                   "caller that wrote it can revise it. Its worktree is left "
-                   "in place." % why)
-
-    @staticmethod
-    def _signal_context(signals):
-        """What the replacement agent is told, so `attempted` stops being
-        decoration: the next model is stronger, not clairvoyant
-        (references/escalation.md)."""
-        out = []
-        for s in signals or []:
-            out.append("The previous agent raised %s: %s"
-                       % (s.get("type", "?"), (s.get("detail") or "").strip()))
-            ev = (s.get("evidence") or "").strip()
-            if ev:
-                out.append(ev[:800])
-            for a in (s.get("attempted") or [])[:6]:
-                out.append("Already tried, and it failed: %s" % str(a)[:200])
-            sug = (s.get("suggestion") or "").strip()
-            if sug:
-                out.append("Its suggestion, which is not binding on you: %s" % sug[:400])
-        return "\n".join(out) or None
 
     def _run_wave(self, wave):
         """Each subtask in its own worktree, concurrently, then merged in
@@ -1469,65 +1378,6 @@ admits only one sensible reading.
         self._close(session)
         return report
 
-    def _optional(self, role, text, timeout=180, pick_as=None):
-        """A text-reply role whose absence is survivable -> the result, or None.
-
-        `pick_as` is the *capability profile* to route on when it differs from
-        the agent's role name: intake is a classifier-tier job that the agent
-        still runs as "intake", and only profiles named in the registry can be
-        routed.
-
-        Selection and invocation are guarded together on purpose. A seat that is
-        already cooled and a seat that goes dark mid-call are the same fact to
-        these callers, and guarding only the pick meant the second one escaped
-        as a quota park -- parking a finished task because its brief could not
-        be prettified."""
-        try:
-            choice = self._pick(pick_as or role)
-            return self._direct(role, choice, text, timeout, pick_as=pick_as)
-        except routing.NoModelAvailable as e:
-            self.log("  %s: skipped — %s" % (role, e))
-            return None
-
-    def _direct(self, role, choice, text, timeout=180, pick_as=None, cooled=()):
-        """One prompt, one answer, no report file -- the text-reply roles
-       Shares the metering, billing and quota failover that `_invoke`
-        gives every other role, which three hand-rolled copies of this dance
-        did not. `pick_as` is the capability profile to re-route on, for roles
-        whose name is not a profile (see `_optional`)."""
-        session = self.adapter.start_agent(role, choice.agent_kind, self.repo,
-                                           prompts.env_for(self.task, role))
-        try:
-            res = self.adapter.prompt(session, text, timeout=timeout)
-        finally:
-            self._close(session)
-        reason = res.get("failure")
-        if reason in self.HOPS_TO_ANOTHER_SEAT:
-            at = self._cool(choice, res) if reason in self.OPENS_THE_BREAKER else None
-            # Accumulated, exactly as `_invoke` does: if the breaker could not be
-            # written -- an unwritable state dir, or a concurrent `--clear` --
-            # excluding only the last seat lets this bounce A->B->A->B through
-            # real, billed invocations until the stack runs out. That reasoning
-            # binds harder for a timeout, which never writes a breaker at all,
-            # so this list is the ONLY thing stopping the bounce.
-            cooled = tuple(cooled) + (choice.channel,)
-            nxt = self._pick(pick_as or role, exclude=cooled)
-            self.log("failover: %s %s -> %s (%s%s)"
-                     % (role, choice.channel, nxt.channel, reason,
-                        ", reopens %s" % _stamp(at) if at else ", seat not cooled"))
-            return self._direct(role, nxt, text, timeout, pick_as=pick_as,
-                                cooled=cooled)
-        self._meter(choice)
-        self._bill(res, choice)
-        # Who actually ran it. After a failover that is not the channel the
-        # caller picked, and the delegation record must name the one that did.
-        res["model"], res["channel"] = choice.model, choice.channel
-        return res
-
-    # A quota wall is the seat's fault, not the approach's, so the hop happens
-    # here rather than in the callers: the failed invocation never returns, so
-    # no caller can bill it against an attempt budget, and every role -- not
-    # just the implementer -- gets failover for free.
     def _invoke(self, role, choice, cwd, subtask=None, extra=None,
                 session=None, failure=None):
         """Run one turn. With `session`, it continues that agent instead of
@@ -1547,7 +1397,7 @@ admits only one sensible reading.
             before = self._report_state()
             if session is None:
                 text = prompts.compose(role, self.task, subtask=subtask,
-                                       extra=self._with_failure(extra, failure),
+                                       extra=extra,
                                        verify_cfg=self.vcfg)
                 session = self.adapter.start_agent(role, choice.agent_kind, cwd,
                                                    prompts.env_for(self.task, role))
@@ -1683,36 +1533,6 @@ admits only one sensible reading.
             self.log("  salvaged %s's uncommitted work as a checkpoint" % label)
             return True
         return False
-
-    @staticmethod
-    def _with_failure(extra, failure):
-        """What a *fresh* agent is told about the attempt it is replacing.
-
-        A retry keeps its session, so `prompts.retry` carries the failure into
-        the follow-up turn. An escalation does not, and cannot: `_climb` returns
-        `session = None` by construction, because the whole point is a different
-        model. So the one path that most needs the context was the one path that
-        dropped it -- `_one_subtask` built `failure` (the signals, the evidence,
-        and the `attempted` list from `_signal_context`, or the failing check
-        output on a `test_stuck` climb), passed it to `_invoke`, and `_invoke`
-        read it only when continuing a session or handing over on a quota hop.
-        The stronger, dearer model opened on the plain role prompt and re-tried
-        what its predecessor had already reported as failed.
-        references/escalation.md: `attempted` prevents repetition, and the next
-        model is smarter, not clairvoyant.
-
-        Appended to the caller's `extra` rather than replacing it: that is the
-        findings brief, and a rework that loses its findings is the failure the
-        hand-off exists to stop.
-        """
-        if not failure:
-            return extra
-        note = ("The previous attempt on this did not succeed, and you are the "
-                "replacement. Read this before you touch anything, then "
-                "continue from the checkpoints already committed in this "
-                "worktree — do not start over, and do not repeat what is listed "
-                "as already tried:\n\n%s" % failure)
-        return "%s\n\n%s" % (extra, note) if extra else note
 
     def _handover(self, extra, failure):
         """What the replacement agent is told. It inherits a worktree holding the
