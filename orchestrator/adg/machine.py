@@ -1371,6 +1371,21 @@ a planner does that next, from your design.
                  % (choice.channel, spec.get("window") or "default 5h"))
         return self.clock() + window
 
+    # Two decisions, not one. Fusing them meant the only failure that could move
+    # work to another seat was also the only failure that took a seat out of
+    # service for five hours -- so a hung call had to either do both or do
+    # nothing, and it did nothing.
+    #
+    #   quota_exhausted -> hop AND cool: the seat said it is out.
+    #   timeout         -> hop, never cool: this call did not come back; the
+    #                      seat is probably fine and cooling it on that evidence
+    #                      hides a working provider for the afternoon.
+    #   anything else   -> neither. An ordinary crash consumes an attempt. A
+    #                      failover that fires on any error is worse than none,
+    #                      because it hides real bugs behind provider hops.
+    HOPS_TO_ANOTHER_SEAT = frozenset({"quota_exhausted", "timeout"})
+    OPENS_THE_BREAKER = frozenset({"quota_exhausted"})
+
     def _cool(self, choice, res):
         """Open the breaker for a channel that just said it is out."""
         at = self._reopen_at(choice, res)
@@ -1448,16 +1463,20 @@ a planner does that next, from your design.
             res = self.adapter.prompt(session, text, timeout=timeout)
         finally:
             self._close(session)
-        if res.get("failure") == "quota_exhausted":
-            at = self._cool(choice, res)
+        reason = res.get("failure")
+        if reason in self.HOPS_TO_ANOTHER_SEAT:
+            at = self._cool(choice, res) if reason in self.OPENS_THE_BREAKER else None
             # Accumulated, exactly as `_invoke` does: if the breaker could not be
             # written -- an unwritable state dir, or a concurrent `--clear` --
             # excluding only the last seat lets this bounce A->B->A->B through
-            # real, billed invocations until the stack runs out.
+            # real, billed invocations until the stack runs out. That reasoning
+            # binds harder for a timeout, which never writes a breaker at all,
+            # so this list is the ONLY thing stopping the bounce.
             cooled = tuple(cooled) + (choice.channel,)
             nxt = self._pick(pick_as or role, exclude=cooled)
-            self.log("failover: %s %s -> %s (quota, reopens %s)"
-                     % (role, choice.channel, nxt.channel, _stamp(at)))
+            self.log("failover: %s %s -> %s (%s%s)"
+                     % (role, choice.channel, nxt.channel, reason,
+                        ", reopens %s" % _stamp(at) if at else ", seat not cooled"))
             return self._direct(role, nxt, text, timeout, pick_as=pick_as,
                                 cooled=cooled)
         self._meter(choice)
@@ -1498,20 +1517,26 @@ a planner does that next, from your design.
                 text = prompts.retry(failure)
                 res = self.adapter.follow_up(session, text, timeout=3600)
             self._log_transcript(role, text, res)
-            if res.get("failure") != "quota_exhausted":
+            reason = res.get("failure")
+            if reason not in self.HOPS_TO_ANOTHER_SEAT:
                 break
             # Close first: `_cool` touches a shared file, and letting it run
             # ahead of teardown meant a write failure leaked the session -- under
             # the herdr adapter, an orphaned pane.
             self._close(session)
             self._salvage(cwd, role, subtask)
-            at = self._cool(choice, res)
+            at = self._cool(choice, res) if reason in self.OPENS_THE_BREAKER else None
+            # Appended whatever the reason: this list excludes the seat from THIS
+            # task's remaining picks, which is a different thing from the global
+            # breaker. A timed-out seat must not be handed the same call again on
+            # the next iteration, but nothing about one hung call justifies
+            # taking it away from every other task for five hours.
             cooled.append(choice.channel)
             self.task.record_delegation({
                 "stage": self.task.state["status"], "role": role,
                 "subtask": subtask.get("id") if subtask else None,
                 "model": choice.model, "channel": choice.channel,
-                "adapter": self.adapter.name, "outcome": "quota_exhausted",
+                "adapter": self.adapter.name, "outcome": reason,
                 # A wall still costs wall-clock, and that time is exactly what
                 # the failover path exists to shorten -- so it has to be on the
                 # record even though the call bought nothing.
@@ -1520,8 +1545,9 @@ a planner does that next, from your design.
             # Excluded explicitly as well as through the breaker: if the state
             # file could not be written, the loop must still terminate.
             nxt = self._replacement(role, choice, cooled)
-            self.log("failover: %s %s -> %s (quota, reopens %s)"
-                     % (role, choice.channel, nxt.channel, _stamp(at)))
+            self.log("failover: %s %s -> %s (%s%s)"
+                     % (role, choice.channel, nxt.channel, reason,
+                        ", reopens %s" % _stamp(at) if at else ", seat not cooled"))
             # A fresh session on the new seat, in the *same* worktree: every
             # checkpoint commit is still there, so the replacement continues
             # from the last one rather than restarting the subtask (§5.5).

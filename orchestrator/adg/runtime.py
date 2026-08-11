@@ -261,10 +261,15 @@ class LocalAdapter(Adapter):
                                env=session.handle["env"], input=text,
                                capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            # Never quota: a timeout says nothing about the provider's window,
-            # and a wrong five-hour breaker hides a healthy seat.
+            # Still never quota -- a timeout says nothing about the provider's
+            # window, and a wrong five-hour breaker hides a healthy seat -- but
+            # `timeout`, not `other`, and the distinction has to be made here as
+            # well as in `quota.classify`. This is the path a real hung agent
+            # takes, so leaving it as `other` would mean the hop-on-timeout
+            # never fires in practice while the classifier's tests all passed.
+            # Two places decide what a timeout means; they must not disagree.
             return {"settled": "timeout", "output": "", "code": None,
-                    "failure": "other", "reset_at": None}
+                    "failure": "timeout", "reset_at": None}
         return _result(p.stdout, p.stderr, p.returncode, kind=kind)
 
     def follow_up(self, session, text, timeout):

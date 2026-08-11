@@ -62,19 +62,27 @@ class TestClassification(unittest.TestCase):
 
     def test_a_timeout_is_never_quota(self):
         # The rule with the sharpest edge: a generic timeout must not open a
-        # five-hour breaker on a provider that is fine.
-        kind, _ = quota.classify(
+        # five-hour breaker on a provider that is fine. It is now its own kind
+        # rather than `other`, so that a hung call can move the work to another
+        # seat -- but `Orchestrator.OPENS_THE_BREAKER` still excludes it, which
+        # is the half that matters here.
+        kind, at = quota.classify(
             "claude", {"settled": "timeout", "output": "", "code": None}, T0)
-        self.assertEqual(kind, "other")
+        self.assertEqual(kind, "timeout")
+        self.assertNotEqual(kind, "quota_exhausted")
+        self.assertIsNone(at, "a timeout must carry no reopen time")
+        from adg.machine import Orchestrator
+        self.assertNotIn(kind, Orchestrator.OPENS_THE_BREAKER)
+        self.assertIn(kind, Orchestrator.HOPS_TO_ANOTHER_SEAT)
 
-    def test_a_timeout_mentioning_rate_limits_is_still_other(self):
+    def test_a_timeout_mentioning_rate_limits_is_not_read_as_quota(self):
         # Deliberately not folded into the test above: this one fails the moment
         # the timeout check moves *after* the pattern table, which is the actual
         # regression to guard against.
         kind, _ = quota.classify("claude", {
             "settled": "timeout", "code": None,
             "output": "waiting on rate limit ..."}, T0)
-        self.assertEqual(kind, "other")
+        self.assertEqual(kind, "timeout")
 
     def test_success_is_not_a_failure_at_all(self):
         kind, _ = quota.classify("claude", {
@@ -447,14 +455,19 @@ class TestRuntimeClassification(unittest.TestCase):
                               kind="claude", now=T0)
         self.assertEqual(res["failure"], "quota_exhausted")
 
-    def test_local_timeout_is_other_not_quota(self):
+    def test_local_timeout_is_timeout_not_quota(self):
+        # This is the path a real hung agent takes -- subprocess.TimeoutExpired,
+        # never `quota.classify` -- so it has to agree with the classifier. While
+        # it hardcoded `other`, every classifier test passed and the hop still
+        # would not have fired on an actually stuck call.
         a = runtime.LocalAdapter()
         s = runtime.Session("implementer-local", ".")
         s.handle = {"argv": ["python3", "-c", "import time; time.sleep(30)"],
                     "env": dict(os.environ), "role": "implementer", "kind": "claude"}
         res = a.prompt(s, "hi", timeout=0.2)
         self.assertEqual(res["settled"], "timeout")
-        self.assertEqual(res["failure"], "other")
+        self.assertEqual(res["failure"], "timeout")
+        self.assertIsNone(res["reset_at"], "a timeout must carry no reopen time")
 
     def test_mock_adapter_can_inject_a_quota_failure(self):
         def implementer(env, cwd):
@@ -606,6 +619,40 @@ class TestMachineSelection(unittest.TestCase):
         strong = [c for c in orch.router.candidates("implementer")
                   if c.model == "opus-class-strong"]
         return orch, strong[0]
+
+    def test_a_timeout_moves_the_work_but_leaves_the_seat_open(self):
+        """The whole point of splitting the two decisions.
+
+        A hung call should reach another seat -- the work is checkpointed and
+        someone else can pick it up, which is why more than one provider is
+        enrolled. But nothing about one call failing to return says the seat is
+        out, so the five-hour breaker must stay shut. Before the split these
+        were one decision, so a timeout could only do both or neither, and it
+        did neither.
+        """
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        before = cooldown.read(T0)[0]
+
+        timed_out = {"settled": "timeout", "output": "", "code": None,
+                     "failure": "timeout", "reset_at": None}
+        self.assertIn(timed_out["failure"], orch.HOPS_TO_ANOTHER_SEAT,
+                      "a timeout must move the work")
+        self.assertNotIn(timed_out["failure"], orch.OPENS_THE_BREAKER,
+                         "a timeout must not take the seat out of service")
+
+        # and the seat really is still there for everyone else
+        self.assertEqual(cooldown.read(T0)[0], before,
+                         "a timeout opened a breaker")
+        self.assertEqual(orch._pick("implementer").channel,
+                         _orch(self.reg, runtime.MockAdapter(), self.task)
+                         ._pick("implementer").channel)
+
+    def test_an_ordinary_crash_still_hops_nowhere(self):
+        """The negative control, as a unit. A failover that fires on any error
+        is worse than none: it hides real bugs behind provider changes."""
+        orch = _orch(self.reg, runtime.MockAdapter(), self.task)
+        self.assertNotIn("other", orch.HOPS_TO_ANOTHER_SEAT)
+        self.assertNotIn("other", orch.OPENS_THE_BREAKER)
 
     def test_a_hop_after_an_escalation_keeps_the_rung(self):
         """Failover must not walk back down the ladder. Re-selecting on plain
