@@ -160,6 +160,18 @@ channels:
     adapter: herdr
     agent_kind: claude
     exposes: [opus-class-strong, balanced-coder]
+    # Which of the models it exposes this seat should WIN when another seat
+    # exposes the same one and both have headroom. Two subscription seats with
+    # room both price at ~0, so that choice used to fall to the alphabetical
+    # tie-break in `candidates` -- "claude-seat" < "cursor-seat" -- and a
+    # two-provider deployment quietly ran every role on one.
+    #
+    # A preference, not a pin: it is worth `router.PREFERENCE_BONUS`, which is
+    # less than the smallest gap between two different capability scores, so it
+    # decides ties and nothing else. When this seat is cooled, reserved out or
+    # drawn down, the work still moves -- which is the whole point of the
+    # project and must not be undone by a routing preference.
+    prefers: [opus-class-strong]
     quota: {window: 5h, est_capacity: 40, weekly_cap: true}
     reserve_for: [planner, reviewer]   # keep headroom for the calls only this seat can make
     reserve_fraction: 0.3
@@ -169,6 +181,10 @@ channels:
     adapter: herdr
     agent_kind: cursor
     exposes: [balanced-coder, fast-cheap]
+    # The other half of the split: implementation lands here, planning and
+    # review land on the strong seat. Both seats expose `balanced-coder`, so
+    # without this the implementer wave went to claude-seat on alphabet alone.
+    prefers: [balanced-coder, fast-cheap]
     quota: {window: monthly, est_capacity: 500}
 
   # Same seat without herdr — e.g. on Windows, or in CI. Identical workflow.

@@ -495,6 +495,27 @@ def _orch(reg, adapter, task, clock=None, logs=None):
                         clock=clock or (lambda: T0))
 
 
+def _seats(reg, role="implementer"):
+    """The channels this role would use, best first: (first, fallback, ...).
+
+    Asked of the registry rather than written down. Which provider a role
+    starts on is a routing decision the registry owns, and it has already
+    changed once: it used to fall out of the alphabetical tie-break in
+    `candidates` -- both subscription seats with headroom price at ~0, so
+    "claude-seat" < "cursor-seat" decided it -- and now falls out of an explicit
+    `prefers:`. A failover test naming the seats is pinned to whatever settles
+    that tie rather than to the failover it exists to prove, and the day the
+    registry is retuned it either breaks for the wrong reason or, worse, keeps
+    passing while proving nothing (cool the seat the router was not going to
+    pick and the "it skipped the cooled seat" assertion is free).
+    """
+    order = []
+    for c in router.Router(reg).candidates(role):
+        if c.channel not in order:
+            order.append(c.channel)
+    return order
+
+
 class TestMachineSelection(unittest.TestCase):
     def setUp(self):
         self.t = TempRepo()
@@ -507,9 +528,11 @@ class TestMachineSelection(unittest.TestCase):
         self.t.close()
 
     def test_pick_skips_a_cooled_channel(self):
-        cooldown.open_breaker("claude-seat", "quota", T0 + 3600, T0)
+        # The seat the router WOULD have picked, or the skip is free.
+        first, other = _seats(self.reg)[:2]
+        cooldown.open_breaker(first, "quota", T0 + 3600, T0)
         orch = _orch(self.reg, runtime.MockAdapter(), self.task)
-        self.assertEqual(orch._pick("implementer").channel, "cursor-seat")
+        self.assertEqual(orch._pick("implementer").channel, other)
 
     def test_pick_uses_a_cooled_channel_again_once_it_reopens(self):
         # AC-2: expiry is on read, so no command has to remember to sweep.
@@ -546,7 +569,7 @@ class TestMachineSelection(unittest.TestCase):
             fh.write("[[[")
         logs = []
         orch = _orch(self.reg, runtime.MockAdapter(), self.task, logs=logs)
-        self.assertEqual(orch._pick("implementer").channel, "claude-seat")
+        self.assertEqual(orch._pick("implementer").channel, _seats(self.reg)[0])
         self.assertTrue(any("unreadable" in x for x in logs), logs)
 
     def test_an_optional_role_going_dark_mid_call_degrades_instead_of_parking(self):
@@ -928,19 +951,22 @@ class TestFailoverEndToEnd(unittest.TestCase):
                          "the quota failure was billed to the subtask: %s" % attempts)
 
     def test_the_run_moved_to_the_other_channel(self):
+        first, other = _seats(self.reg)[:2]
         _, script = self._script(quota_first=True)
         task, _, _ = self._run(script)
         used = [h["channel"] for h in task.state["delegation_history"]
                 if h.get("role") == "implementer" and h.get("outcome") == "complete"]
-        self.assertEqual(used, ["cursor-seat"])
+        self.assertEqual(used, [other],
+                         "the wall was on %s and the work did not move" % first)
 
     def test_the_cooled_channel_is_on_disk_with_the_stated_reset(self):
         # AC-2: "reset in 2 hours" from the message, not the 5h window.
+        walled = _seats(self.reg)[0]
         _, script = self._script(quota_first=True)
         self._run(script)
         cools, _, _ = cooldown.read(T0)
-        self.assertEqual(cools["claude-seat"]["reopen_at"], T0 + 2 * 3600)
-        self.assertEqual(cools["claude-seat"]["reason"], "quota")
+        self.assertEqual(cools[walled]["reopen_at"], T0 + 2 * 3600)
+        self.assertEqual(cools[walled]["reason"], "quota")
 
     def test_without_a_stated_reset_the_configured_window_is_used(self):
         state, script = self._script(quota_first=False)
@@ -952,9 +978,15 @@ class TestFailoverEndToEnd(unittest.TestCase):
                 return blocked("Error: usage limit reached")     # no time given
             return original(env, cwd)
 
+        walled = _seats(self.reg)[0]
         _, status, logs = self._run(dict(script, implementer=implementer))
         cools, _, _ = cooldown.read(T0)
-        self.assertEqual(cools["claude-seat"]["reopen_at"], T0 + 5 * 3600)
+        # That channel's own window, read from the registry: the two seats are
+        # configured differently (5h against monthly), so a literal here would
+        # be asserting which seat walled rather than that its window was used.
+        window = quota.parse_window(
+            (self.reg["channels"][walled].get("quota") or {}).get("window"))
+        self.assertEqual(cools[walled]["reopen_at"], T0 + window)
         self.assertTrue(any("stated no reset time" in x for x in logs), "\n".join(logs))
 
     def _red_until_done(self):
@@ -1041,10 +1073,19 @@ class TestFailoverEndToEnd(unittest.TestCase):
         task, status, logs = self._run(script)
         self.assertEqual(status, "done", "\n".join(logs))
         text = task.read_text("brief.md", "")
+        first, other = _seats(self.reg)[:2]
         cost_table = text.split("## Who did the work")[1].split("##")[0]
-        self.assertNotIn("claude-seat", cost_table,
+        # The implementer rows only. Scanning the whole table for the refused
+        # seat's name is not the same question: that seat also serves other
+        # roles -- the classifier runs there, because only it exposes
+        # `fast-cheap` -- and a row for a call that really happened is exactly
+        # what the table is for.
+        rows = [r for r in cost_table.splitlines() if "implementer" in r]
+        self.assertEqual(len(rows), 1,
+                         "the refused seat was billed a row of its own: %s" % rows)
+        self.assertIn(other, rows[0], "the seat that did the work is missing")
+        self.assertNotIn(first, rows[0],
                          "the refused seat was billed a row saying it reported no cost")
-        self.assertIn("cursor-seat", cost_table, "the seat that did the work is missing")
         self.assertNotIn("quota_exhausted", text, "raw protocol token reached the human")
         self.assertIn("ran out of its provider's capacity", text,
                       "the hop is invisible to the human who paid for it")

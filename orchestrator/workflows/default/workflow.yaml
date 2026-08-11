@@ -34,6 +34,24 @@ stages:
 
   classify:
     role: classifier
+    # Which work needs a plan, in this workflow's terms. The two tiers and the
+    # VERDICT line the program parses stay in `machine.CLASSIFY_PROMPT` -- the
+    # machine routes on the tier names, so they are not a manifest's to rename
+    # -- but the judgement itself used to be a string constant that opened
+    # "Classify this software task", which is this workflow's opinion sitting in
+    # the state machine. A workflow that says nothing here gets
+    # `DEFAULT_CLASSIFY_CRITERIA`, on the same rule as `enabled()`: silence
+    # leaves a stage as the machine has it. (yamlite drops blank lines inside a
+    # block scalar, so these paragraphs are separated by a single newline.)
+    criteria: |
+      SIMPLE: one coherent change a single competent engineer would finish in
+      one sitting without a written plan. A few files, no new architecture, no
+      format or interface that other code depends on.
+      COMPLEX: needs a plan first -- multiple independent parts, a new
+      abstraction or dependency, a change to a shared interface / schema / save
+      format, wide blast radius, or genuine ambiguity about what is wanted.
+      Bias: when the work is small and self-contained, say SIMPLE. Planning a
+      small task wastes far more than it saves.
 
   # --- design -------------------------------------------------------------
 

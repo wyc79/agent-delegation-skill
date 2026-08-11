@@ -62,7 +62,16 @@ directory matters; `--repo <path>` overrides it.
 | `channels [--clear NAME]` | Per-seat cooldowns and estimated quota draw. |
 
 `run` also takes `--id`, `--mode attended|autonomous`, `--adapter herdr|local|mock`,
-`--no-panes`, `--max-cost N`, `--review auto|always|never`, `--dry-run`, `--yes`.
+`--no-panes`, `--max-cost N`, `--review auto|always|never`,
+`--tier auto|simple|complex`, `--dry-run`, `--yes`.
+
+`--tier` is the one to reach for once you have decided to delegate. `auto`
+spends a cheap call asking whether the work needs a plan; if you already know —
+you have just designed the decomposition, or the request is plainly one edit —
+say so and skip it. `complex` plans and decomposes, `simple` seeds one subtask
+and implements. It overrides a `hotspots:` entry in the project's `.adg.yaml`,
+which is the only thing it can silently make worse, so the run logs when it
+does.
 `resume`, `approve` and `reject` take the adapter flags too. `approve` also
 takes `--no-continue`, which records the decision and advances the task to the
 stage it would have resumed at, without running it — pick it up later with plain

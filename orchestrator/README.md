@@ -34,8 +34,10 @@ Useful flags: `--dry-run` drives the state machine with no agents, `--adapter
 local|herdr|mock` overrides runtime selection, `--no-panes` trades herdr's
 visible agent panes back for cost accounting (pane sessions report no cost, so
 `max_cost_usd` cannot bind while they are on), `--max-cost 5` lowers (never
-raises) the cost cap, `--yes` auto-approves gates for unattended runs — merge
-still never happens automatically.
+raises) the cost cap, `--tier simple|complex` states outright whether the work
+needs a plan instead of paying the classifier to judge (`auto` is the default,
+so `delegate` run by hand still judges for itself), `--yes` auto-approves gates
+for unattended runs — merge still never happens automatically.
 
 ## Project config
 
@@ -326,3 +328,138 @@ The parallel tests still pin their own concurrency rather than inheriting the
 registry's — `TestWaveRaces` at 3, because it plans three subtasks and a lower
 cap never opens the window it exists to probe. A registry tuned back down must
 not quietly turn the race tests into sequential runs that pass.
+
+## The continuity defects underneath the wave tests
+
+Everything above is about **attribution** — which agent's report belongs to
+which subtask. A cold read found a second family sitting under it, about
+**continuity**: what a finished subtask leaves behind, and what the next one is
+handed. None of it was a race; each defect reproduced on the first run and every
+run, and `TestSubtaskContinuity` pins them.
+
+It took three passes, and the middle one is the part worth keeping: the first
+fix was reviewed by an agent told to attack it rather than confirm it, and that
+review found three regressions *inside the fix*. A second such review found two
+more. Each pass was smaller than the last, and each of the tests below is
+mutation-checked — the fix is reverted, and the test that names it has to fail.
+
+### Where a subtask works, and what its diff means
+
+Both used to be decided in several places that disagreed.
+
+A subtask worktree is cut from the **integration branch**, not from the task's
+base commit. `references/parallelism.md` always said so and
+`roles/implementer.md` tells the agent that `depends_on` "tells you what already
+exists"; neither held, so a second wave could not see the first wave's merged
+output and a dependant began by importing a file that was not there.
+`depends_on` bought ordering and nothing else. The Test Author was the quieter
+casualty: its failing tests are committed into the integration worktree during
+`plan`, so a wave never contained them and the checks an implementer ran were
+green because the requirement was absent.
+
+A worktree that is **reused** is brought up to that branch first (`_catch_up`).
+A subtask's own checkout is a snapshot of the moment it was cut, so a rework
+after `REQUEST_CHANGES` ran against a tree missing everything its siblings had
+landed — the checks were evidence about an incomplete tree, and a finding citing
+a sibling's file pointed at a file the agent could not see. Where the branch is
+already merged this is a fast-forward; where it is not — an interrupted subtask
+carrying salvage commits — a real merge is attempted and abandoned cleanly if it
+will not go, because a half-merged worktree is worse than a stale one.
+
+Its **diff base is read from that tree, on every dispatch**. Recording the
+commit we asked to cut from was wrong twice over: `create_worktree` reuses an
+existing branch and ignores the base it is handed, and a replan reissuing an id
+rebuilt the subtask from plan.md alone, so it recorded that day's integration
+tip while its checkout sat where it always had. Both produced the same symptom —
+a subtask credited with every file its siblings had landed, and those files
+reported as scope violations it never committed. `actual_files` accumulates
+across dispatches, so moving the base forward loses nothing.
+
+The one path that had no per-subtask base at all was the subtask working
+directly in the integration worktree, which is what a wave of one does — and any
+dependency chain or overlapping scope produces waves of one at any cap. It
+measured against the task base, so the second subtask in a sequential run
+inherited its predecessors' files and the "changed no files" guard could never
+fire, since a predecessor's work always looked like its own. That guard now
+applies only to a subtask that has never produced anything: with the base
+following the tree, a rework that changes nothing also shows an empty diff, and
+halting the run there would be a new failure mode invented as a side effect —
+an implementer ignoring its findings is what the reviewer and `max_review_loops`
+are for.
+
+### Stopping part-way through a wave
+
+The invariant is **a subtask marked `complete` has its work on the integration
+branch**, and it is what makes the merge brief's file list and the delivered
+patch the same account of the change. Three things broke it.
+
+`_integrate_wave` ran only once the whole wave came back clean, so one failing
+member left every finished one unmerged: `_finish_subtask` had already marked
+them complete, a complete subtask never rejoins a wave, and nothing else merges
+a subtask branch. The run resumed, finished the survivor, reached `done`, and
+delivered a patch missing work that `actual_files` and the brief both listed as
+changed — a silent loss inside a run that reported success, which is the worst
+shape a defect can take here. The wave now merges what finished *before*
+reporting what did not.
+
+Merging first then introduced the opposite fault: a `Halt` out of
+`_integrate_wave` outranked a sibling's `Replan`, discarding rung 3 with its
+escalation bundle already written, and would have done the same to a quota
+park's reopen time — the exact "the sequential and parallel paths disagreed
+about the same event" failure the re-raises exist to prevent. The integration
+failure is now held and raised only if nothing else in the wave decides where
+the run goes next.
+
+And a merge can fail part-way through the wave. `_reconcile` could raise out of
+an unfinished merge, and the run does not always end there: a sibling's `Replan`
+continues at the plan stage, where `_author_tests` does a blind `git add -A &&
+git commit` and committed the conflict markers as the resolution, shipping them
+in the patch. A failed merge is aborted, and the members behind it — complete,
+but never merged — are reopened rather than left to be delivered as done and
+absent.
+
+### The finding hand-off
+
+`_finish_subtask` cleared `pending_findings` wholesale, so the first subtask to
+go green disarmed the rework for every other one: a reviewer that rejected
+`st-1` and `st-2` saw `st-1` fixed and `st-2` re-dispatched with nothing at all,
+back to the same code with the same prompt. A subtask now consumes only the
+findings addressed to it; an unowned finding stays, because it is addressed to
+whoever is reworking; and a verdict replaces the list wholesale, so nothing
+outlives the review that raised it.
+
+Two schema-legal shapes reached nobody. `severity: minor` is legal, so a
+`REQUEST_CHANGES` carrying no blocking finding named no owner, reopened every
+subtask on the no-owners fallback, and gave them nothing to go on; it is refused
+as the incoherent verdict it is. And a `suggested_owner` naming no subtask in
+the plan reopened `subtasks[0]` and was then filtered out of that subtask's own
+brief — an unmatched owner is dropped, which makes the finding unowned and so
+addressed to whoever reworks.
+
+### Smaller inconsistencies closed on the way
+
+Conflicting role cards are refused when the manifest **loads** rather than when
+the role is first dispatched, which is what the code claimed. A stage the
+manifest never mentions is no longer reported as switched off while the run loop
+ran it anyway — the machine owns the graph, and silence leaves a stage as the
+machine has it; the one switch is `enabled: false`, and an empty body
+(`review: {}`) means "declared, nothing to say". `machine.run` walks `STAGES`
+when it skips a disabled stage, because walking the manifest's declared stages
+alone could never route to an undeclared one: a manifest that disabled `review`
+and never mentioned `integrate` ended the run without the stage that writes the
+patch.
+
+`cli.main` resolves the workflow before every subcommand rather than only when
+`--workflow` is passed, and catches `yamlite.YamlError` beside `WorkflowError`
+— a manifest that exists and does not parse is the commoner typo, and it is a
+sibling `ValueError` rather than a subclass. It is fatal only for the commands
+that dispatch agents: `status`, `show` and `channels --clear` are how a user
+works out what went wrong and unsticks a seat, and refusing to run them over an
+unrelated `$AGENT_DELEGATION_WORKFLOW` would take away the tools for the
+recovery.
+
+And `delegate status` asks the breaker file rather than the `park` snapshot in
+task.json, the same correction `_quota_guard` already carries: that snapshot
+goes stale through `channels --clear` and through a window that simply reopened,
+and reading it left `status` reporting a quota wall beside a reopen time in the
+past.

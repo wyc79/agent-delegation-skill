@@ -79,7 +79,26 @@ class Workflow:
         stages = self.data.get("stages")
         if not isinstance(stages, dict) or not stages:
             raise WorkflowError("%s declares no stages" % path)
+        for stage, spec in stages.items():
+            # `review:` with nothing under it parses as None, and every
+            # accessor below then reads it differently -- `enabled` called it
+            # off, `discipline` called it empty. A stage with no body is a
+            # manifest mistake, and refusing it here is the same trade
+            # `yamlite` makes: a config that silently parses to the wrong shape
+            # is worse than one that will not load.
+            if not isinstance(spec, dict):
+                raise WorkflowError(
+                    "%s: stage %r must be a mapping, got %r. A stage with "
+                    "nothing to say still needs a body -- `%s: {}`."
+                    % (path, stage, spec, stage))
         self.stages = stages
+        # Resolved at load, not on first use. `card()` is reached from
+        # `prompts.compose`, which runs stages into a task and after real
+        # spend; a WorkflowError there arrives at the generic handler as
+        # CRASHED, for what is a typo in a file this class has already read.
+        # `cli.main` loads the manifest before any subcommand precisely so
+        # that a bad one fails with the path in the message.
+        self._card_by_role = self._resolve_cards()
 
     # --- loading -----------------------------------------------------------
 
@@ -106,6 +125,42 @@ class Workflow:
         name = self.data.get("protocol")
         return os.path.join(self.path, name) if name else None
 
+    def _resolve_cards(self):
+        """role -> the one card it reads, for every role this manifest names.
+
+        Two stages CAN share a role -- `brainstorm` and `plan` both dispatch the
+        planner -- which made a second declaration silently dead: repointing
+        `plan.card` alone changed nothing, because a first-match lookup let
+        whichever stage came first answer for the role. Rather than pick one
+        quietly, disagreement is refused. A manifest that means two different
+        cards for one role is asking for something this lookup cannot express.
+        """
+        seen = {}
+        for stage, spec in self.stages.items():
+            if spec.get("role") and spec.get("card"):
+                seen.setdefault(spec["role"], {}).setdefault(
+                    spec["card"], []).append(stage)
+        out = {}
+        for role, cards in seen.items():
+            if len(cards) > 1:
+                raise WorkflowError(
+                    "%s: role %r is given different cards by different stages "
+                    "(%s). One role reads one card; split the role or unify "
+                    "the card."
+                    % (self.path, role,
+                       "; ".join("%s -> %s" % (", ".join(v), k)
+                                 for k, v in cards.items())))
+            out[role] = next(iter(cards))
+        # Roles a stage dispatches alongside its own. `test-author` is the one
+        # that exists: it runs inside `plan`, before any implementation exists,
+        # which is the property that lets it encode what was ASKED rather than
+        # what was built. It is not a stage, so it is not in `stages` --
+        # and a stage's own card wins over one declared here.
+        for role, spec in (self.data.get("extra_roles") or {}).items():
+            if isinstance(spec, dict) and spec.get("card"):
+                out.setdefault(role, spec["card"])
+        return out
+
     def card(self, role):
         """Instructions for a role, or None when the workflow supplies none.
 
@@ -113,34 +168,8 @@ class Workflow:
         foreign skill has no card of its own, and inventing a path to a file
         that does not exist would send the agent hunting for it.
         """
-        # First match wins, and two stages CAN share a role -- `brainstorm` and
-        # `plan` both dispatch the planner. That made a second declaration
-        # silently dead: repointing `plan.card` alone changed nothing, because
-        # `brainstorm` is declared first and answers for the role. Rather than
-        # pick one quietly, disagreement is refused. A manifest that means two
-        # different cards for one role is asking for something this lookup
-        # cannot express, and finding that out at load time beats finding out
-        # from an agent that read the wrong instructions.
-        found = {}
-        for stage, spec in self.stages.items():
-            if spec.get("role") == role and spec.get("card"):
-                found.setdefault(spec["card"], []).append(stage)
-        if len(found) > 1:
-            raise WorkflowError(
-                "%s: role %r is given different cards by different stages (%s). "
-                "One role reads one card; split the role or unify the card."
-                % (self.path, role,
-                   "; ".join("%s -> %s" % (", ".join(v), k) for k, v in found.items())))
-        if found:
-            return os.path.join(self.path, next(iter(found)))
-        # Roles a stage dispatches alongside its own. `test-author` is the one
-        # that exists: it runs inside `plan`, before any implementation exists,
-        # which is the property that lets it encode what was ASKED rather than
-        # what was built. It is not a stage, so it is not in `stages`.
-        extra = (self.data.get("extra_roles") or {}).get(role) or {}
-        if extra.get("card"):
-            return os.path.join(self.path, extra["card"])
-        return None
+        name = self._card_by_role.get(role)
+        return os.path.join(self.path, name) if name else None
 
     # --- what the machine asks ---------------------------------------------
 
@@ -151,10 +180,22 @@ class Workflow:
         return [s for s in self.stages]
 
     def enabled(self, stage):
-        spec = self.stages.get(stage)
-        return bool(spec) and spec.get("enabled", True) is not False
+        """Is this stage switched on?
 
-    def next_enabled(self, after, terminal="done"):
+        A stage the manifest does not declare is **not** off. The machine owns
+        the graph; a manifest switches a stage off by saying so, and saying
+        nothing about one leaves it as the machine has it. This answered False
+        for an undeclared stage while `machine.run` only ever asked about
+        declared ones -- two answers to one question, and the disagreement
+        would have surfaced the first time somebody wrote a manifest with no
+        `review:` block and got a review anyway.
+        """
+        spec = self.stages.get(stage)
+        if spec is None:
+            return True
+        return spec.get("enabled", True) is not False
+
+    def next_enabled(self, after, terminal="done", order=None):
         """The next stage that will actually run, skipping disabled ones.
 
         A stage is skipped, never removed: the handlers set their own successor
@@ -163,12 +204,22 @@ class Workflow:
         which of those destinations is switched on. Falling off the end is
         `done` rather than an error, because disabling the tail of a workflow is
         a legitimate thing to declare.
+
+        `order` is the caller's own stage sequence, and `machine.run` passes
+        `STAGES`. Walking the manifest's declared stages alone contradicted
+        `enabled()`, which treats an undeclared stage as on: a manifest that
+        declared `review: {enabled: false}` and never mentioned `integrate`
+        skipped review straight to `done`, so the run ended without the stage
+        that writes the patch. The machine owns the graph, so the machine's
+        order is the one to walk.
         """
-        order = self.order()
-        if after in order:
-            rest = order[order.index(after) + 1:]
-        else:
-            rest = order
+        order = list(order or self.order())
+        if after not in order:
+            # An id this sequence does not contain has no position in it, so it
+            # has no "next". Falling back to the whole list returned the FIRST
+            # stage, which would send a run back to `intake` and around again.
+            return terminal
+        rest = order[order.index(after) + 1:]
         for stage in rest:
             if self.enabled(stage):
                 return stage
@@ -191,6 +242,25 @@ class Workflow:
         if wanted and not have:
             return (spec.get("fallback") or "").strip()
         return (spec.get("text") or spec.get("fallback") or "").strip()
+
+    def criteria(self, stage):
+        """A stage's judgement text, when the manifest supplies one.
+
+        Distinct from `discipline`, which is *method* -- how a role should go
+        about its work -- and is injected beside that role's card. This is the
+        substance of a one-shot question the program asks and parses itself:
+        `classify` has no card to carry it, so the criteria used to be a string
+        constant in `machine.py` that opened "Classify this software task",
+        which is domain policy hardcoded into the machine and exactly what a
+        manifest is for.
+
+        What stays code is the frame around it. `_classified` routes on the two
+        tiers by name, so the vocabulary and the VERDICT line the parser reads
+        are not a manifest's to change -- a workflow that invented a third tier
+        would parse as neither and fall through to the safe default. A manifest
+        moves the judgement, not the question.
+        """
+        return ((self.stages.get(stage) or {}).get("criteria") or "").strip()
 
     def wants_skill(self, stage):
         """Which companion a stage would use if it were installed.

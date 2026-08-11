@@ -14,13 +14,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from adg import (brief, cli, limits, prompts, router, runtime, schema, store,
-                 verify, winnow, workflow as wf, yamlite)
-from adg.machine import Halt, Orchestrator
+from adg import (brief, cli, cooldown, limits, prompts, router, runtime, schema,
+                 store, verify, winnow, workflow as wf, yamlite)
+from adg.machine import STAGES, Halt, Orchestrator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REGISTRY = os.path.join(REPO_ROOT, "registry.default.yaml")
@@ -206,6 +207,157 @@ class TestLimits(unittest.TestCase):
         with self.assertRaises(limits.LimitBreach) as cm:
             b.check_attempt("st-1")
         self.assertEqual(cm.exception.action, "escalate")
+
+
+class TestChannelPreference(unittest.TestCase):
+    """`prefers:` decides which seat serves a model that two seats both expose.
+
+    That decision used to be alphabetical. Two subscription seats with headroom
+    both price at ~0, so the scores tied and `candidates` fell through to
+    `sort(..., c.channel)` — "claude-seat" beats "cursor-seat" — and a
+    deployment with two providers ran every role on one of them. The rule is
+    now written down rather than emergent, and it stays a preference: it may
+    break a tie and may not buy a weaker model a job.
+    """
+
+    def _reg(self, **chan_overrides):
+        reg = {
+            "models": {
+                "strong": {"tier": "t2", "reasoning": 5, "coding": 5,
+                           "adherence": 4, "tool": 5, "speed": 2, "ctx": 200000,
+                           "cost_out": 75, "enrolled_roles": ["implementer"]},
+                "worker": {"tier": "t2", "reasoning": 4, "coding": 5,
+                           "adherence": 4, "tool": 5, "speed": 4, "ctx": 200000,
+                           "cost_out": 15, "enrolled_roles": ["implementer"]},
+            },
+            "profiles": {"implementer": {"require": {"coding": 4, "tool": 4},
+                                         "weights": {"coding": 3, "adherence": 2,
+                                                     "speed": 1},
+                                         "cost_sensitivity": "high"}},
+            "channels": {
+                "aaa-seat": {"type": "subscription", "adapter": "mock",
+                             "agent_kind": "claude", "exposes": ["worker"]},
+                "zzz-seat": {"type": "subscription", "adapter": "mock",
+                             "agent_kind": "cursor", "exposes": ["worker"]},
+            },
+            "policy": {"escalation_ceiling": {"max_tier": "t2"}},
+        }
+        for name, over in chan_overrides.items():
+            reg["channels"][name.replace("_", "-")].update(over)
+        return reg
+
+    def test_without_a_preference_the_tie_falls_to_the_alphabet(self):
+        """The behaviour that made this necessary, pinned so the fix has
+        something to be a fix *of*."""
+        top = router.Router(self._reg()).candidates("implementer")[0]
+        self.assertEqual(top.channel, "aaa-seat")
+
+    def test_a_preference_decides_which_seat_serves_the_model(self):
+        reg = self._reg(zzz_seat={"prefers": ["worker"]})
+        cands = router.Router(reg).candidates("implementer")
+        self.assertEqual(cands[0].channel, "zzz-seat",
+                         "the declared preference lost to the alphabet")
+        # The other seat is still there, and still second: a preference orders
+        # the fallback chain, it does not remove anything from it.
+        self.assertEqual([c.channel for c in cands], ["zzz-seat", "aaa-seat"])
+
+    def test_a_preference_cannot_buy_a_weaker_model_the_job(self):
+        """The bound that makes this safe. `PREFERENCE_BONUS` is below the
+        smallest gap two different capability scores can have, so a preferred
+        seat wins ties and only ties — here `worker` scores 27 and `strong` 25
+        on the implementer profile, and preferring `strong` must not flip it."""
+        reg = self._reg()
+        reg["channels"]["aaa-seat"]["exposes"] = ["strong"]
+        reg["channels"]["aaa-seat"]["prefers"] = ["strong"]
+        top = router.Router(reg).candidates("implementer")[0]
+        self.assertEqual(top.model, "worker")
+        self.assertEqual(top.channel, "zzz-seat")
+
+    def test_a_preferred_seat_that_is_cooled_still_yields(self):
+        """A preference, not a pin. Moving work off a walled seat is the whole
+        point of the project, and a routing preference must not undo it."""
+        reg = self._reg(zzz_seat={"prefers": ["worker"]})
+        cands = router.Router(reg).candidates("implementer", cooldowns={"zzz-seat"})
+        self.assertEqual([c.channel for c in cands], ["aaa-seat"])
+
+    def test_a_preferred_seat_that_is_drawn_down_still_yields(self):
+        """Utilisation is a real signal and outranks a stated preference: the
+        bonus is a tie-break, so once the shadow price separates the two seats
+        the cheaper one wins regardless of what the manifest would rather."""
+        reg = self._reg(zzz_seat={"prefers": ["worker"]})
+        cands = router.Router(reg).candidates(
+            "implementer", utilization={"zzz-seat": 0.95, "aaa-seat": 0.0})
+        self.assertEqual(cands[0].channel, "aaa-seat",
+                         "a preference held a seat that had priced itself out")
+
+    def test_preferring_a_model_the_seat_cannot_serve_is_refused(self):
+        """A line that reads like a policy and routes nothing is the shape of
+        mistake this registry refuses elsewhere. Caught at load, so `--registry`
+        fails with the path rather than three stages into a run."""
+        d = tempfile.mkdtemp(prefix="reg-")
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "r.yaml")
+        with open(p, "w") as fh:
+            fh.write("""models:
+  worker: {tier: t2, coding: 5, tool: 5, enrolled_roles: [implementer]}
+profiles:
+  implementer: {require: {}, weights: {coding: 3}}
+channels:
+  a-seat:
+    type: subscription
+    exposes: [worker]
+    prefers: [nonesuch]
+policy: {escalation_ceiling: {max_tier: t2}}
+""")
+        with self.assertRaises(router.RoutingError) as cm:
+            router.load_registry(p)
+        self.assertIn("nonesuch", str(cm.exception))
+        self.assertIn("does not expose", str(cm.exception))
+
+    def test_the_shipped_registry_splits_the_work_across_both_seats(self):
+        """The deployment claim, checked against the file that makes it: the
+        strong seat plans and reviews, the other implements. With both seats
+        exposing `balanced-coder` and nothing to choose between them, this ran
+        entirely on one provider — testing none of the routing this exists for."""
+        r = router.Router(router.load_registry(REGISTRY))
+        by_role = {role: r.candidates(role)[0]
+                   for role in ("planner", "reviewer", "integrator",
+                                "implementer", "test-author")}
+        self.assertEqual(by_role["planner"].channel, "claude-seat")
+        self.assertEqual(by_role["reviewer"].channel, "claude-seat")
+        self.assertEqual(by_role["implementer"].channel, "cursor-seat")
+        self.assertEqual(by_role["test-author"].channel, "cursor-seat")
+        self.assertGreater(len({c.channel for c in by_role.values()}), 1,
+                           "every role resolved to one seat, which is the "
+                           "indirection SKILL.md tells the caller not to pay for")
+
+    def test_the_strong_seat_keeps_planning_when_a_rival_seat_appears(self):
+        """`claude-seat: prefers: [opus-class-strong]` decides nothing today —
+        no other shipped seat exposes that model. It is not decoration: the
+        moment a deployment enrols a second strong seat the tie returns, and
+        without the line it would fall to the alphabet again, which is the
+        failure the whole mechanism replaced. Pinned by adding that seat."""
+        reg = router.load_registry(REGISTRY)
+        reg["channels"]["aaa-strong-seat"] = {
+            "type": "subscription", "adapter": "herdr", "agent_kind": "codex",
+            "exposes": ["opus-class-strong"],
+            "quota": {"window": "5h", "est_capacity": 40},
+        }
+        top = router.Router(reg).candidates("planner")[0]
+        self.assertEqual(top.channel, "claude-seat",
+                         "a newly enrolled seat took planning purely by sorting "
+                         "earlier than the seat the registry prefers")
+
+    def test_escalation_still_crosses_to_the_strong_seat(self):
+        """And the preference must not trap an implementer on the worker seat:
+        rung 2 raises a reasoning floor, which only the strong model clears, so
+        the climb is itself a cross-provider hop."""
+        r = router.Router(router.load_registry(REGISTRY))
+        first = r.candidates("implementer")[0]
+        self.assertEqual(first.channel, "cursor-seat")
+        climbed = r.escalate("implementer", first)
+        self.assertIsNotNone(climbed, "rung 2 had nowhere to go")
+        self.assertEqual(climbed.channel, "claude-seat")
 
 
 class TestRouter(unittest.TestCase):
@@ -858,6 +1010,1650 @@ class TestParallelEndToEnd(unittest.TestCase):
                               lambda k, t: True, log=lambda *_: None).run()
         self.assertEqual(status, "needs_human")
         self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+
+class TestSubtaskContinuity(unittest.TestCase):
+    """What one subtask leaves behind, and what the next one is handed.
+
+    Three defects of one shape: something a subtask produced -- its commits, or
+    the findings written against it -- reached nobody, and the run reported
+    success regardless. None of them is a race; each reproduces on the first
+    run, every run.
+    """
+
+    INDEPENDENT = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+- id: st-2-beta
+  goal: add beta
+  file_scope: ["beta.py"]
+  acceptance: [AC-2]
+```
+"""
+
+    # Three subtasks whose DECLARED scopes are disjoint, so they form one wave.
+    # What they actually write is up to the scripted agent.
+    CONFLICTING = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+- id: st-2-beta
+  goal: add beta
+  file_scope: ["beta.py"]
+  acceptance: [AC-2]
+- id: st-3-gamma
+  goal: add gamma
+  file_scope: ["gamma.py"]
+  acceptance: [AC-3]
+```
+"""
+
+    # st-1 lands first and alone; the other two are a second wave that depends
+    # on it. This is the shape `depends_on` exists for.
+    CHAINED = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-lib
+  goal: add the shared library
+  file_scope: ["lib.py"]
+  acceptance: [AC-1]
+- id: st-2-beta
+  goal: build on the library
+  file_scope: ["beta.py"]
+  depends_on: ["st-1-lib"]
+  acceptance: [AC-2]
+- id: st-3-gamma
+  goal: also build on the library
+  file_scope: ["gamma.py"]
+  depends_on: ["st-1-lib"]
+  acceptance: [AC-3]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _pol(self, cap):
+        return dict(self.reg["policy"]["limits"],
+                    escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
+                    max_parallel_agents=cap)
+
+    def _planner(self, plan):
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(plan)
+        return planner
+
+    @staticmethod
+    def _approve(env, cwd):
+        _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
+            "stage": "review", "role": "reviewer", "status": "complete",
+            "summary": "ok", "evidence": {"tests": "ok"},
+            "role_data": {"verdict": {"verdict": "APPROVE",
+                                      "ac_table": [{"ac": "AC-1", "status": "met"}],
+                                      "findings": []}}})
+
+    def _log(self, repo_branch):
+        return subprocess.run(["git", "log", "--oneline", repo_branch],
+                              cwd=self.t.repo, capture_output=True, text=True).stdout
+
+    def test_a_completed_sibling_lands_even_when_its_wave_fails(self):
+        """`_integrate_wave` ran only after the whole wave came back clean, so
+        one failing sibling stranded every green one: `_finish_subtask` had
+        already marked them complete, a complete subtask never rejoins a wave,
+        and nothing else merges a subtask branch. The run resumed, finished the
+        survivor, reached `done`, and delivered a patch missing work that
+        `actual_files` and the merge brief both listed as changed."""
+        state = {"beta_exploded": False}
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            if "st-1-alpha" in _tree_name(cwd):
+                with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                    fh.write("ALPHA = 1\n")
+                _report(td, "implement-st-1-alpha.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-1-alpha", "status": "complete",
+                    "summary": "did alpha", "evidence": {"tests": "ok"}})
+                return
+            if not state["beta_exploded"]:
+                state["beta_exploded"] = True
+                raise RuntimeError("beta agent exploded")
+            with open(os.path.join(cwd, "beta.py"), "w") as fh:
+                fh.write("BETA = 1\n")
+            _report(td, "implement-st-2-beta.json", {
+                "stage": "implement", "role": "implementer",
+                "subtask": "st-2-beta", "status": "complete",
+                "summary": "did beta", "evidence": {"tests": "ok"}})
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "reviewer": self._approve}
+        task = store.Task.create(self.t.repo, "T-SC1", "# t\n\nAdd two things\n",
+                                 self._pol(2))
+        logs = []
+        first = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                             lambda k, t: True, log=logs.append).run()
+        self.assertEqual(first, "needs_human", "\n".join(logs))
+
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        self.assertEqual(by_id["st-1-alpha"]["status"], "complete")
+        # The invariant, asserted where it is cheapest to see: a subtask marked
+        # complete has its work on the integration branch. Without it the file
+        # list in the brief and the patch are two different accounts.
+        self.assertIn("st-1-alpha", self._log("adg/T-SC1/work"),
+                      "the green sibling's branch was never merged:\n"
+                      + "\n".join(logs))
+
+        # Exactly what `delegate resume` does from needs_human (cli.cmd_resume).
+        task.update(status="implement")
+        second = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(second, "done", "\n".join(logs))
+        patch = task.read_text("integrate.patch")
+        self.assertIn("beta.py", patch)
+        self.assertIn("alpha.py", patch,
+                      "the run reported success and delivered a patch without "
+                      "the sibling's completed work")
+
+    def test_a_later_wave_is_cut_from_what_the_earlier_one_landed(self):
+        """Subtask worktrees were cut from the task's *base* commit, so a wave
+        saw the repository as it was before the task started.
+        `references/parallelism.md` promises they are cut from the integration
+        branch and `roles/implementer.md` tells the agent `depends_on` "tells
+        you what already exists" -- neither held, so a subtask that depended on
+        one already finished began by importing a file that was not there."""
+        seen = {}
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            name = _tree_name(cwd)
+            # A wave of one runs in the integration worktree ("<task>-work"),
+            # not in a worktree named for the subtask -- and st-1-lib is the
+            # only subtask this plan dispatches alone, the other two depending
+            # on it. Reading the tree name without allowing for that makes the
+            # first subtask answer to a sibling's name and write nothing.
+            if "st-1-lib" in name or name.endswith("-work"):
+                with open(os.path.join(cwd, "lib.py"), "w") as fh:
+                    fh.write("VALUE = 42\n")
+                _report(td, "implement-st-1-lib.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-1-lib", "status": "complete",
+                    "summary": "lib", "evidence": {"tests": "ok"}})
+                return
+            sub = "st-2-beta" if "st-2-beta" in name else "st-3-gamma"
+            seen[sub] = os.path.isfile(os.path.join(cwd, "lib.py"))
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("from lib import VALUE\n")
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "used lib",
+                "evidence": {"tests": "ok"}})
+
+        script = {"planner": self._planner(self.CHAINED),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "reviewer": self._approve}
+        task = store.Task.create(self.t.repo, "T-SC2", "# t\n\nAdd three things\n",
+                                 self._pol(3))
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertEqual(seen, {"st-2-beta": True, "st-3-gamma": True},
+                         "a dependant could not see its dependency's output")
+        # Per subtask, not the union: cutting from the integration branch moves
+        # what a diff is measured against, and measuring against the task base
+        # would credit every dependant with the file st-1 wrote and then call
+        # it a scope violation it never committed.
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        self.assertEqual(by_id["st-2-beta"]["actual_files"], ["beta.py"])
+        self.assertEqual(by_id["st-2-beta"]["scope_violations"], [])
+        self.assertEqual(by_id["st-3-gamma"]["actual_files"], ["gamma.py"])
+
+    def test_a_wave_implementer_can_see_the_authored_tests(self):
+        """The same defect where it is most expensive: the Test Author writes
+        failing tests into the integration worktree during `plan`, and a wave
+        cut from the task base never contained them -- so the checks an
+        implementer ran were green because the requirement was absent, which is
+        exactly the evidence `_author_tests` exists to create."""
+        seen = {}
+
+        def test_author(env, cwd):
+            with open(os.path.join(cwd, "test_requirements.py"), "w") as fh:
+                fh.write("def test_alpha():\n    import alpha\n")
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
+            seen[sub] = os.path.isfile(os.path.join(cwd, "test_requirements.py"))
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = 1\n")
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "done",
+                "evidence": {"tests": "ok"}})
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": test_author,
+                  "reviewer": self._approve}
+        task = store.Task.create(self.t.repo, "T-SC3", "# t\n\nAdd two things\n",
+                                 self._pol(2))
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertEqual(seen, {"st-1-alpha": True, "st-2-beta": True},
+                         "the authored tests were invisible to the implementers")
+
+    def test_the_second_sequential_subtask_is_credited_only_with_its_own_files(self):
+        """A subtask working in the integration worktree measured its diff
+        against the *task* base, which still holds the Test Author's commit and
+        every earlier subtask's — so the second one in a sequential run was
+        credited with its predecessors' files and reported them as scope
+        violations it never committed. Waves of one are not exotic: any
+        dependency chain or overlapping scope produces them at any cap."""
+        def test_author(env, cwd):
+            with open(os.path.join(cwd, "test_requirements.py"), "w") as fh:
+                fh.write("def test_it():\n    pass\n")
+
+        def implementer(env, cwd):
+            # Cap 1, so both run in the same integration worktree: which subtask
+            # this is comes from the prompt, not the directory name.
+            sub = "st-1-alpha" if not os.path.exists(os.path.join(cwd, "alpha.py")) \
+                else "st-2-beta"
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = 1\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "did %s" % sub,
+                "evidence": {"tests": "ok"}})
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": test_author,
+                  "reviewer": self._approve}
+        task = store.Task.create(self.t.repo, "T-SC5", "# t\n\nAdd two things\n",
+                                 self._pol(1))
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        self.assertEqual(by_id["st-1-alpha"]["actual_files"], ["alpha.py"])
+        self.assertEqual(by_id["st-2-beta"]["actual_files"], ["beta.py"],
+                         "it was credited with its predecessor's work")
+        self.assertEqual(by_id["st-2-beta"]["scope_violations"], [],
+                         "phantom scope violations from a cumulative diff base")
+
+    def test_an_idle_agent_is_still_caught_after_a_sibling_has_landed(self):
+        """The same cumulative base disarmed the "changed no files" guard: a
+        predecessor's work always looked like this subtask's, so an agent that
+        wrote nothing and reported `complete` was believed. The existing guard
+        test uses a one-subtask plan, which is the only shape where it fired."""
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            if not os.path.exists(os.path.join(cwd, "alpha.py")):
+                with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                    fh.write("V = 1\n")
+                _report(td, "implement-st-1-alpha.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-1-alpha", "status": "complete",
+                    "summary": "did alpha", "evidence": {"tests": "ok"}})
+                return
+            # st-2-beta writes nothing at all, and says it finished.
+            _report(td, "implement-st-2-beta.json", {
+                "stage": "implement", "role": "implementer",
+                "subtask": "st-2-beta", "status": "complete",
+                "summary": "nothing to do", "evidence": {"tests": "ok"}})
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "reviewer": self._approve}
+        task = store.Task.create(self.t.repo, "T-SC6", "# t\n\nAdd two things\n",
+                                 self._pol(1))
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "needs_human",
+                         "an agent that wrote nothing was delivered as done\n"
+                         + "\n".join(logs))
+        self.assertIn("changed no files", "\n".join(logs))
+        self.assertFalse(os.path.exists(task.file("integrate.patch")))
+
+    def test_a_rework_sees_what_its_siblings_landed(self):
+        """A subtask's own checkout is a snapshot of the moment it was cut, so a
+        rework after `REQUEST_CHANGES` ran against a tree missing everything its
+        siblings merged in the meantime — the checks were evidence about an
+        incomplete tree, and a finding citing a sibling's file pointed at a file
+        the agent could not see. It stays in its own worktree, which is what
+        preserves an interrupted subtask's salvage checkpoints; `_catch_up`
+        brings that worktree up to the integration branch first."""
+        seen = []
+        rounds = {"n": 0}
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
+            if rounds["n"] and sub == "st-1-alpha":
+                # the rework round: can it see what st-2-beta landed?
+                seen.append(os.path.isfile(os.path.join(cwd, "beta.py")))
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = %d\n" % (rounds["n"] + 1))
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete",
+                "summary": "round %s" % ("one" if not rounds["n"] else "two"),
+                "evidence": {"tests": "ok"}})
+
+        def reviewer(env, cwd):
+            rounds["n"] += 1
+            first = rounds["n"] == 1
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
+                "stage": "review", "role": "reviewer", "status": "complete",
+                "summary": "ruled", "evidence": {"tests": "ok"},
+                "role_data": {"verdict": {
+                    "verdict": "REQUEST_CHANGES" if first else "APPROVE",
+                    "ac_table": [{"ac": "AC-1",
+                                  "status": "unmet" if first else "met"}],
+                    "findings": ([{"id": "f-1", "severity": "blocking",
+                                   "claim": "alpha must agree with beta.py",
+                                   "cite": "AC-1",
+                                   "suggested_owner": "st-1-alpha"}]
+                                 if first else [])}}})
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "reviewer": reviewer}
+        task = store.Task.create(self.t.repo, "T-SC7", "# t\n\nAdd two things\n",
+                                 self._pol(2))
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertEqual(seen, [True],
+                         "the rework ran against a tree without the sibling's "
+                         "landed work: %s\n%s" % (seen, "\n".join(logs)))
+        # And it is still credited with its own file only, not the sibling's it
+        # can now see: the diff base follows the tree on every dispatch.
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        self.assertEqual(by_id["st-1-alpha"]["actual_files"], ["alpha.py"])
+        self.assertEqual(by_id["st-1-alpha"]["scope_violations"], [])
+
+    def test_a_replan_keeps_what_a_surviving_subtask_already_owns(self):
+        """`_read_plan_subtasks` rebuilds every subtask from plan.md, so a
+        replan that reissues an id dropped its `worktree` and `base_commit`
+        while the checkout and branch stayed on disk. `create_worktree` then
+        reused the checkout and ignored the base it was handed, and the subtask
+        recorded TODAY's integration tip — a commit its own worktree had never
+        seen — so its diff was credited with every file its siblings landed."""
+        rounds = {"review": 0}
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = %d\n" % (rounds["review"] + 1))
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete",
+                "summary": "round %s" % ("one" if not rounds["review"] else "two"),
+                "evidence": {"tests": "ok"}})
+
+        def reviewer(env, cwd):
+            rounds["review"] += 1
+            first = rounds["review"] == 1
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
+                "stage": "review", "role": "reviewer", "status": "complete",
+                "summary": "ruled", "evidence": {"tests": "ok"},
+                "role_data": {"verdict": {
+                    "verdict": "REPLAN" if first else "APPROVE",
+                    "ac_table": [{"ac": "AC-1",
+                                  "status": "unmet" if first else "met"}],
+                    "findings": []}}})
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "reviewer": reviewer}
+        task = store.Task.create(self.t.repo, "T-SC8", "# t\n\nAdd two things\n",
+                                 self._pol(2))
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        self.assertEqual(by_id["st-1-alpha"]["actual_files"], ["alpha.py"],
+                         "the replan rebased its diff onto its sibling's work")
+        self.assertEqual(by_id["st-2-beta"]["actual_files"], ["beta.py"])
+        for s in by_id.values():
+            self.assertEqual(s["scope_violations"], [], s["id"])
+
+    def test_a_replan_reaps_the_worktree_of_a_subtask_it_drops(self):
+        """`_reap_worktrees` names paths out of `state["subtasks"]`, so a plan
+        that renames a subtask leaves a checkout nobody can name and the reaper
+        walks past it forever — the failure the persistence it relies on exists
+        to prevent."""
+        rounds = {"review": 0}
+        RENAMED = self.INDEPENDENT.replace("st-1-alpha", "st-9-delta")
+
+        def planner(env, cwd):
+            # Keyed on the review, not on a call counter: `brainstorm`
+            # dispatches the planner too, so counting planner calls made the
+            # very first plan the renamed one and st-1-alpha never existed.
+            body = self.INDEPENDENT if rounds["review"] == 0 else RENAMED
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(body)
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            name = _tree_name(cwd)
+            sub = next((s for s in ("st-1-alpha", "st-9-delta", "st-2-beta")
+                        if s in name), "st-2-beta")
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = %d\n" % (rounds["review"] + 1))
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete",
+                "summary": "round %s" % ("one" if not rounds["review"] else "two"),
+                "evidence": {"tests": "ok"}})
+
+        def reviewer(env, cwd):
+            rounds["review"] += 1
+            first = rounds["review"] == 1
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
+                "stage": "review", "role": "reviewer", "status": "complete",
+                "summary": "ruled", "evidence": {"tests": "ok"},
+                "role_data": {"verdict": {
+                    "verdict": "REPLAN" if first else "APPROVE",
+                    "ac_table": [{"ac": "AC-1",
+                                  "status": "unmet" if first else "met"}],
+                    "findings": []}}})
+
+        script = {"planner": planner, "implementer": implementer,
+                  "test-author": lambda e, c: None, "reviewer": reviewer}
+        task = store.Task.create(self.t.repo, "T-SC9", "# t\n\nAdd two things\n",
+                                 self._pol(2))
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        trees = subprocess.run(["git", "worktree", "list"], cwd=self.t.repo,
+                               capture_output=True, text=True).stdout
+        self.assertNotIn("T-SC9-st-1-alpha", trees,
+                         "the dropped subtask's worktree outlived the task:\n" + trees)
+
+    def test_a_merge_failure_does_not_swallow_a_siblings_replan(self):
+        """Merging the finished members before classifying the wave's outcomes
+        let a `Halt` from `_integrate_wave` outrank a sibling's `Replan` — the
+        ladder's rung 3, with its escalation bundle already written — and would
+        do the same to a quota park's reopen time. That is the very
+        "the sequential and parallel paths disagreed about the same event"
+        failure the re-raises exist to prevent."""
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            name = _tree_name(cwd)
+            if "st-3-gamma" in name:
+                _report(td, "implement-st-3-gamma.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-3-gamma", "status": "escalate",
+                    "summary": "the plan is wrong",
+                    "signals": [{"type": "plan_conflict",
+                                 "detail": "gamma cannot be built as planned",
+                                 "evidence": "no interface to build against"}],
+                    "evidence": {"not_verified": ["everything"]}})
+                return
+            sub = "st-1-alpha" if "st-1-alpha" in name else "st-2-beta"
+            # Both write the same file with different content. Their DECLARED
+            # scopes are disjoint, so the wave still forms all three — and the
+            # second merge is an add/add conflict the scripted integrator
+            # cannot resolve, which is how `_integrate_wave` is made to Halt.
+            with open(os.path.join(cwd, "shared.py"), "w") as fh:
+                fh.write("OWNER = %r\n" % sub)
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "did %s" % sub,
+                "evidence": {"tests": "ok"}})
+
+        script = {"planner": self._planner(self.CONFLICTING),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "integrator": lambda e, c: None, "reviewer": self._approve}
+        task = store.Task.create(self.t.repo, "T-SCA", "# t\n\nAdd three things\n",
+                                 self._pol(3))
+        logs = []
+        Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                     lambda k, t: True, log=logs.append).run()
+        self.assertEqual(task.state["spent"]["replans"], 1,
+                         "the sibling's rung 3 was swallowed by the merge "
+                         "failure\n" + "\n".join(logs))
+        self.assertIn("plan_conflict", task.read_text("escalation.md", ""),
+                      "the escalation bundle names the wrong signal")
+
+    def test_a_failed_merge_leaves_no_conflict_markers_behind(self):
+        """`_reconcile` could raise out of an unfinished merge, and the run does
+        not always end there — a sibling's `Replan` continues at the plan stage,
+        where `_author_tests` does a blind `git add -A && git commit` and
+        committed the conflict markers as the resolution. The run then reached
+        `done` and shipped them in the patch."""
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            name = _tree_name(cwd)
+            if "st-3-gamma" in name:
+                _report(td, "implement-st-3-gamma.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-3-gamma", "status": "escalate",
+                    "summary": "the plan is wrong",
+                    "signals": [{"type": "plan_conflict",
+                                 "detail": "gamma cannot be built as planned",
+                                 "evidence": "no interface to build against"}],
+                    "evidence": {"not_verified": ["everything"]}})
+                return
+            sub = "st-1-alpha" if "st-1-alpha" in name else "st-2-beta"
+            with open(os.path.join(cwd, "shared.py"), "w") as fh:
+                fh.write("OWNER = %r\n" % sub)
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "did %s" % sub,
+                "evidence": {"tests": "ok"}})
+
+        script = {"planner": self._planner(self.CONFLICTING),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "integrator": lambda e, c: None, "reviewer": self._approve}
+        task = store.Task.create(self.t.repo, "T-SCD", "# t\n\nAdd three things\n",
+                                 self._pol(3))
+        logs = []
+        Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                     lambda k, t: True, log=logs.append).run()
+        wt = task.state["worktree"]
+        mid = subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                             cwd=wt, capture_output=True, text=True)
+        self.assertNotEqual(mid.returncode, 0,
+                            "the worktree was left mid-merge: %s" % mid.stdout)
+        # The whole history of the branch, not just its tip: a later round can
+        # overwrite the file, so asking HEAD alone would miss a commit that
+        # introduced markers and a subsequent one that happened to clear them.
+        # `-S` finds any commit that changed how often the string occurs.
+        introduced = subprocess.run(
+            ["git", "log", "-S", "<<<<<<<", "--oneline", task.state["branch"]],
+            cwd=self.t.repo, capture_output=True, text=True).stdout
+        self.assertEqual(introduced.strip(), "",
+                         "a commit carried conflict markers:\n%s" % introduced)
+        self.assertNotIn("<<<<<<<", task.read_text("integrate.patch", ""),
+                         "the delivered patch carries markers")
+
+    def test_a_member_behind_a_broken_merge_is_not_left_complete(self):
+        """`_integrate_wave` raises on the first member that breaks the branch,
+        and every member behind it was already marked `complete` by
+        `_finish_subtask` — but never merged, and a complete subtask never
+        rejoins a wave. Its work was delivered as done and absent, the same
+        silent loss as a partially failed wave, through the broken-merge door.
+        """
+        state = {"beta_breaks": True}
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            name = _tree_name(cwd)
+            sub = next(s for s in ("st-1-alpha", "st-2-beta", "st-3-gamma")
+                       if s in name)
+            leaf = sub.split("-")[-1]
+            with open(os.path.join(cwd, leaf + ".py"), "w") as fh:
+                fh.write("V = 1\n")
+            if sub == "st-2-beta" and state["beta_breaks"]:
+                # Poisons the shared config only once merged: alone in its own
+                # worktree the checks still pass, which is the case the
+                # post-merge verify exists to catch.
+                with open(os.path.join(cwd, "boom.py"), "w") as fh:
+                    fh.write("raise SystemExit(1)\n")
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "did %s" % sub,
+                "evidence": {"tests": "ok"}})
+
+        # A script, not an inline `python3 -c`: the check needs nested quotes,
+        # and `yamlite` does not process backslash escapes inside a quoted
+        # scalar, so the command reaches the shell with its backslashes intact
+        # and fails to parse — which looks like every check failing rather than
+        # like a broken fixture.
+        _spit(os.path.join(self.t.repo, "combo_check.py"),
+              "import os, sys\n"
+              "sys.exit(1 if os.path.exists('boom.py') and "
+              "os.path.exists('alpha.py') else 0)\n")
+        _spit(os.path.join(self.t.repo, ".adg.yaml"),
+              'fast:\n  - "python3 combo_check.py"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "combination check"], self.t.repo)
+
+        script = {"planner": self._planner(self.CONFLICTING),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "integrator": lambda e, c: None, "reviewer": self._approve}
+        task = store.Task.create(self.t.repo, "T-SCE", "# t\n\nAdd three things\n",
+                                 self._pol(3))
+        logs = []
+        first = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                             lambda k, t: True, log=logs.append).run()
+        self.assertEqual(first, "needs_human", "\n".join(logs))
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        for sid, s in by_id.items():
+            if s.get("status") == "complete":
+                self.assertTrue(s.get("merged"),
+                                "%s is complete but its branch never merged" % sid)
+
+    def test_a_request_for_changes_with_nothing_blocking_stops(self):
+        """`severity: minor` is legal, so `blocking` can legally be empty — and
+        then no owner is named, `_reopen_subtasks` falls through to reopening
+        EVERYTHING, and `pending_findings` is empty. Every green subtask was
+        rebuilt from scratch with no idea what was wrong, through a
+        schema-legal verdict."""
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = 1\n")
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "done", "evidence": {"tests": "ok"}})
+
+        def reviewer(env, cwd):
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
+                "stage": "review", "role": "reviewer", "status": "complete",
+                "summary": "ruled", "evidence": {"tests": "ok"},
+                "role_data": {"verdict": {
+                    "verdict": "REQUEST_CHANGES",
+                    "ac_table": [{"ac": "AC-1", "status": "unmet"}],
+                    "findings": [{"id": "f-1", "severity": "minor",
+                                  "claim": "naming could be better",
+                                  "cite": "taste"}]}}})
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "reviewer": reviewer}
+        task = store.Task.create(self.t.repo, "T-SCB", "# t\n\nAdd two things\n",
+                                 self._pol(2))
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "needs_human")
+        self.assertIn("no blocking finding", "\n".join(logs))
+
+    def test_a_request_for_changes_with_no_findings_at_all_says_so(self):
+        # `%` binds tighter than `or`, so the fallback clause was unreachable
+        # and the message trailed off after its colon.
+        task = store.Task.create(self.t.repo, "T-SCF", "# t\n", self._pol(1))
+        task.update(subtasks=[{"id": "st-1", "status": "complete",
+                               "planned_scope": ["**"], "actual_files": []}])
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(),
+                            lambda k, t: True, log=lambda *_: None)
+        with self.assertRaises(Halt) as cm:
+            orch._apply_verdict({"verdict": "REQUEST_CHANGES", "ac_table": [],
+                                 "findings": []})
+        self.assertIn("listed no findings at all", str(cm.exception))
+
+    def test_a_finding_naming_no_subtask_still_reaches_whoever_reworks(self):
+        """`suggested_owner` is written by hand against ids the planner chose.
+        One naming no subtask reopened `subtasks[0]` on the no-owners
+        fallback — and `_findings_brief` then filtered it out of that subtask's
+        brief, because it has an owner and this is not it. The agent was sent
+        back to rebuild with the reason withheld."""
+        seen, rounds = [], {"review": 0}
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
+            if _tree_name(cwd).endswith("-work"):
+                sub = "st-1-alpha"
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = %d\n" % (rounds["review"] + 1))
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete",
+                "summary": "round %s" % ("one" if not rounds["review"] else "two"),
+                "evidence": {"tests": "ok"}})
+
+        def reviewer(env, cwd):
+            rounds["review"] += 1
+            first = rounds["review"] == 1
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
+                "stage": "review", "role": "reviewer", "status": "complete",
+                "summary": "ruled", "evidence": {"tests": "ok"},
+                "role_data": {"verdict": {
+                    "verdict": "REQUEST_CHANGES" if first else "APPROVE",
+                    "ac_table": [{"ac": "AC-1",
+                                  "status": "unmet" if first else "met"}],
+                    "findings": ([{"id": "f-1", "severity": "blocking",
+                                   "claim": "the guard is missing",
+                                   "cite": "AC-1",
+                                   "suggested_owner": "st-7-nonexistent"}]
+                                 if first else [])}}})
+
+        class Recorder(runtime.MockAdapter):
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "implementer":
+                    seen.append(text)
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "reviewer": reviewer}
+        task = store.Task.create(self.t.repo, "T-SCC", "# t\n\nAdd two things\n",
+                                 self._pol(2))
+        logs = []
+        status = Orchestrator(task, self.reg, Recorder(script), lambda k, t: True,
+                              log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        rework = [t for t in seen if "the guard is missing" in t]
+        self.assertTrue(rework,
+                        "the finding reached nobody: it named a subtask that "
+                        "does not exist, so it was filtered out of every brief")
+
+    def test_every_reworking_subtask_gets_its_own_findings(self):
+        """`_finish_subtask` cleared the whole `pending_findings` list, so the
+        first subtask to go green disarmed the rework for every other one: a
+        reviewer that rejected st-1 and st-2 saw st-1 fixed, and st-2 was then
+        re-dispatched with nothing -- back to the same code with the same
+        prompt, rebuilding what was rejected. Sequential, with a cap of one:
+        no concurrency is involved, the second subtask is simply dispatched
+        after the first has finished."""
+        seen, rounds, holder = [], {"review": 0}, {}
+
+        class Recorder(runtime.MockAdapter):
+            """The prompt is how a sequential mock knows which subtask it is:
+            at a cap of one every subtask runs in the same integration
+            worktree, so there is no directory name to read."""
+
+            last = ""
+
+            def prompt(self, session, text, timeout):
+                if session.handle["role"] == "implementer":
+                    self.last = text
+                    seen.append(text)
+                return runtime.MockAdapter.prompt(self, session, text, timeout)
+
+        def implementer(env, cwd):
+            sub = ("st-1-alpha" if "Your subtask: st-1-alpha" in holder["a"].last
+                   else "st-2-beta")
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = %d\n" % rounds["review"])
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete",
+                # Distinct per round, and it has to be: `_collect_report`
+                # decides freshness on (mtime, size), so a byte-identical
+                # rewrite inside one filesystem tick reads as no report at all.
+                "summary": "round %s" % ("one" if rounds["review"] == 0 else "two"),
+                "evidence": {"tests": "ok"}})
+
+        def reviewer(env, cwd):
+            rounds["review"] += 1
+            first = rounds["review"] == 1
+            verdict = {
+                "verdict": "REQUEST_CHANGES" if first else "APPROVE",
+                "ac_table": [{"ac": "AC-1", "status": "unmet" if first else "met"}],
+                "findings": ([{"id": "f-1", "severity": "blocking",
+                               "claim": "alpha is wrong", "cite": "AC-1",
+                               "suggested_owner": "st-1-alpha"},
+                              {"id": "f-2", "severity": "blocking",
+                               "claim": "beta is wrong", "cite": "AC-2",
+                               "suggested_owner": "st-2-beta"}] if first else []),
+            }
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
+                "stage": "review", "role": "reviewer", "status": "complete",
+                "summary": "ruled", "evidence": {"tests": "ok"},
+                "role_data": {"verdict": verdict}})
+
+        script = {"planner": self._planner(self.INDEPENDENT),
+                  "implementer": implementer, "test-author": lambda e, c: None,
+                  "reviewer": reviewer}
+        adapter = Recorder(script)
+        holder["a"] = adapter
+        task = store.Task.create(self.t.repo, "T-SC4", "# t\n\nAdd two things\n",
+                                 self._pol(1))
+        logs = []
+        status = Orchestrator(task, self.reg, adapter, lambda k, t: True,
+                              log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+
+        mine = [t for t in seen if "Your subtask: st-2-beta" in t]
+        self.assertEqual(len(mine), 2, "st-2-beta should have been dispatched "
+                                       "once, then again for the rework")
+        self.assertIn("beta is wrong", mine[-1],
+                      "the second reworking subtask was dispatched with no "
+                      "findings — a sibling's completion had cleared them")
+        self.assertNotIn("alpha is wrong", mine[-1],
+                         "it was handed another subtask's finding")
+        self.assertEqual(task.state.get("pending_findings"), [],
+                         "findings outlived the review that raised them")
+
+
+class TestSecondColdRead(unittest.TestCase):
+    """What a third cold read found under `TestSubtaskContinuity`.
+
+    The same family -- a subtask's work, or the reason it was sent back, going
+    missing while the run reports success -- but reached through the paths the
+    continuity fixes themselves opened: a flag that is set and never cleared, a
+    handler narrower than the exceptions that reach it, a union that can only
+    grow. None is a race; each reproduces on the first run and every run.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        self.task = store.Task.create(self.t.repo, "T-CR", "# t\n\ndo it\n", self.pol)
+        self.logs = []
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _orch(self, adapter=None):
+        return Orchestrator(self.task, self.reg,
+                            adapter or runtime.MockAdapter({}),
+                            lambda k, t: True, log=self.logs.append)
+
+    def _branches(self):
+        out = subprocess.run(["git", "branch", "--format=%(refname:short)"],
+                             cwd=self.t.repo, capture_output=True, text=True).stdout
+        return set(out.split())
+
+    def _commit(self, cwd, name, body):
+        with open(os.path.join(cwd, name), "w") as fh:
+            fh.write(body)
+        sh(["git", "add", "-A"], cwd)
+        sh(["git", "commit", "-qm", "add %s" % name], cwd)
+
+    # --- the flag that outlived what it described ---------------------------
+
+    def test_reopening_a_subtask_clears_the_flag_that_says_it_landed(self):
+        """`merged` is what `_unfinish` reads to decide whether a subtask that
+        did not make it onto the integration branch may stay `complete`. It was
+        set on a successful merge and cleared nowhere, so a subtask that landed
+        in wave one and was then sent back by the reviewer carried the flag into
+        its rework: when THAT merge was aborted, `_unfinish`'s
+        `complete and not merged` guard was false, the subtask stayed complete,
+        and the run fell through review to integrate and delivered a patch with
+        none of the rework in it."""
+        self.task.update(subtasks=[
+            {"id": "st-1", "status": "complete", "merged": True, "actual_files": []},
+            {"id": "st-2", "status": "complete", "merged": True, "actual_files": []}])
+        orch = self._orch()
+        orch._reopen_subtasks({"st-1"})
+
+        by_id = {s["id"]: s for s in self.task.state["subtasks"]}
+        self.assertEqual(by_id["st-1"]["status"], "pending")
+        self.assertFalse(by_id["st-1"].get("merged"),
+                         "a reopened subtask still claims its work is on the "
+                         "integration branch, so `_unfinish` will refuse to "
+                         "reopen it when the rework's own merge fails")
+        # The one that was not reopened is untouched: its work really is landed.
+        self.assertEqual(by_id["st-2"]["status"], "complete")
+        self.assertTrue(by_id["st-2"]["merged"])
+
+        # And the guard now bites: mark it complete again without a merge, and
+        # `_unfinish` sends it back rather than letting it be delivered as done.
+        self.task.update(subtasks=[dict(s, status="complete")
+                                   for s in self.task.state["subtasks"]])
+        orch._unfinish([{"id": "st-1"}])
+        self.assertEqual({s["id"]: s["status"]
+                          for s in self.task.state["subtasks"]}["st-1"], "pending")
+
+    def test_the_no_owners_fallback_clears_the_flag_too(self):
+        """`_reopen_subtasks` with nothing named reopens `subtasks[0]` through a
+        separate branch, which is exactly the path a REQUEST_CHANGES whose
+        findings name no subtask takes."""
+        self.task.update(subtasks=[{"id": "st-1", "status": "complete",
+                                    "merged": True, "actual_files": []}])
+        self._orch()._reopen_subtasks({"st-nonexistent"})
+        s = self.task.state["subtasks"][0]
+        self.assertEqual(s["status"], "pending")
+        self.assertFalse(s.get("merged"))
+
+    # --- the handler narrower than what reaches it --------------------------
+
+    def _conflicting_wave(self, orch):
+        """An integration worktree and one subtask branch that cannot merge into
+        it: both edit the same line from the same parent."""
+        integration = orch._ensure_worktree()
+        self._commit(integration, "shared.py", "V = 'integration'\n")
+        branch = "adg/%s/st-1" % self.task.state["id"]
+        tree = os.path.join(self.t.dir, "st1-tree")
+        base = store.git(["rev-parse", "HEAD^"], integration).strip()
+        sh(["git", "worktree", "add", "-b", branch, tree, base], self.t.repo)
+        self._commit(tree, "shared.py", "V = 'subtask'\n")
+        self.task.update(subtasks=[{"id": "st-1", "status": "complete",
+                                    "worktree": tree, "actual_files": []}])
+        return integration
+
+    def test_a_merge_is_aborted_even_when_the_integrator_cannot_be_reached(self):
+        """`_integrate_wave` cleaned up after `_reconcile` on `Halt` alone. But
+        `_reconcile` dispatches an agent, so it also raises `AllChannelsCooled`
+        (every integrator seat walled mid-conflict) and adapter `RuntimeError_`
+        -- neither a `Halt`, and both unwound straight past the handler, leaving
+        MERGE_HEAD set and conflict markers in the files. The run does not end
+        there, and the next `_checkpoint` is a blind `git add -A && git commit`,
+        so the markers were committed as the resolution and shipped."""
+        for boom in (router.AllChannelsCooled("integrator", ["seat"],
+                                               time.time() + 60, "all cooled"),
+                     runtime.RuntimeError_("the integrator CLI vanished")):
+            with self.subTest(raised=type(boom).__name__):
+                self.tearDown()
+                self.setUp()
+                orch = self._orch()
+                integration = self._conflicting_wave(orch)
+                orch._reconcile = lambda *a, **k: (_ for _ in ()).throw(boom)
+
+                with self.assertRaises(type(boom)):
+                    orch._integrate_wave([self.task.state["subtasks"][0]])
+
+                self.assertFalse(
+                    os.path.exists(os.path.join(integration, ".git")) and
+                    os.path.exists(store.git(["rev-parse", "--git-dir"],
+                                       integration).strip() + "/MERGE_HEAD"),
+                    "the integration worktree was left mid-merge, so the next "
+                    "blind `git add -A && git commit` ships conflict markers")
+                with open(os.path.join(integration, "shared.py")) as fh:
+                    self.assertNotIn("<<<<<<<", fh.read(),
+                                     "conflict markers were left in the tree")
+                self.assertEqual(self.task.state["subtasks"][0]["status"], "pending",
+                                 "a subtask that never reached the integration "
+                                 "branch was left marked complete")
+
+    def test_a_cooled_integrator_still_parks_on_quota(self):
+        """`AllChannelsCooled` subclasses `NoModelAvailable` precisely so a
+        mandatory stage propagates it to the park handler. `_reconcile` caught
+        the parent, so the one exception carrying a reopen time was flattened
+        into a bare `Halt("needs_human")`: `_quota_park` never ran, no `park`
+        was written, and `resume --when-open` returned immediately on a run that
+        was merely early."""
+        orch = self._orch()
+        cooled = router.AllChannelsCooled("integrator", ["claude-seat"],
+                                           time.time() + 3600, "all cooled")
+
+        def pick(role, **kw):
+            raise cooled
+        orch._pick = pick
+        with self.assertRaises(router.AllChannelsCooled):
+            orch._reconcile({"id": "st-1"}, self.t.repo, "CONFLICT")
+
+        # ... and an ordinary "nothing enrolled" still halts, as it always did.
+        def none_available(role, **kw):
+            raise router.NoModelAvailable("no integrator enrolled")
+        orch._pick = none_available
+        with self.assertRaises(Halt):
+            orch._reconcile({"id": "st-1"}, self.t.repo, "CONFLICT")
+
+    # --- the base that moved under the branch -------------------------------
+
+    def test_a_deleted_worktree_does_not_move_the_task_base(self):
+        """`_ensure_worktree` re-ran whenever the checkout was missing -- a
+        parked task whose worktree the user deleted, which both READMEs invite
+        by calling them throwaway -- and rewrote `base_commit` to today's HEAD.
+        `create_worktree` reattaches the branch that already exists and ignores
+        the base it is handed, so the branch still forked where it always did:
+        `_land` then wrote `git diff <today> <branch>`, a patch carrying a
+        reverse-delta for every commit the user made while the task was parked.
+        Applying it would have reverted their own work."""
+        orch = self._orch()
+        tree = orch._ensure_worktree()
+        original = self.task.state["repo"]["base_commit"]
+
+        # The user cleans up the checkout and gets on with their own work.
+        subprocess.run(["git", "worktree", "remove", "--force", tree],
+                       cwd=self.t.repo, capture_output=True)
+        self._commit(self.t.repo, "unrelated.py", "MINE = 1\n")
+        moved = store.git(["rev-parse", "HEAD"], self.t.repo).strip()
+        self.assertNotEqual(original, moved)
+
+        self._orch()._ensure_worktree()
+        self.assertEqual(self.task.state["repo"]["base_commit"], original,
+                         "the task base followed the user's own commits, so the "
+                         "delivered patch would revert them")
+
+    # --- the branch a discarded plan left behind ----------------------------
+
+    def test_a_replan_does_not_inherit_an_unmerged_branch(self):
+        """A REPLAN is raised by the subtask that failed, so the branch behind a
+        reissued id holds the attempt written for the plan that was just thrown
+        away. `_prepare` re-reads HEAD *above* those commits, so `actual_files`
+        and the scope check never saw them -- while `_integrate_wave` merges the
+        branch whole, landing work for an abandoned goal in the patch with
+        nothing accounting for it."""
+        orch = self._orch()
+        branch = "adg/%s/st-1" % self.task.state["id"]
+        tree = os.path.join(self.t.dir, "st1-tree")
+        sh(["git", "worktree", "add", "-b", branch, tree], self.t.repo)
+        self._commit(tree, "abandoned.py", "DISCARDED = 1\n")
+        self.task.update(subtasks=[{"id": "st-1", "status": "pending",
+                                    "worktree": tree, "base_commit": "deadbee",
+                                    "actual_files": []}])
+
+        fresh = orch._reseed([{"id": "st-1", "goal": "something else",
+                               "planned_scope": ["other.py"]}])
+
+        self.assertNotIn(branch, self._branches(),
+                         "the reissued id kept the discarded plan's branch, so "
+                         "its commits land in the patch unaccounted for")
+        self.assertIn(branch + ".replaced-1", self._branches(),
+                      "the abandoned attempt was destroyed rather than shelved")
+        self.assertNotIn("worktree", fresh[0])
+        self.assertNotIn("base_commit", fresh[0])
+        self.assertFalse(os.path.isdir(tree))
+
+    def test_a_replan_keeps_a_branch_whose_work_already_landed(self):
+        """The other side of the same rule. Work that reached the integration
+        branch is accounted for, so there is nothing to strand: that checkout is
+        kept and `_catch_up` brings it current, which is what preserves an
+        interrupted subtask's salvage checkpoints across a replan."""
+        orch = self._orch()
+        branch = "adg/%s/st-1" % self.task.state["id"]
+        tree = os.path.join(self.t.dir, "st1-tree")
+        sh(["git", "worktree", "add", "-b", branch, tree], self.t.repo)
+        self.task.update(subtasks=[{"id": "st-1", "status": "complete",
+                                    "worktree": tree, "base_commit": "cafe123",
+                                    "merged": True, "actual_files": []}])
+
+        fresh = orch._reseed([{"id": "st-1", "goal": "refined"}])
+        self.assertIn(branch, self._branches())
+        self.assertEqual(fresh[0]["worktree"], tree)
+        self.assertEqual(fresh[0]["base_commit"], "cafe123")
+        self.assertFalse(fresh[0].get("merged"),
+                         "the reissued id inherited `merged`, which would tell "
+                         "`_unfinish` that work it has not done yet is landed")
+
+    # --- what a union could not take back -----------------------------------
+
+    def test_a_file_a_rework_deleted_leaves_the_file_list(self):
+        """`actual_files` accumulates because the diff base moves forward with
+        the tree on every dispatch. But a union can only grow, so a file the
+        rework DELETED came straight back -- the deletion is itself a change --
+        and went on being reported as a scope violation, went on blocking
+        `_skip_review`, and was still shown at the merge gate as a changed file
+        the patch does not contain."""
+        orch = self._orch()
+        tree = orch._ensure_worktree()
+        sub = {"id": "st-1", "status": "pending", "planned_scope": ["kept.py"],
+               "actual_files": []}
+        self.task.update(subtasks=[sub])
+
+        self._commit(tree, "kept.py", "KEPT = 1\n")
+        self._commit(tree, "scratch.py", "SCRATCH = 1\n")
+        orch._finish_subtask(sub, tree)
+        landed = self.task.state["subtasks"][0]
+        self.assertEqual(landed["actual_files"], ["kept.py", "scratch.py"])
+        self.assertEqual(landed["scope_violations"], ["scratch.py"])
+
+        # The rework does what the finding asked: the stray file goes away. Its
+        # own diff base has moved on to the commit above, so the deletion is the
+        # only thing it shows.
+        os.remove(os.path.join(tree, "scratch.py"))
+        sh(["git", "add", "-A"], tree)
+        sh(["git", "commit", "-qm", "drop the stray file"], tree)
+        sub["base_commit"] = store.git(["rev-parse", "HEAD^"], tree).strip()
+        orch._finish_subtask(sub, tree)
+
+        landed = self.task.state["subtasks"][0]
+        self.assertEqual(landed["actual_files"], ["kept.py"],
+                         "a file with no net effect is still listed as changed")
+        self.assertEqual(landed["scope_violations"], [],
+                         "the rework fixed the scope violation and was still "
+                         "charged with it")
+
+    # --- the commit the orchestrator makes on its own account ---------------
+
+    def test_a_merge_does_not_depend_on_the_users_git_identity(self):
+        """`_checkpoint` always passed `-c user.email/-c user.name`, because the
+        pipeline must not depend on the user having configured git. The merges
+        did not, and a merge writes a commit too. With no identity anywhere, a
+        fast-forward still succeeds while a real merge exits non-zero with
+        "Committer identity unknown" -- which `_integrate_wave` reads as a
+        conflict: it pays an integrator to resolve one that does not exist,
+        finds no unmerged paths, verifies a branch nothing was merged into, and
+        marks the subtask landed. Success, with none of its work in the patch."""
+        orch = self._orch()
+        integration = orch._ensure_worktree()
+        # Diverging, so the merge needs a commit of its own rather than a
+        # fast-forward -- the only case that needs an identity.
+        self._commit(integration, "integration.py", "SIDE = 'a'\n")
+        branch = "adg/%s/st-1" % self.task.state["id"]
+        tree = os.path.join(self.t.dir, "st1-tree")
+        base = store.git(["rev-parse", "HEAD^"], integration).strip()
+        sh(["git", "worktree", "add", "-b", branch, tree, base], self.t.repo)
+        self._commit(tree, "subtask.py", "SIDE = 'b'\n")
+        self.task.update(subtasks=[{"id": "st-1", "status": "complete",
+                                    "worktree": tree, "actual_files": []}])
+
+        # Only now, so the fixture's own commits above are unaffected. Three
+        # things together, because any one alone leaves an identity standing:
+        # the repository's own config, the developer's ~/.gitconfig (which would
+        # otherwise make this pass on a laptop and fail in the container it
+        # describes), and git's willingness to invent `user@host` from the gecos
+        # field, which `useConfigOnly` is what switches off. The local config is
+        # shared by every linked worktree, so this covers both merge sites.
+        sh(["git", "config", "--unset", "user.email"], self.t.repo)
+        sh(["git", "config", "--unset", "user.name"], self.t.repo)
+        sh(["git", "config", "user.useConfigOnly", "true"], self.t.repo)
+        restore = {k: os.environ.get(k)
+                   for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")}
+        for key in restore:
+            os.environ[key] = os.devnull
+        try:
+            def refuse(*a, **k):
+                raise AssertionError("an integrator was dispatched to resolve a "
+                                     "conflict that does not exist")
+            orch._reconcile = refuse
+            orch._integrate_wave([self.task.state["subtasks"][0]])
+
+            self.assertTrue(os.path.isfile(os.path.join(integration, "subtask.py")),
+                            "the run reported the merge and delivered none of it")
+            self.assertTrue(self.task.state["subtasks"][0]["merged"])
+
+            # `_catch_up` writes a merge commit on the same terms, and its
+            # failure is quieter still: it logs that the worktree could not be
+            # brought up to the branch, and the rework runs on the stale tree.
+            sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=Test",
+                "commit", "-q", "--allow-empty", "-m", "diverge"], tree)
+            orch._catch_up(self.task.state["subtasks"][0], tree)
+            self.assertTrue(os.path.isfile(os.path.join(tree, "integration.py")),
+                            "the reused worktree was never brought up to the "
+                            "integration branch: %s" % "\n".join(self.logs))
+        finally:
+            for key, was in restore.items():
+                if was is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = was
+
+    # --- the context the escalation paid for and threw away ------------------
+
+    def test_the_stronger_model_is_told_what_the_last_one_already_tried(self):
+        """`_one_subtask` builds the escalation context -- the signals, the
+        evidence, the `attempted` list -- and hands it to `_invoke` as
+        `failure`. `_invoke` read it only when continuing a session or handing
+        over on a quota hop, and `_climb` returns `session = None` by
+        construction, because the whole point is a different model. So the one
+        path that most needs the context was the one path that dropped it: the
+        dearer model opened on the plain role prompt and re-tried what its
+        predecessor had already reported as failed. references/escalation.md:
+        the next model is smarter, not clairvoyant."""
+        PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+```
+"""
+        rounds = {"n": 0}
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            rounds["n"] += 1
+            with open(os.path.join(cwd, "alpha.py"), "w") as fh:
+                fh.write("ALPHA = %d\n" % rounds["n"])
+            if rounds["n"] == 1:
+                _report(td, "implement-st-1-alpha.json", {
+                    "stage": "implement", "role": "implementer",
+                    "subtask": "st-1-alpha", "status": "escalate",
+                    "summary": "the fixture will not build",
+                    "evidence": {"tests": "red"},
+                    "signals": [{
+                        "type": "test_stuck",
+                        "detail": "the fixture deadlocks on import",
+                        "evidence": "E   RuntimeError: event loop is closed",
+                        "attempted": ["raising the timeout",
+                                      "running the fixture eagerly"]}]})
+                return
+            _report(td, "implement-st-1-alpha.json", {
+                "stage": "implement", "role": "implementer",
+                "subtask": "st-1-alpha", "status": "complete",
+                "summary": "did alpha", "evidence": {"tests": "ok"}})
+
+        def reviewer(env, cwd):
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
+                "stage": "review", "role": "reviewer", "status": "complete",
+                "summary": "ok", "evidence": {"tests": "ok"},
+                "role_data": {"verdict": {"verdict": "APPROVE",
+                                          "ac_table": [{"ac": "AC-1",
+                                                        "status": "met"}],
+                                          "findings": []}}})
+
+        def planner(env, cwd):
+            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
+                fh.write(PLAN)
+
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\ntest_author: never\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+
+        adapter = runtime.MockAdapter({
+            "planner": planner, "implementer": implementer,
+            "test-author": lambda e, c: None, "reviewer": reviewer})
+        task = store.Task.create(self.t.repo, "T-ESC", "# t\n\nAdd alpha\n", self.pol)
+        logs = []
+        status = Orchestrator(task, self.reg, adapter, lambda k, t: True,
+                              log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+
+        sent = [text for role, text in adapter.calls if role == "implementer"]
+        self.assertEqual(len(sent), 2, "the subtask should have been dispatched "
+                                       "once, then again on the stronger seat")
+        self.assertIn("event loop is closed", sent[-1],
+                      "the escalated-to model was given no evidence")
+        self.assertIn("raising the timeout", sent[-1],
+                      "`attempted` never reached the replacement, so it is free "
+                      "to repeat what already failed")
+        # And the first dispatch is untouched: there is nothing to carry yet.
+        self.assertNotIn("event loop is closed", sent[0])
+
+    def test_the_failure_note_is_folded_in_without_losing_the_brief(self):
+        """The caller's `extra` is the findings brief. A rework that loses its
+        findings is the failure the hand-off exists to stop, so the note is
+        appended rather than substituted."""
+        both = Orchestrator._with_failure("THE FINDINGS", "WHAT FAILED")
+        self.assertIn("THE FINDINGS", both)
+        self.assertIn("WHAT FAILED", both)
+        self.assertEqual(Orchestrator._with_failure("only extra", None),
+                         "only extra")
+        self.assertIn("only failure", Orchestrator._with_failure(None, "only failure"))
+        self.assertIsNone(Orchestrator._with_failure(None, None))
+
+    # --- the write that failed and said nothing -----------------------------
+
+    def test_a_breaker_that_cannot_be_written_is_reported(self):
+        """`cooldown._mutate` returns the reason precisely so a caller can say
+        it -- "it must not pretend the write happened" -- and both production
+        callers dropped it, which made orchestrator/README.md's promise that an
+        unwritable file "is reported" false. A read-only state dir then cost
+        real money in silence: the wall was never recorded, every seat read as
+        ready, and the next run paid for the exhausted seat's refusal."""
+        orch = self._orch()
+        real = cooldown.record_use
+        cooldown.record_use = lambda *a, **k: "channels.json is not writable"
+        try:
+            choice = orch.router.candidates("implementer")[0]
+            orch._meter(choice)
+            orch._meter(choice)
+        finally:
+            cooldown.record_use = real
+
+        said = [l for l in self.logs if "not writable" in l]
+        self.assertEqual(len(said), 1,
+                         "a breaker write that failed was either never reported "
+                         "or repeated once per invocation: %s" % self.logs)
+
+    def test_status_falls_back_to_the_park_when_the_breaker_is_unreadable(self):
+        """`cmd_status` asks the breaker rather than the snapshot in task.json,
+        because the snapshot goes stale. But "the file could not be READ" is not
+        the same answer as "those windows have reopened", and only the second
+        means the task is runnable. Falling through reported a task that is
+        merely early as one that needs a human to think, and took away the
+        `resume --when-open` the paused-seat brief points at."""
+        import io
+        import contextlib
+
+        self.task.update(status="needs_human",
+                         park={"reason": "quota_all_exhausted", "role": "implementer",
+                               "channels": ["claude-seat"],
+                               "reopen_at": time.time() + 3600})
+        os.makedirs(os.path.dirname(cooldown.path()), exist_ok=True)
+        with open(cooldown.path(), "w") as fh:
+            fh.write("{not json at all")
+
+        class Args:
+            repo, registry = self.t.repo, REGISTRY
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_status(Args())
+        out = buf.getvalue()
+        self.assertIn("waiting on quota", out,
+                      "an unreadable breaker made a parked task look broken")
+        self.assertIn("reopens at", out)
+        self.assertIn("claude-seat", out)
+
+
+class TestDispatchWorkflow(unittest.TestCase):
+    """delegate as a general wrapper: the caller brings the decomposition.
+
+    The full protocol is one use. The other is execution only — a skill that
+    has already designed the work wants N jobs placed on N seats, in isolated
+    worktrees, with metering and failover underneath, and does not want a
+    planner second-guessing it or a reviewer it will not read. `--plan` plus
+    `workflows/dispatch` is that, and it needed no new stage: the machine
+    already recovers subtasks from plan.md when the state has none.
+    """
+
+    PLAN = """# Supplied by the caller
+
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+- id: st-2-beta
+  goal: add beta
+  file_scope: ["beta.py"]
+  acceptance: [AC-2]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
+                        max_parallel_agents=2)
+        self.dispatch = os.path.join(
+            os.path.dirname(wf.default_dir()), "dispatch")
+        self.addCleanup(setattr, wf, "_CURRENT", None)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo,
+                       capture_output=True)
+        self.t.close()
+
+    def test_the_bundled_dispatch_workflow_runs_only_execution(self):
+        self.assertTrue(os.path.isdir(self.dispatch), self.dispatch)
+        w = wf.use(self.dispatch)
+        for off in ("intake", "classify", "brainstorm", "plan", "review"):
+            self.assertFalse(w.enabled(off), "%s should be switched off" % off)
+        for on in ("implement", "integrate"):
+            self.assertTrue(w.enabled(on), "%s must stay on" % on)
+        # `integrate` in particular: it is the stage that merges the subtask
+        # branches and writes the patch, so a dispatcher without it would end
+        # the run with the work stranded on branches nobody merges.
+        self.assertEqual(w.next_enabled("implement", order=STAGES), "integrate")
+        self.assertEqual(w.next_enabled("intake", order=STAGES), "implement")
+
+    def test_a_supplied_plan_is_executed_with_no_planner_or_reviewer(self):
+        wf.use(self.dispatch)
+        dispatched = []
+
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
+            dispatched.append(sub)
+            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
+                fh.write("V = 1\n")
+            _report(td, "implement-%s.json" % sub, {
+                "stage": "implement", "role": "implementer", "subtask": sub,
+                "status": "complete", "summary": "did it",
+                "evidence": {"tests": "ok"}})
+
+        def refuse(role):
+            def fn(env, cwd):
+                raise AssertionError("%s ran under the dispatch workflow" % role)
+            return fn
+
+        task = store.Task.create(self.t.repo, "T-DIS", "# t\n\ntwo things\n",
+                                 self.pol)
+        task.write_text("plan.md", self.PLAN)      # what `--plan` does
+        logs = []
+        status = Orchestrator(
+            task, self.reg,
+            runtime.MockAdapter({"implementer": implementer,
+                                 "planner": refuse("planner"),
+                                 "reviewer": refuse("reviewer"),
+                                 "classifier": refuse("classifier")}),
+            lambda k, t: True, log=logs.append).run()
+
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertEqual(sorted(dispatched), ["st-1-alpha", "st-2-beta"])
+        self.assertTrue(any("2 subtasks in parallel" in l for l in logs),
+                        "the supplied subtasks did not form a wave:\n"
+                        + "\n".join(logs))
+        # The patch still gets written: `integrate` is deliberately kept on.
+        patch = task.read_text("integrate.patch", "")
+        self.assertIn("alpha.py", patch)
+        self.assertIn("beta.py", patch)
+        # And the work is accounted for exactly as under the full protocol.
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        self.assertEqual(by_id["st-1-alpha"]["actual_files"], ["alpha.py"])
+        self.assertEqual(by_id["st-2-beta"]["scope_violations"], [])
+
+    def test_the_cli_writes_a_supplied_plan_where_the_machine_looks(self):
+        """`--plan` needs no new machinery: it lands the file at the path
+        `_stage_implement` already reads when the state has no subtasks."""
+        src = os.path.join(self.t.dir, "mine.md")
+        with open(src, "w") as fh:
+            fh.write(self.PLAN)
+
+        class Args:
+            repo, registry, request = self.t.repo, REGISTRY, "do it"
+            plan, id, tier, review = src, "T-CLI", "auto", "auto"
+            mode, adapter, no_panes = "attended", "mock", True
+            max_cost, dry_run, yes, workflow = None, True, True, None
+            func = None
+
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            cli.cmd_run(Args())
+        task = store.Task.open(self.t.repo, "T-CLI")
+        self.assertIn("st-1-alpha", task.read_text("plan.md", ""),
+                      "the supplied plan never reached the task directory")
+        self.assertIn("plan supplied by the caller", buf.getvalue())
+
+    def test_a_plan_that_is_not_there_is_refused_before_anything_runs(self):
+        class Args:
+            repo, registry, request = self.t.repo, REGISTRY, "do it"
+            plan, id, tier, review = "/no/such/plan.md", "T-MISS", "auto", "auto"
+            mode, adapter, no_panes = "attended", "mock", True
+            max_cost, dry_run, yes, workflow = None, True, True, None
+            func = None
+
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            cli.cmd_run(Args())
+        self.assertIn("no plan at", str(cm.exception))
+
+
+class TestCallerDeclaredTier(unittest.TestCase):
+    """`--tier`, and the criteria behind the judgement it replaces.
+
+    Whether to delegate at all is the caller's decision and lives in SKILL.md.
+    Whether delegated work needs a plan was the machine's alone: a caller that
+    had already designed the decomposition still paid a billed call to be told
+    what it knew, and could be told differently. `auto` still judges, so
+    `delegate` run by hand is unchanged.
+    """
+
+    PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: add alpha
+  file_scope: ["alpha.py"]
+  acceptance: [AC-1]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\ntest_author: never\n'
+                     'hotspots:\n  - "combat_system"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        self.logs = []
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _run_to_classify(self, request, tier=None, task_id="T-T"):
+        """Drive intake+classify only, with a classifier that must not be asked
+        when the caller has declared the tier."""
+        asked = []
+
+        def classifier(env, cwd):
+            asked.append(True)
+            return {"output": "VERDICT: SIMPLE -- tiny"}
+
+        task = store.Task.create(self.t.repo, task_id, "# t\n\n%s\n" % request, self.pol)
+        if tier:
+            task.update(tier=tier)
+        orch = Orchestrator(task, self.reg,
+                            runtime.MockAdapter({"classifier": classifier}),
+                            lambda k, t: True, log=self.logs.append)
+        orch._stage_classify()
+        return task, asked
+
+    def test_a_declared_complex_tier_skips_the_classifier_and_plans(self):
+        task, asked = self._run_to_classify("add a subtract function", "complex")
+        self.assertEqual(asked, [], "the classifier was billed for a judgement "
+                                    "the caller had already made")
+        self.assertEqual(task.state["classification"]["tier"], "complex")
+        self.assertEqual(task.state["classification"]["by"], "caller")
+        self.assertIn(task.state["status"], ("brainstorm", "plan"))
+        # And crucially it is NOT seeded with one catch-all subtask, which is
+        # what would have collapsed a parallel wave into a single agent.
+        self.assertFalse(task.state.get("subtasks"))
+
+    def test_a_declared_simple_tier_skips_the_classifier_and_implements(self):
+        task, asked = self._run_to_classify("rewrite the whole engine", "simple")
+        self.assertEqual(asked, [])
+        self.assertEqual(task.state["classification"]["tier"], "simple")
+        self.assertEqual(task.state["status"], "implement")
+        self.assertEqual([s["id"] for s in task.state["subtasks"]], ["st-1-main"])
+
+    def test_auto_still_asks(self):
+        """The default is unchanged: `delegate run` by hand judges for itself."""
+        task, asked = self._run_to_classify("add a subtract function")
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(task.state["classification"]["tier"], "simple")
+
+    def test_a_declared_tier_beats_a_hotspot_but_says_so(self):
+        """A hotspot is the PROJECT's standing declaration and `--tier` is the
+        operator's, for one run; the later and more specific instruction wins.
+        Not silently, because the declaration exists for files that merge badly
+        when the work is not planned."""
+        task, asked = self._run_to_classify("touch combat_system today", "simple")
+        self.assertEqual(asked, [])
+        self.assertEqual(task.state["classification"]["tier"], "simple")
+        self.assertTrue(any("overrides a declared hotspot" in l for l in self.logs),
+                        "a hotspot was overridden with nothing in the log: %s"
+                        % self.logs)
+        # With no override the hotspot still decides, as it always did.
+        task2, asked2 = self._run_to_classify("touch combat_system today",
+                                              task_id="T-T2")
+        self.assertEqual(asked2, [], "a hotspot is not a judgement call")
+        self.assertEqual(task2.state["classification"]["tier"], "complex")
+
+    def test_an_unrecognised_tier_is_ignored_rather_than_obeyed(self):
+        """Only the two tiers the machine routes on are honoured. Anything else
+        falls through to the classifier rather than reaching `_classified`,
+        which would set a status no handler answers to."""
+        task, asked = self._run_to_classify("add a subtract function", "medium")
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(task.state["classification"]["tier"], "simple")
+
+    def test_the_criteria_come_from_the_manifest(self):
+        """The judgement moved out of `machine.py`, where it opened "Classify
+        this software task" -- one workflow's opinion living in the state
+        machine. The tiers and the VERDICT line stay code, because
+        `_classified` routes on the tier names."""
+        seen = {}
+
+        def classifier(env, cwd):
+            seen["prompt"] = None
+            return {"output": "VERDICT: COMPLEX -- big"}
+
+        adapter = runtime.MockAdapter({"classifier": classifier})
+        task = store.Task.create(self.t.repo, "T-T3", "# t\n\ndo a thing\n", self.pol)
+        orch = Orchestrator(task, self.reg, adapter, lambda k, t: True,
+                            log=self.logs.append)
+        orch._stage_classify()
+        prompt = [text for role, text in adapter.calls if role == "classifier"][0]
+        self.assertIn("no new architecture", prompt,
+                      "the manifest's criteria never reached the classifier")
+        self.assertIn("VERDICT: SIMPLE|COMPLEX", prompt,
+                      "the frame the parser reads must survive")
+        self.assertNotIn("Classify this software task", prompt,
+                         "the workflow's own wording is back in the machine")
+
+    def test_a_workflow_declaring_its_own_criteria_gets_them(self):
+        """The one that proves the manifest is really the source. The bundled
+        criteria and `DEFAULT_CLASSIFY_CRITERIA` are the same words -- they have
+        to be, the default workflow is the one that used to be hardcoded -- so
+        asserting on that text cannot tell a manifest that was read from a
+        fallback that was not. This declares something the machine has never
+        heard of and looks for it."""
+        d = tempfile.mkdtemp(prefix="wf-tier-")
+        self.addCleanup(shutil.rmtree, d, True)
+        self.addCleanup(setattr, wf, "_CURRENT", None)
+        shutil.copy(os.path.join(wf.default_dir(), "PROTOCOL.md"), d)
+        with open(os.path.join(d, "workflow.yaml"), "w") as fh:
+            fh.write("""name: houses
+protocol: PROTOCOL.md
+stages:
+  intake: {role: intake}
+  classify:
+    role: classifier
+    criteria: |
+      SIMPLE: one room, one trade, no permit.
+      COMPLEX: touches the load-bearing walls.
+  plan: {role: planner}
+  implement: {role: implementer}
+""")
+        wf.use(d)
+
+        adapter = runtime.MockAdapter(
+            {"classifier": lambda e, c: {"output": "VERDICT: COMPLEX -- walls"}})
+        task = store.Task.create(self.t.repo, "T-T4", "# t\n\nknock it through\n",
+                                 self.pol)
+        Orchestrator(task, self.reg, adapter, lambda k, t: True,
+                     log=self.logs.append)._stage_classify()
+
+        prompt = [text for role, text in adapter.calls if role == "classifier"][0]
+        self.assertIn("touches the load-bearing walls", prompt,
+                      "the workflow in force declared criteria and the machine "
+                      "asked its own question anyway")
+        self.assertNotIn("no new architecture", prompt,
+                         "the default criteria were used beside the manifest's")
+        self.assertEqual(task.state["classification"]["tier"], "complex")
+
+    def test_a_workflow_with_no_criteria_still_classifies(self):
+        """Silence in a manifest leaves a stage as the machine has it -- the
+        same rule `enabled()` follows -- so a workflow with no opinion about
+        what counts as complex gets the default, not a prompt with a hole."""
+        from adg.machine import DEFAULT_CLASSIFY_CRITERIA, CLASSIFY_PROMPT
+        w = wf.current()
+        self.assertEqual(w.criteria("plan"), "")
+        filled = CLASSIFY_PROMPT % {"criteria": w.criteria("plan") or DEFAULT_CLASSIFY_CRITERIA,
+                                    "request": "r", "facts": "f"}
+        self.assertIn("no new architecture", filled)
+        self.assertNotIn("%(criteria)s", filled)
 
 
 class TestRungThree(unittest.TestCase):
@@ -1734,6 +3530,57 @@ class TestResume(unittest.TestCase):
                          "the bad stage was written before it was checked")
 
 
+class TestStatusReadsTheBreaker(unittest.TestCase):
+    """`park` records why a run stopped; the breaker file records whether the
+    seat is still out. `_quota_guard` was taught the difference and `status`
+    was not, so a task whose window had reopened — or whose seat had been
+    cleared by hand — still reported "waiting on quota" beside a reopen time
+    in the past, for a task `resume` would have run immediately."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.task = store.Task.create(self.t.repo, "T-Q", "# t\n",
+                                      {"max_cost_usd": 1})
+        self.task.update(status="needs_human",
+                         park={"reason": "quota_all_exhausted", "role": "implementer",
+                               "channels": ["claude-seat"],
+                               "reopen_at": time.time() + 3600})
+
+    def tearDown(self):
+        self.t.close()
+
+    def _status(self):
+        import io
+        import contextlib
+
+        class Args:
+            repo, registry = self.t.repo, REGISTRY
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_status(Args())
+        return buf.getvalue()
+
+    def test_an_open_breaker_still_reads_as_waiting(self):
+        cooldown.open_breaker("claude-seat", "quota", time.time() + 3600, time.time())
+        self.assertIn("waiting on quota", self._status())
+        self.assertIn("reopens at", self._status())
+
+    def test_a_cleared_seat_stops_reading_as_waiting(self):
+        cooldown.open_breaker("claude-seat", "quota", time.time() + 3600, time.time())
+        cooldown.clear("claude-seat")
+        out = self._status()
+        self.assertNotIn("waiting on quota", out,
+                         "status reported a quota wall the breaker no longer has")
+        self.assertIn("needs_human", out)
+
+    def test_an_expired_window_stops_reading_as_waiting(self):
+        # Nothing cleared it; the window simply came back. Same stale snapshot,
+        # and the one a user hits by waiting rather than intervening.
+        cooldown.open_breaker("claude-seat", "quota", time.time() - 1, time.time() - 2)
+        self.assertNotIn("waiting on quota", self._status())
+
+
 class TestCostBreakdown(unittest.TestCase):
     """The brief should say which model on which provider did what, and never
     fold an unreported cost into a total as zero."""
@@ -2030,6 +3877,10 @@ class TestReviewInputs(unittest.TestCase):
                       "the reviewer was never told what to diff against")
         self.assertIn(os.path.join(task.path, "verify"), text,
                       "the reviewer was never pointed at the verify output")
+        # Where the schemas it is told to match come from is pinned by
+        # TestWorkflowManifest instead: under the bundled workflow the right
+        # path and the wrong one are the same string, so asserting it here
+        # would pass with the defect still in place.
 
 
 class TestCapabilityHint(unittest.TestCase):
@@ -3190,17 +5041,169 @@ stages:
 
     def test_two_stages_may_not_give_one_role_different_cards(self):
         """`brainstorm` and `plan` both dispatch the planner, and the lookup
-        answers with the first match — so a second declaration was silently
-        dead and repointing `plan.card` alone changed nothing."""
-        w = self._manifest("""name: clash
+        answered with the first match — so a second declaration was silently
+        dead and repointing `plan.card` alone changed nothing.
+
+        Refused when the manifest LOADS, not when the role is first dispatched.
+        `card()` is reached from `prompts.compose`, stages into a run and after
+        real spend, and a WorkflowError there arrives at the generic handler as
+        CRASHED — for a typo in a file that was read before the run started.
+        `cli.main` resolves `--workflow` ahead of every subcommand precisely so
+        a bad manifest fails with its path in the message instead.
+        """
+        with self.assertRaises(wf.WorkflowError) as cm:
+            self._manifest("""name: clash
 stages:
   brainstorm: {role: planner, card: roles/planner.md}
   plan: {role: planner, card: roles/reviewer.md}
 """)
-        with self.assertRaises(wf.WorkflowError) as cm:
-            w.card("planner")
         self.assertIn("planner", str(cm.exception))
         self.assertIn("brainstorm", str(cm.exception), "the error does not say which stages")
+
+    def test_a_stage_the_manifest_never_mentions_is_not_off(self):
+        """`enabled()` answered False for an undeclared stage while
+        `machine.run` only ever asked about declared ones — two answers to one
+        question. The machine owns the graph: a manifest switches a stage off
+        by saying so, and silence leaves it as the machine has it. Had they
+        stayed apart, the first manifest written without a `review:` block
+        would have been told review was off and got a review anyway."""
+        w = self._manifest("""name: partial
+stages:
+  intake: {role: intake}
+  implement: {role: implementer, card: roles/implementer.md}
+""")
+        self.assertTrue(w.enabled("review"), "an undeclared stage read as off")
+        self.assertTrue(w.enabled("implement"))
+
+    def test_a_stage_outside_the_order_has_no_next(self):
+        """`next_enabled` fell back to the whole list for an id it could not
+        place, which returns the FIRST stage — a run sent back to `intake` and
+        around again. Unreachable from `machine.run`, which only asks about a
+        stage it is standing in; it stays a trap for the next caller."""
+        w = self._manifest("""name: partial
+stages:
+  intake: {role: intake}
+  implement: {role: implementer, card: roles/implementer.md}
+""")
+        self.assertEqual(w.next_enabled("intake"), "implement")
+        self.assertEqual(w.next_enabled("review"), "done",
+                         "an unplaceable stage sent the run backwards")
+
+    def test_skipping_a_disabled_stage_can_still_reach_an_undeclared_one(self):
+        """`enabled()` treats an undeclared stage as on, but `next_enabled`
+        walked the manifest's declared stages alone and so could never route to
+        one — the same two-answers-to-one-question shape. A manifest that
+        disables `review` and never mentions `integrate` skipped straight to
+        `done`, ending the run without the stage that writes the patch."""
+        from adg.machine import STAGES
+        w = self._manifest("""name: partial
+stages:
+  plan: {role: planner, card: roles/planner.md}
+  implement: {role: implementer, card: roles/implementer.md}
+  review: {role: reviewer, card: roles/reviewer.md, enabled: false}
+""")
+        self.assertEqual(w.next_enabled("review"), "done",
+                         "the manifest's own order ends at review")
+        self.assertEqual(w.next_enabled("review", order=STAGES), "integrate",
+                         "the run would end before the stage that lands the work")
+
+    def test_a_run_skipping_a_disabled_review_still_reaches_integrate(self):
+        """The same property from the machine's side, which is where it is load
+        bearing: `machine.run` has to walk STAGES when it skips, or a manifest
+        that switches review off and never mentions integrate ends the run
+        without the stage that writes the patch."""
+        self._manifest("""name: partial
+protocol: PROTOCOL.md
+stages:
+  intake: {role: intake}
+  classify: {role: classifier}
+  plan: {role: planner, card: roles/planner.md}
+  implement: {role: implementer, card: roles/implementer.md}
+  review: {role: reviewer, card: roles/reviewer.md, enabled: false}
+""")
+        _spit(os.path.join(self.t.repo, ".adg.yaml"),
+              'fast:\n  - "python3 -c \'import app; assert app.add(1,2)==3\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        script, _ = TestEndToEnd._script(self)
+        task = store.Task.create(self.t.repo, "T-WFI",
+                                 "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertTrue(os.path.exists(task.file("integrate.patch")),
+                        "the run finished without landing anything:\n"
+                        + "\n".join(logs))
+
+    def _with_bad_env_workflow(self, body, manifest=None):
+        old = os.environ.get(wf.ENV_VAR)
+        where = os.path.join(self.dir, "broken")
+        os.makedirs(where, exist_ok=True)
+        if manifest is not None:
+            with open(os.path.join(where, "workflow.yaml"), "w") as fh:
+                fh.write(manifest)
+        os.environ[wf.ENV_VAR] = where
+        wf._CURRENT = None                  # or the cache answers for it
+        try:
+            return body()
+        finally:
+            if old is None:
+                os.environ.pop(wf.ENV_VAR, None)
+            else:
+                os.environ[wf.ENV_VAR] = old
+
+    def test_a_bad_workflow_in_the_environment_stops_a_run_before_it_starts(self):
+        """`cli.main` guarded the early load on `--workflow` alone, so the
+        bundled default and $AGENT_DELEGATION_WORKFLOW were left to
+        `wf.current()` — called from `Orchestrator.__init__`, outside every
+        handler. A bad env var let `delegate run` create the task directory and
+        then die with a raw traceback: the crash-instead-of-a-typo outcome the
+        early load exists to prevent."""
+        def body():
+            with self.assertRaises(SystemExit) as cm:
+                cli.main(["--repo", self.t.repo, "run", "do a thing"])
+            self.assertIn("refusing to run", str(cm.exception))
+            self.assertIn("broken", str(cm.exception), "the message omits the path")
+        self._with_bad_env_workflow(body)
+
+    def test_an_unparseable_manifest_is_caught_like_a_missing_one(self):
+        """`yamlite.YamlError` is a sibling ValueError, not a WorkflowError, so
+        catching only the latter left the commonest typo of the two — a
+        manifest that exists and does not parse — crashing with a traceback."""
+        def body():
+            with self.assertRaises(SystemExit) as cm:
+                cli.main(["--repo", self.t.repo, "run", "do a thing"])
+            self.assertIn("refusing to run", str(cm.exception))
+        self._with_bad_env_workflow(body, manifest="stages:\n  intake: {role: x\n")
+
+    def test_the_reporting_commands_survive_a_broken_workflow(self):
+        """`status`, `show` and `channels --clear` are how a user finds out what
+        went wrong and unsticks a seat. Refusing to run them over an unrelated
+        $AGENT_DELEGATION_WORKFLOW would take away the tools for the recovery,
+        and none of them dispatches an agent."""
+        import contextlib
+        import io
+
+        def body():
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cli.main(["--repo", self.t.repo, "status"])   # must not raise
+            return buf.getvalue()
+
+        out = self._with_bad_env_workflow(body)
+        self.assertIn("warning:", out, "the failure was not reported at all")
+        self.assertIn("no tasks", out, "status did not do its job")
+
+    def test_a_stage_with_no_body_is_refused_rather_than_read_two_ways(self):
+        """`review:` with nothing under it parses as None, and the accessors
+        disagreed about it: `enabled` called it off, `discipline` called it
+        empty. Same trade `yamlite` makes — a config that silently parses to
+        the wrong shape is worse than one that will not load."""
+        with self.assertRaises(wf.WorkflowError) as cm:
+            self._manifest("name: empty\nstages:\n  intake: {role: intake}\n  review:\n")
+        self.assertIn("review", str(cm.exception))
 
     def test_the_schemas_do_not_move_with_the_workflow(self):
         """The report envelope is how the RUNTIME reads a result, so it is the
@@ -3219,6 +5222,36 @@ stages:
         schema.validate_report({"stage": "implement", "role": "implementer",
                                 "status": "complete", "summary": "did it",
                                 "evidence": {"tests": "ok"}})
+
+    def test_the_reviewer_is_sent_to_the_runtimes_schemas_not_the_workflows(self):
+        """The same contract, from the side that names it in a prompt. The
+        review prompt built both schema paths from `prompts.skill_path()`, so
+        under any workflow but the bundled one it sent the reviewer to files
+        that need not exist — and put a second, different absolute path for
+        report.schema.json in the same prompt `compose` had already named
+        correctly. Under the bundled workflow the two are one string, which is
+        why this has to be asserted from a foreign workflow directory.
+        """
+        self._manifest(self.BASE % "")
+        self.assertFalse(os.path.isdir(os.path.join(self.dir, "schemas")),
+                         "the fixture ships schemas, so it proves nothing")
+        _spit(os.path.join(self.t.repo, ".adg.yaml"), 'fast:\n  - "true"\n')
+        task = store.Task.create(self.t.repo, "T-WS", "# t\n\n- **AC-1** — works\n",
+                                 dict(self.reg["policy"]["limits"]))
+        task.update(status="review", classification={"tier": "complex"},
+                    subtasks=[{"id": "st-1-main", "status": "complete",
+                               "actual_files": ["app.py"], "planned_scope": ["**"]}])
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(),
+                            lambda k, t: True, log=lambda *_: None)
+        with self.assertRaises(Halt):
+            orch._stage_review()          # no verdict from the mock
+        text = "".join(_slurp(task.file("agent-logs", n))
+                       for n in os.listdir(task.file("agent-logs"))
+                       if n.startswith("reviewer-"))
+        self.assertIn(os.path.join(schema.schemas_dir(), "report.schema.json"), text)
+        self.assertNotIn(os.path.join(self.dir, "schemas"), text,
+                         "the reviewer was sent to a schemas directory this "
+                         "workflow does not have")
 
     def test_a_design_report_is_a_legal_report(self):
         """`_stage_brainstorm` dispatches a planner and `compose` tells it to

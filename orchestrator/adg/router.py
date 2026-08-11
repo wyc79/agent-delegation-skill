@@ -16,6 +16,22 @@ TIERS = ["t1", "t2", "t3"]
 _SENSITIVITY = {"low": 0.2, "medium": 0.6, "high": 1.2, "max": 2.0}
 _LEVELS = {"low": 2, "medium": 3, "high": 4, "very_high": 5}
 
+# What a channel's `prefers:` is worth when two seats expose the same model.
+#
+# Deliberately smaller than 1.0, which is the smallest gap two DIFFERENT
+# capability scores can have: capabilities are integers 1-5 and the shipped
+# weights are integers, so a base score that differs at all differs by at least
+# one. A preference can therefore only ever decide between seats the router
+# already rates equally -- it can never buy a weaker model a job.
+#
+# It exists because that decision was previously alphabetical. Two subscription
+# seats with headroom both price at ~0, so `balanced-coder` on claude-seat and
+# on cursor-seat scored identically and the tie fell to `sort(... c.channel)`:
+# "claude-seat" < "cursor-seat", so every implementer went to Claude and a
+# deployment with two providers ran as if it had one. An arbitrary rule that
+# looks like a policy is worse than no rule, so the policy is now written down.
+PREFERENCE_BONUS = 0.5
+
 
 class RoutingError(RuntimeError):
     pass
@@ -64,6 +80,23 @@ def load_registry(path=None):
     for key in ("models", "profiles", "channels", "policy"):
         if key not in reg:
             raise RoutingError("registry missing '%s' (%s)" % (key, path))
+    # A `prefers:` naming something the channel does not expose is a typo that
+    # would route exactly as if it were absent -- the shape of mistake this
+    # registry already refuses elsewhere, because a line that reads like a
+    # policy and is enforced by nothing is worse than no line. Checked here
+    # rather than in `candidates`, so `--registry` fails on load with the path
+    # in the message instead of three stages into a run.
+    for cname, chan in (reg["channels"] or {}).items():
+        if not isinstance(chan, dict):
+            continue
+        exposes = chan.get("exposes") or []
+        unknown = [m for m in (chan.get("prefers") or []) if m not in exposes]
+        if unknown:
+            raise RoutingError(
+                "channel %r prefers %s, which it does not expose (%s) — a "
+                "preference for a model the seat cannot serve routes nothing "
+                "(%s)" % (cname, ", ".join(map(repr, unknown)),
+                          ", ".join(exposes) or "nothing", path))
     return reg
 
 
@@ -175,12 +208,15 @@ class Router:
                 "reserve_fraction is %r, must be >= 0 and < 1" % (raw,))
         return float(utilization or 0.0) > (1.0 - frac)
 
-    def _score(self, spec, chan, profile, utilization=0.0):
+    def _score(self, spec, chan, profile, utilization=0.0, model=None):
         weights = profile.get("weights") or {}
         base = sum(float(w) * float(spec.get(cap, 0)) for cap, w in weights.items())
         lam = _SENSITIVITY.get(profile.get("cost_sensitivity", "medium"), 0.6)
         import math
-        return base - lam * math.log1p(self._cost(spec, chan, utilization))
+        score = base - lam * math.log1p(self._cost(spec, chan, utilization))
+        if model is not None and model in (chan.get("prefers") or []):
+            score += PREFERENCE_BONUS
+        return score
 
     # --- selection --------------------------------------------------------
     def candidates(self, role, ceiling=None, boost=None, cooldowns=(),
@@ -230,7 +266,7 @@ class Router:
             for mname, spec in legal:
                 (reserved if held else out).append(
                     Choice(mname, cname, spec, chan,
-                           self._score(spec, chan, profile, u), u, held))
+                           self._score(spec, chan, profile, u, mname), u, held))
         # A reservation that would leave the role with nothing is a reservation
         # that parks work it could have done -- but "nothing" is not decidable
         # here: the caller still filters by which CLI is installed. So return the

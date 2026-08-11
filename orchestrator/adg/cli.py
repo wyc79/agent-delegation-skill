@@ -8,7 +8,7 @@ import time
 import json
 
 from . import (companions, cooldown, limits as lim, quota, router as routing,
-               runtime, store, verify, winnow, workflow as wf)
+               runtime, store, verify, winnow, workflow as wf, yamlite)
 
 
 def _repo(path):
@@ -215,6 +215,24 @@ def cmd_run(args):
     task = store.Task.create(repo, task_id, body, merged, mode=args.mode)
     if args.review != "auto":
         task.update(review=args.review)
+    if getattr(args, "tier", "auto") != "auto":
+        task.update(tier=args.tier)
+    if getattr(args, "plan", None):
+        # The caller brought its own decomposition, so there is nothing for a
+        # planner to decide. Written where the planner would have written it,
+        # because `_stage_implement` already recovers subtasks from `plan.md`
+        # when the state has none -- the path that exists so a resumed run does
+        # not re-pay for planning. Supplying the file is the same situation
+        # arriving earlier, and it needs no new code in the machine.
+        #
+        # Not validated here beyond existing: `_read_plan_subtasks` is the one
+        # parser, it already refuses a block it cannot read rather than guessing,
+        # and a second check in a different place is how the two drift.
+        if not os.path.isfile(args.plan):
+            sys.exit("refusing to run: no plan at %s" % args.plan)
+        with open(args.plan, encoding="utf-8") as fh:
+            task.write_text("plan.md", fh.read())
+        print("plan supplied by the caller: %s" % args.plan)
     print("task %s -> %s" % (task_id, task.path))
 
     adapter = _make_adapter(args, reg)
@@ -382,12 +400,41 @@ def cmd_status(args):
     if not tasks:
         print("no tasks for %s" % store.project_key(repo))
         return
+    # The breaker file is the truth and `park` only records why we stopped, so
+    # this asks the same question `_quota_guard` does rather than reading the
+    # snapshot in task.json. That snapshot goes stale two ordinary ways --
+    # `channels --clear`, and a window that simply reopened -- and reporting
+    # from it left `status` saying "waiting on quota" beside a reopen time in
+    # the past, for a task that `resume` would have run immediately.
+    now = time.time()
+    cools, _, warning = cooldown.read(now)
+    if warning:
+        print("warning: %s" % warning)
     for t in tasks:
         s = t.state
         done = sum(1 for x in s.get("subtasks", []) if x.get("status") == "complete")
         status = s["status"]
         park = s.get("park") or {}
+        reopen, still = None, {}
         if park.get("reason") == "quota_all_exhausted":
+            still = {c: e for c, e in cools.items()
+                     if c in (park.get("channels") or ())}
+            reopen = cooldown.earliest_reopen(still)
+            if reopen is None and warning:
+                # The breaker could not be READ, which is not the same answer as
+                # "those windows have reopened" -- and only the second one means
+                # the task is runnable. Falling through here reported a task
+                # that is merely early as one that needs a human to think, which
+                # is the distinction the park exists to draw, and took away the
+                # `resume --when-open` the paused-seat brief points at. So while
+                # the file that supersedes the snapshot is unreadable, the
+                # snapshot stands in.
+                try:
+                    reopen = float(park.get("reopen_at"))
+                except (TypeError, ValueError):
+                    reopen = None
+                still = dict.fromkeys(park.get("channels") or ())
+        if reopen and reopen > now:
             # Otherwise a task that is merely early is indistinguishable from one
             # that needs a human to think, which is the whole point of parking
             # it differently.
@@ -395,10 +442,9 @@ def cmd_status(args):
         print("%-8s %-17s %2d/%-2d subtasks  $%.2f  %s" % (
             s["id"], status, done, len(s.get("subtasks", [])),
             float(s.get("spent", {}).get("usd", 0)), t.path))
-        if park.get("reason") == "quota_all_exhausted" and park.get("reopen_at"):
+        if reopen and reopen > now:
             print("%-8s   %s reopens at %s" % (
-                "", ", ".join(park.get("channels") or ["the seat"]),
-                _stamp(park["reopen_at"])))
+                "", ", ".join(sorted(still) or ["the seat"]), _stamp(reopen)))
 
 
 def cmd_show(args):
@@ -437,9 +483,18 @@ def main(argv=None):
                         "can actually bind")
     r.add_argument("--max-cost", type=float, help="lower the cost cap for this task")
     r.add_argument("--dry-run", action="store_true", help="drive the machine without agents")
+    r.add_argument("--tier", choices=["auto", "simple", "complex"], default="auto",
+                   help="auto (default): a cheap model judges whether the work "
+                        "needs a plan. simple|complex states it outright and "
+                        "skips that call — for a caller that has already decided")
     r.add_argument("--review", choices=["auto", "always", "never"], default="auto",
                    help="auto (default): independent LLM review for complex work, "
                         "deterministic checks alone for simple work")
+    r.add_argument("--plan", metavar="FILE",
+                   help="a decomposition you already have, in plan.md's subtask "
+                        "format. Pair with `--workflow orchestrator/workflows/"
+                        "dispatch` to use delegate purely as a dispatcher: your "
+                        "subtasks, run across your seats, no planner or reviewer")
     r.add_argument("--yes", action="store_true",
                    help="auto-approve gates (unattended runs; merge still never happens)")
     r.set_defaults(func=cmd_run)
@@ -489,9 +544,29 @@ def main(argv=None):
     # first stage of a run could be composed against a different manifest from
     # the rest. Failing here, with the path in the message, beats failing three
     # stages in with a missing file.
-    if getattr(args, "workflow", None):
-        try:
-            wf.use(args.workflow)
-        except wf.WorkflowError as e:
+    #
+    # Unconditionally, not only when `--workflow` is passed. The bundled default
+    # and $AGENT_DELEGATION_WORKFLOW were left to `wf.current()`, which
+    # `Orchestrator.__init__` calls from outside any handler -- so a bad env var
+    # let `delegate run` create the task directory and then die with a raw
+    # traceback, which is exactly the crash-instead-of-a-typo outcome this
+    # early load exists to prevent.
+    #
+    # `yamlite.YamlError` as well as `WorkflowError`: a manifest that exists and
+    # does not parse is the commonest typo of the two, and it is a sibling
+    # ValueError rather than a subclass, so catching only the latter left the
+    # traceback this exists to prevent.
+    #
+    # And it is fatal only for the commands that dispatch agents. `status`,
+    # `show` and `channels --clear` are how a user works out what went wrong and
+    # unsticks a seat; refusing to run them because of an unrelated
+    # $AGENT_DELEGATION_WORKFLOW would take away the tools for the recovery.
+    needs_workflow = args.cmd in ("run", "resume", "approve", "reject")
+    try:
+        wf.use(args.workflow) if getattr(args, "workflow", None) else wf.current()
+    except (wf.WorkflowError, yamlite.YamlError) as e:
+        if needs_workflow:
             sys.exit("refusing to run: %s" % e)
+        print("warning: the workflow could not be loaded (%s). Reporting "
+              "commands still work; `run` and `resume` will not." % e)
     return args.func(args)

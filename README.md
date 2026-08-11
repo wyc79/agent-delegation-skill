@@ -134,7 +134,10 @@ from `git rev-parse --git-common-dir`, so the working directory matters.
 
 `run` also takes `--id`, `--mode attended|autonomous`,
 `--adapter herdr|local|mock`, `--no-panes`, `--max-cost N`,
-`--review auto|always|never`, `--dry-run` and `--yes`. Two worth understanding
+`--review auto|always|never`, `--tier auto|simple|complex`, `--dry-run` and
+`--yes`. `--tier` is how a caller that has already decided says so: `auto`
+spends a cheap call judging whether the work needs a plan, and naming the tier
+skips it. Two more worth understanding
 before use: `--dry-run` walks the state machine with no agents and no spend,
 which is the cheapest way to see the shape of a run; `--yes` auto-approves
 **every** gate for the whole run, which exists for unattended runs and should
@@ -340,7 +343,7 @@ checks.
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 192 tests, no tokens spent
+python3 orchestrator/tests/test_orchestrator.py  # 246 tests, no tokens spent
 python3 orchestrator/tests/test_failover.py      # 104 more, same
 ```
 
@@ -389,8 +392,22 @@ no seat can finish, and never parks a runnable task.
 **Two honest weaknesses.** Parallel waves are enabled (`max_parallel_agents: 3`)
 on the strength of deterministic tests — the long-intermittent wave failure was
 the test harness's own path matching rather than a race, and every attribution
-defect found on the way is fixed and pinned — but no wave has yet run with real
-agent CLIs, so treat the first as a shakedown. And cross-provider *dollars* are
+defect found on the way is fixed and pinned. But those tests were about
+*attribution*, and a later cold read found a second family underneath them,
+about **continuity** — what a finished subtask leaves behind, and what the next
+one is handed. A wave that partially failed stranded its green siblings'
+branches; a second wave was cut from the task's base commit rather than the
+integration branch, so a dependant could not see what it depended on and the
+Test Author's tests were invisible; the first subtask to go green cleared the
+review findings addressed to all the others; and a sequential subtask was
+credited with its predecessors' files. Later cold passes, each told to attack the
+fix rather than confirm it, found further defects of the same shape inside it.
+All of it is fixed and pinned in `TestSubtaskContinuity` and
+`TestSecondColdRead`, every test mutation-checked by reverting its fix and
+watching it fail; none of it was a race, each defect reproducing on the first
+run and every run. The write-up is in
+[`orchestrator/README.md`](orchestrator/README.md). No wave has yet run with
+real agent CLIs, so treat the first as a shakedown. And cross-provider *dollars* are
 weaker than cross-provider tokens: not every CLI returns a cost figure, so where
 one reports usage but not money the spend is this project's own price table
 applied to token counts, carried as `usd_estimated` rather than passed off as

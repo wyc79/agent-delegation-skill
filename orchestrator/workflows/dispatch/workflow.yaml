@@ -1,0 +1,62 @@
+# The dispatcher: delegate with the protocol taken out.
+#
+# `workflows/default` is the role protocol -- a planner decomposes, a reviewer
+# rules. This one keeps only the part no model release makes redundant: N jobs,
+# placed on whichever enrolled seat can run them, in isolated worktrees, with
+# quota metering, breakers and failover underneath.
+#
+# It exists for a caller that has ALREADY decided. A skill that has designed the
+# work does not want a planner second-guessing it, and does not want to pay for
+# a reviewer whose findings it will not read -- it wants execution across seats.
+# Supply the decomposition with `--plan`:
+#
+#     delegate run "<what this is>" \
+#         --workflow orchestrator/workflows/dispatch \
+#         --plan my-subtasks.md
+#
+# No `--tier`: that flag only decides whether `classify` sends work to a planner
+# or straight to one subtask, and `classify` is off here. The subtasks you
+# supply are the decomposition, whatever a classifier would have said.
+#
+# `--plan` is written to the task's plan.md, which is where `_stage_implement`
+# already looks when the state has no subtasks. The stages below are switched
+# off rather than deleted: the machine owns the graph, a manifest only says
+# which parts of it run, and `implement` still needs `integrate` after it to
+# write the patch.
+#
+# What you keep: worktree isolation and scope measurement, the dependency
+# waves, `capability_hint` routing, the escalation ladder, checkpointing and
+# salvage, quota breakers and cross-provider failover, the merge gate.
+#
+# What you give up, and should not be surprised by: nothing derives acceptance
+# criteria (intake is off), nothing checks the work against a plan (review is
+# off), and `capability_hint` is now yours to set -- with no planner, an
+# unhinted subtask draws the ordinary implementer.
+
+name: dispatch
+description: >
+  Execution only. The caller supplies the subtasks; delegate places them on
+  seats, runs them in isolated worktrees, and integrates what comes back.
+
+protocol: PROTOCOL.md
+
+stages:
+
+  # Off, not absent. `enabled: false` is the one switch; a stage a manifest
+  # simply never mentions is left as the machine has it, which for these would
+  # mean running them.
+  intake:    {role: intake,    enabled: false}
+  classify:  {role: classifier, enabled: false}
+  brainstorm: {role: planner,  enabled: false}
+  plan:      {role: planner,   enabled: false}
+  review:    {role: reviewer,  enabled: false}
+
+  implement:
+    role: implementer
+    card: roles/implementer.md
+
+  # Kept: this is the stage that merges the branches and writes the patch.
+  # Disabling it would end the run with the work stranded on subtask branches.
+  integrate:
+    role: integrator
+    card: roles/integrator.md

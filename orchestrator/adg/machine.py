@@ -30,6 +30,19 @@ STAGES = ["intake", "classify", "brainstorm", "plan", "implement",
           "review", "integrate", "done"]
 TERMINAL = {"done", "abandoned", "needs_human"}
 
+# The orchestrator's identity for the commits it makes on its own account, on
+# every command that writes one. `_checkpoint` always passed it, because the
+# pipeline must not depend on the user having configured git -- but the merges
+# did not, and a merge writes a commit too. On a machine with no committer
+# identity (a fresh container, a CI image, a repo a tool cloned) a fast-forward
+# still succeeds while a real merge exits non-zero with "Committer identity
+# unknown". `_integrate_wave` reads any non-zero exit as a conflict: it paid an
+# integrator to resolve one that did not exist, found no unmerged paths, ran the
+# checks against a branch nothing had been merged into, and marked the subtask
+# landed. A run that reported success, with none of that subtask's work in the
+# patch.
+IDENTITY = ["-c", "user.email=orchestrator@agent-delegation", "-c", "user.name=adg"]
+
 # , signal -> the rung the ladder enters at. Only agent-raised
 # signals reach this table; the counter-driven ones are read off verify.
 #
@@ -55,18 +68,15 @@ ENTRY_RUNG = {
 # recognises "add a subtract function" as simple. Classification is a judgement,
 # so a cheap model makes it -- the call costs ~$0.0002 against a ~$2.60 mistake.
 # Only non-negotiable facts stay hard-coded, below.
-CLASSIFY_PROMPT = """Classify this software task as SIMPLE or COMPLEX.
+#
+# The frame is code and the judgement is not. `_classified` routes on the two
+# tiers by name, so the vocabulary and the VERDICT line the parser reads have to
+# stay here -- a workflow that invented a third tier would parse as neither and
+# fall through to the safe default. What a workflow CAN say is which work counts
+# as which, through `classify.criteria` in its manifest.
+CLASSIFY_PROMPT = """Classify this task as SIMPLE or COMPLEX.
 
-SIMPLE: one coherent change a single competent engineer would finish in one
-sitting without a written plan. A few files, no new architecture, no format or
-interface that other code depends on.
-
-COMPLEX: needs a plan first -- multiple independent parts, a new abstraction or
-dependency, a change to a shared interface / schema / save format, wide blast
-radius, or genuine ambiguity about what is wanted.
-
-Bias: when the work is small and self-contained, say SIMPLE. Planning a small
-task wastes far more than it saves.
+%(criteria)s
 
 --- REQUEST ---
 %(request)s
@@ -77,6 +87,21 @@ task wastes far more than it saves.
 Reply with exactly one line:
 VERDICT: SIMPLE|COMPLEX -- <one short clause of reasoning>
 """
+
+# Used when the workflow in force declares no `classify.criteria`. Silence in a
+# manifest leaves a stage as the machine has it -- the same rule `enabled()`
+# follows -- so a workflow that has no opinion about what counts as complex
+# still gets a working classifier rather than a prompt with a hole in it.
+DEFAULT_CLASSIFY_CRITERIA = """SIMPLE: one coherent change a single competent engineer would finish in one
+sitting without a written plan. A few files, no new architecture, no format or
+interface that other code depends on.
+
+COMPLEX: needs a plan first -- multiple independent parts, a new abstraction or
+dependency, a change to a shared interface / schema / save format, wide blast
+radius, or genuine ambiguity about what is wanted.
+
+Bias: when the work is small and self-contained, say SIMPLE. Planning a small
+task wastes far more than it saves."""
 
 
 _LOG_SEQ = [0]
@@ -169,6 +194,11 @@ class Orchestrator:
         # clock exactly as it ran.
         self.clock = clock
         self._warned_channels = False
+        # Breaker-write failures already reported. `_meter` runs after every
+        # single invocation, so an unwritable state dir would otherwise repeat
+        # one line per call for the whole run; the fault is a property of the
+        # file, not of the call that noticed it.
+        self._warned_writes = set()
         self.budget = lim.Budget(task)
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
@@ -185,8 +215,11 @@ class Orchestrator:
                 # -- `_stage_classify` sends simple work straight past
                 # `brainstorm` -- so this only decides which of the
                 # destinations they name is actually switched on.
-                if status in self.workflow.stages and not self.workflow.enabled(status):
-                    nxt = self.workflow.next_enabled(status)
+                if not self.workflow.enabled(status):
+                    # STAGES, not the manifest's own order: `enabled()` treats a
+                    # stage the manifest never mentions as on, so the sequence
+                    # walked to find the next one has to contain those too.
+                    nxt = self.workflow.next_enabled(status, order=STAGES)
                     self.log("%s: disabled by workflow %r — skipping to %s"
                              % (status, self.workflow.data.get("name", "?"), nxt))
                     self.task.update(status=nxt)
@@ -319,9 +352,28 @@ admits only one sensible reading.
         return "\n".join(lines)
 
     def _stage_classify(self):
-        """A cheap model judges; only facts override it."""
+        """A cheap model judges; facts and the caller override it."""
         text = self.task.read_text("task.md", "")
         hotspots = [h for h in (self.vcfg.get("hotspots") or []) if h and h in text]
+        forced = self.task.state.get("tier")
+        if forced in ("simple", "complex"):
+            # `--tier`, and it is the most specific thing here. The caller is the
+            # agent that already decided this work was worth delegating -- the
+            # skill's "first decide whether to delegate at all" -- and one that
+            # has designed the decomposition already knows its shape. Paying a
+            # billed call to be told what it has decided, and to be told
+            # differently often enough to matter, is the indirection this
+            # removes. `auto` is still the default, so `delegate` run by hand
+            # keeps judging for itself.
+            if forced == "simple" and hotspots:
+                # A hotspot is the PROJECT's standing declaration; this flag is
+                # the operator's, for one run. The later and more specific
+                # instruction wins, but not silently: the declaration exists
+                # because these files merge badly when the work is not planned.
+                self.log("classify: --tier simple overrides a declared hotspot "
+                         "(%s) — this run is not getting a plan"
+                         % ", ".join(hotspots))
+            return self._classified(forced, "declared by the caller", "caller")
         if hotspots:
             # Not a judgement call: a hotspot is unmergeable or high-coupling by
             # declaration, so it always gets a plan.
@@ -333,8 +385,10 @@ admits only one sensible reading.
     def _ask_classifier(self, text):
         if self.dry_run:
             return "simple", "dry run", "stub"
-        prompt = CLASSIFY_PROMPT % {"request": text.strip()[:4000],
-                                    "facts": self._repo_facts()}
+        prompt = CLASSIFY_PROMPT % {
+            "criteria": self.workflow.criteria("classify") or DEFAULT_CLASSIFY_CRITERIA,
+            "request": text.strip()[:4000],
+            "facts": self._repo_facts()}
         res = self._optional("classifier", prompt)
         if res is None:
             # Fail safe, exactly as an unparseable verdict does: over-planning a
@@ -453,8 +507,15 @@ a planner does that next, from your design.
         self._archive_reports("plan-")
         self.log("plan: %s via %s" % (choice.model, choice.channel))
         self.budget.check_cost(0.0)
-        extra = ("Write plan.md now. Use the template at %s/templates/plan.md."
-                 % prompts.skill_path())
+        # The template is the WORKFLOW's, unlike the report schemas, so it moves
+        # with `--workflow` -- but only if it is there. Naming a file a hosted
+        # workflow does not ship sends the planner hunting for it instead of
+        # planning, which is the same objection as pointing it at a schemas
+        # directory that does not exist.
+        extra = "Write plan.md now."
+        template = os.path.join(prompts.skill_path(), "templates", "plan.md")
+        if os.path.exists(template):
+            extra += " Use the template at %s." % template
         if self.task.read_text("spec.md", "").strip():
             extra += ("\n\nAn approved design is at %s. Plan against it: it settles "
                       "the approach, so decompose and scope rather than redesigning. "
@@ -479,13 +540,110 @@ a planner does that next, from your design.
         subtasks = self._read_plan_subtasks()
         if not subtasks:
             raise Halt("needs_human", "planner produced no usable subtasks in plan.md")
-        self.task.update(subtasks=[dict(s, status="pending", actual_files=[]) for s in subtasks])
+        self.task.update(subtasks=self._reseed(subtasks))
         self.log("plan: %d subtask(s)" % len(subtasks))
         self._author_tests(subtasks)
         if self.budget.requires_approval("plan"):
             self._gate("plan", "Approve this plan? It splits the work into %d step(s)."
                        % len(subtasks), resume_status="implement")
         self.task.update(status="implement")
+
+    def _reseed(self, planned):
+        """Subtasks from a new plan, keeping what a surviving id already owns.
+
+        A replan reissues ids, and `_read_plan_subtasks` builds every subtask
+        from plan.md alone -- so `worktree` and `base_commit` were dropped while
+        the checkout and the branch stayed on disk. `_subtask_worktree` then
+        reused that checkout, which `create_worktree` does deliberately and
+        which makes it ignore the `base` it is handed, and recorded TODAY's
+        integration tip as the commit the subtask was cut from. The subtask's
+        diff was then measured against a commit its worktree had never seen: it
+        was credited with every file its siblings had landed and those files
+        were reported as scope violations it never committed.
+
+        The other half is the worktree a new plan simply drops. `_reap_worktrees`
+        names paths out of `state["subtasks"]`, so a renamed subtask leaves a
+        checkout nobody can name and the reaper walks past it forever.
+
+        What a reissued id may NOT keep is a branch the plan it was written for
+        has been thrown away with. Only subtasks that reach `_stage_plan` with
+        `merged` set have their commits on the integration branch and so
+        accounted for; an id reissued over an unmerged one -- the ordinary shape
+        of a REPLAN, since it is the failing subtask that raised it -- carried a
+        branch holding the discarded plan's attempt. `_prepare` re-reads HEAD
+        *above* those commits, so `actual_files` and the scope check never saw
+        them, while `_integrate_wave` merged the branch whole and landed them in
+        the delivered patch: work for a goal the planner had abandoned, in the
+        change, accounted for nowhere. Those are set aside by `_shelve_branch`
+        and the id is cut fresh from the integration tip.
+        """
+        old = {s["id"]: s for s in (self.task.state.get("subtasks") or [])}
+        out = []
+        for s in planned:
+            prev = old.pop(s["id"], None) or {}
+            fresh = dict(s, status="pending", actual_files=[])
+            if prev and not prev.get("merged"):
+                prev = {} if self._shelve_branch(prev) else prev
+            # `merged` deliberately does NOT travel. Whatever the previous
+            # incarnation landed is on the integration branch already, and the
+            # work this id is about to do under its new goal is not -- carrying
+            # the flag would tell `_unfinish` the new commits were safe when a
+            # later merge of them was aborted.
+            for key in ("worktree", "base_commit"):
+                if prev.get(key):
+                    fresh[key] = prev[key]
+            out.append(fresh)
+        for gone in old.values():
+            if not gone.get("worktree"):
+                continue
+            try:
+                self.adapter.remove_worktree(self.repo, gone["worktree"])
+                self.log("  worktree: removed %s — the new plan drops %s"
+                         % (gone["worktree"], gone["id"]))
+            except Exception as e:            # noqa: BLE001 -- best effort, as in _reap
+                self.log("  worktree: left %s in place (%s)" % (gone["worktree"], e))
+        return out
+
+    def _shelve_branch(self, sub):
+        """Set aside the checkout and branch of a subtask whose plan was
+        discarded, so the id can be cut fresh. True when it is safe to forget.
+
+        The branch is the point, not the directory. `create_worktree` is
+        deliberately idempotent -- it reattaches an existing branch and ignores
+        the base it is handed -- so removing the checkout alone would hand the
+        next dispatch exactly the same commits back.
+
+        Renamed rather than deleted. The commits are the record of an attempt
+        the escalation bundle refers to, and this is the one place the pipeline
+        would destroy work outright; `adg/<task>/<id>` is a name the machine
+        owns, so moving it aside costs nothing a human might want. If the
+        checkout will not go (the Windows lock case `_reap_worktrees` documents)
+        nothing is renamed and the caller keeps the subtask as it was: a stale
+        base is a smaller fault than a branch pointing at a worktree that is
+        still on disk.
+        """
+        if sub.get("worktree"):
+            try:
+                self.adapter.remove_worktree(self.repo, sub["worktree"])
+            except Exception as e:            # noqa: BLE001 -- best effort, as in _reap
+                self.log("  worktree: left %s in place (%s) — %s keeps it"
+                         % (sub["worktree"], e, sub["id"]))
+                return False
+        branch = "adg/%s/%s" % (self.task.state["id"], sub["id"])
+        if not git(["rev-parse", "--verify", "--quiet", "refs/heads/" + branch],
+                   self.repo, check=False):
+            return True
+        for n in range(1, 100):
+            shelf = "%s.replaced-%d" % (branch, n)
+            if git(["rev-parse", "--verify", "--quiet", "refs/heads/" + shelf],
+                   self.repo, check=False):
+                continue
+            git(["branch", "-m", branch, shelf], self.repo, check=False)
+            self.log("  %s: the new plan reissues it — its unmerged branch is "
+                     "set aside as %s, and it starts from the integration branch"
+                     % (sub["id"], shelf))
+            return True
+        return False
 
     def _author_tests(self, subtasks):
         """Write tests from the requirements, before any implementation exists.
@@ -587,8 +745,7 @@ a planner does that next, from your design.
             # rather than re-running (and re-paying for) the planner.
             recovered = self._read_plan_subtasks()
             if recovered:
-                state = self.task.update(
-                    subtasks=[dict(x, status="pending", actual_files=[]) for x in recovered])
+                state = self.task.update(subtasks=self._reseed(recovered))
                 self.log("implement: recovered %d subtask(s) from plan.md" % len(recovered))
             else:
                 raise Halt("needs_human", "no subtasks and no parseable plan.md")
@@ -625,7 +782,81 @@ a planner does that next, from your design.
             self._run_wave(wave)
             return
         sub = wave[0]
-        self._one_subtask(sub, self._ensure_worktree())
+        tree = sub.get("worktree")
+        if tree and os.path.isdir(tree):
+            # It owns a worktree from an earlier wave. Continue there rather
+            # than in the integration worktree: sending it elsewhere would
+            # restart it from nothing and strand its checkpoints, including
+            # whatever `_salvage` committed when a seat died mid-subtask, which
+            # is the salvage point the keep-the-worktree-on-a-park rule is for.
+            # `_catch_up` is what makes that safe -- it brings the checkout to
+            # the integration branch first, so a rework is not answered against
+            # a tree from before its siblings landed.
+            self._dispatch(sub, tree)
+            self._integrate_wave([sub])
+            return
+        self._dispatch(sub, self._ensure_worktree())
+
+    def _prepare(self, sub, tree):
+        """Make the tree current and settle what this subtask's diff is measured
+        against. Called serially, never from a wave thread: `_catch_up` merges,
+        which touches refs in the common git directory, and concurrent git
+        against one repository is what the serial worktree creation below
+        already exists to avoid."""
+        self._catch_up(sub, tree)
+        self._remember_base(sub, git(["rev-parse", "HEAD"], tree, check=False))
+        return tree
+
+    def _dispatch(self, sub, tree):
+        """Run one subtask in `tree`, having settled what its diff is measured
+        against.
+
+        The base is read from the tree itself, every dispatch, rather than
+        written once when a worktree is created. Recording the commit we *asked*
+        to cut from was wrong twice over: `create_worktree` reuses an existing
+        branch and ignores the base it is handed, and a rework may run in a
+        different tree from the one the subtask started in. Reading HEAD after
+        the checkout is prepared cannot disagree with the tree, whichever path
+        arrived here.
+        """
+        self._one_subtask(sub, self._prepare(sub, tree))
+
+    def _catch_up(self, sub, tree):
+        """Bring a reused subtask worktree up to the integration branch.
+
+        A subtask's own checkout is a snapshot of the moment it was cut. Coming
+        back for a rework, it is missing everything its siblings landed in the
+        meantime -- so the checks ran against an incomplete tree and a reviewer
+        finding citing a sibling's file pointed at a file the agent could not
+        see. Where the branch is already merged this is a fast-forward and
+        cannot conflict; where it is not (an interrupted subtask carrying
+        salvage commits) a real merge is attempted and abandoned cleanly if it
+        will not go, because a half-merged worktree is worse than a stale one
+        and the agent can still work from its own checkpoints.
+        """
+        state = self.task.state
+        branch = state.get("branch")
+        if not branch or self.dry_run:
+            return
+        tip = git(["rev-parse", "--verify", "--quiet", "refs/heads/" + branch],
+                  self.repo, check=False)
+        if not tip:
+            return
+        have = subprocess.run(["git", "merge-base", "--is-ancestor", tip, "HEAD"],
+                              cwd=tree, capture_output=True)
+        if have.returncode == 0:
+            return                      # already has everything on the branch
+        merge = subprocess.run(["git"] + IDENTITY + ["merge", "--no-edit", branch],
+                               cwd=tree, capture_output=True, text=True)
+        if merge.returncode != 0:
+            subprocess.run(["git", "merge", "--abort"], cwd=tree,
+                           capture_output=True)
+            self.log("  %s: could not bring its worktree up to %s (%s) — it "
+                     "continues from its own checkpoints"
+                     % (sub["id"], branch,
+                        (merge.stdout + merge.stderr).strip().splitlines()[-1:] or ["conflict"]))
+            return
+        self.log("  %s: worktree brought up to %s" % (sub["id"], branch))
 
     def _one_subtask(self, sub, base):
         role_choice = self._pick_implementer(sub)
@@ -666,7 +897,15 @@ a planner does that next, from your design.
                     sub, rung, role_choice, attempts, result, report, session, signals)
                 failure = self._signal_context(signals)
                 continue
-            if result.ok and not self._touched(base):
+            if result.ok and not sub.get("actual_files") and not self._touched(base, sub):
+                # Only for a subtask that has never produced anything. Now that
+                # the diff base follows the tree, a rework round that changes
+                # nothing also shows an empty diff -- and halting the run there
+                # would be a new failure mode invented as a side effect: an
+                # implementer that ignores its findings is what the reviewer and
+                # `max_review_loops` are for, and they end the run with a verdict
+                # rather than a park. The case this guard exists for is the
+                # first attempt on green checks, and that is unchanged.
                 raise Halt("needs_human",
                            "%s changed no files, and the checks were already green "
                            "before it ran — passing tests are not evidence of work"
@@ -914,9 +1153,10 @@ a planner does that next, from your design.
         dependency order. Threads are fine here: every agent is a subprocess."""
         import threading
         results = {}
-        # Serial creation: concurrent `git worktree add` against one repo
-        # contends on .git locks and fails intermittently on a healthy run.
-        trees = {t["id"]: self._subtask_worktree(t) for t in wave}
+        # Serial creation and preparation: concurrent git against one repository
+        # contends on .git locks and fails intermittently on a healthy run, and
+        # `_prepare` merges the integration branch into a reused checkout.
+        trees = {t["id"]: self._prepare(t, self._subtask_worktree(t)) for t in wave}
 
         def work(sub):
             try:
@@ -929,22 +1169,57 @@ a planner does that next, from your design.
             t.start()
         for t in threads:
             t.join()
+        # Merge what finished BEFORE reporting what did not. `_integrate_wave`
+        # used to run only after the whole wave came back clean, so one failing
+        # sibling stranded every green one: `_finish_subtask` had already marked
+        # them complete, and a complete subtask never rejoins a wave, so nothing
+        # ever merged their branches. The run resumed, finished the survivor,
+        # reached `done`, and delivered a patch missing work that `actual_files`
+        # and the merge brief both listed as changed -- a silent loss inside a
+        # run that reported success.
+        #
+        # The invariant this restores: a subtask marked `complete` has its work
+        # on the integration branch. That is what makes the brief's file list
+        # and the patch the same account of the change.
+        finished = [s for s in wave
+                    if not isinstance(results.get(s["id"]), Exception)]
+        # Held, not raised on the spot. A merge that will not go in is real, but
+        # it must not outrank a sibling's routing outcome: raising it here threw
+        # away a `Replan` -- the ladder's rung 3, with its escalation bundle
+        # already written -- and would swallow a quota park's reopen time, which
+        # is the exact "the sequential and parallel paths disagreed about the
+        # same event" failure the re-raises below exist to prevent.
+        integration_error = None
+        if finished:
+            try:
+                self._integrate_wave(finished)
+            except (Halt, routing.AllChannelsCooled) as e:
+                # `AllChannelsCooled` as well, now that `_reconcile` stops
+                # flattening it: held under the same rule as a `Halt` so the
+                # precedence below still decides. Raised on its own at the end
+                # it reaches `run()`'s park handler with its reopen time intact.
+                integration_error = e
         for sub in wave:
             outcome = results.get(sub["id"])
-            if isinstance(outcome, Replan):
-                # Same reasoning as the quota park below: flattening this into a
-                # Halt would give the wave path a different ladder from the
-                # sequential one for the identical event.
-                raise outcome
-            if isinstance(outcome, routing.AllChannelsCooled):
-                # Re-raised, not flattened into a Halt: a quota park carries a
-                # reopen time and drives `resume --when-open`. Downgrading it
-                # here left a wave-mode run with no `park` record at all, so the
-                # sequential and parallel paths disagreed about the same event.
+            if isinstance(outcome, (Replan, routing.AllChannelsCooled)):
+                # Re-raised, not flattened into a Halt. A Replan continues the
+                # run at the plan stage, and a quota park carries a reopen time
+                # and drives `resume --when-open`; downgrading either gave the
+                # wave path a different answer from the sequential one for an
+                # identical event.
+                if integration_error is not None:
+                    self.log("  wave: the finished members did not integrate "
+                             "cleanly (%s) — reporting %s's outcome first, "
+                             "because that is what decides where the run goes "
+                             "next" % (integration_error, sub["id"]))
                 raise outcome
             if isinstance(outcome, Exception):
+                if integration_error is not None:
+                    self.log("  wave: the finished members did not integrate "
+                             "cleanly either (%s)" % integration_error)
                 raise Halt("needs_human", "%s failed: %s" % (sub["id"], outcome))
-        self._integrate_wave(wave)
+        if integration_error is not None:
+            raise integration_error
 
     def _reap_worktrees(self):
         """Remove this task's worktrees, once and only once it is done.
@@ -981,46 +1256,189 @@ a planner does that next, from your design.
         if removed:
             self.log("worktree: removed %d, the task is done" % removed)
 
+    def _integration_tip(self):
+        """The commit a new subtask worktree is cut from.
+
+        The task's integration branch as it stands, NOT `base_commit`. Cutting
+        from the task base gave every wave a checkout of the repository as it
+        was before the task started, which broke two promises at once:
+        `references/parallelism.md` says a subtask worktree is "cut from the
+        task's integration branch", and `roles/implementer.md` tells the agent
+        that `depends_on` "tells you what already exists". Neither held -- a
+        second wave could not see the first wave's merged output, so a subtask
+        that depended on one already finished began by importing a file that was
+        not there. The test author's failing tests were invisible the same way:
+        they are committed into the integration worktree during `plan`, and a
+        wave cut from the base never contained them, so the checks an
+        implementer ran were green because the requirement was absent.
+
+        Falls back to the base when the branch does not exist yet, which is the
+        first worktree of the task and the one case where they are the same
+        commit anyway.
+        """
+        state = self.task.state
+        branch = state.get("branch")
+        if branch:
+            tip = git(["rev-parse", "--verify", "--quiet", "refs/heads/" + branch],
+                      self.repo, check=False)
+            if tip:
+                return tip
+        return state["repo"].get("base_commit", "HEAD")
+
+    def _subtask_base(self, sub=None):
+        """What a subtask's diff is measured against.
+
+        Its own worktree's starting commit, which is no longer the task base now
+        that waves are cut from the integration branch: measuring against the
+        task base would report every file an earlier subtask landed as this
+        one's work, and then as a scope violation it never committed.
+
+        A subtask working directly in the integration worktree has no recorded
+        base and keeps the task's, which is what it has always used.
+        """
+        return ((sub or {}).get("base_commit")
+                or self.task.state["repo"].get("base_commit", "HEAD"))
+
     def _subtask_worktree(self, sub):
         state = self.task.state
         branch = "adg/%s/%s" % (state["id"], sub["id"])
         path = os.path.join(os.path.dirname(os.path.abspath(self.repo)),
                             ".adg-worktrees", state["project_key"],
                             "%s-%s" % (state["id"], sub["id"]))
-        self.adapter.create_worktree(self.repo, branch,
-                                     state["repo"].get("base_commit", "HEAD"), path)
-        # Persisted, because `_wave` holds these in a local dict that is gone
+        self.adapter.create_worktree(self.repo, branch, self._integration_tip(), path)
+        # Persisted, because `_run_wave` holds these in a local dict that is gone
         # long before the task reaches `done` -- and a reaper that cannot name
-        # what it created is a reaper that leaves everything behind.
+        # what it created is a reaper that leaves everything behind. The diff
+        # base is NOT recorded here: `create_worktree` may reuse an existing
+        # branch and ignore the base it was handed, so only reading HEAD back
+        # off the prepared tree (`_prepare`) is guaranteed to match it.
         def _record(st):
             for t in st.get("subtasks") or []:
                 if t.get("id") == sub["id"]:
                     t["worktree"] = path
+                    sub["worktree"] = path
         self.task.mutate(_record)
         return path
+
+    def _remember_base(self, sub, commit):
+        """Record the commit this subtask's diff is measured against.
+
+        Rewritten on every dispatch, not kept from the first. The base has to
+        follow the tree: a rework runs in a worktree that has since been brought
+        up to the integration branch, and holding the original commit measured
+        the diff from before the siblings landed -- which credited the subtask
+        with their files, called them scope violations it never committed, and
+        disarmed the "changed no files" guard, since a sibling's work always
+        looked like its own. `actual_files` stays cumulative across dispatches
+        (`_finish_subtask`), so nothing is lost by moving the base forward.
+
+        Written to the caller's dict as well as to task.json. `_run_wave` hands
+        each thread the dict it read before the worktree was prepared, and
+        `_finish_subtask` reads the diff base from that dict.
+        """
+        if not commit:
+            return
+        def _record(st):
+            for t in st.get("subtasks") or []:
+                if t.get("id") == sub["id"]:
+                    t["base_commit"] = commit
+                    sub["base_commit"] = commit
+        self.task.mutate(_record)
 
     def _integrate_wave(self, wave):
         """Merge each green branch into the task branch, verifying after each --
         so the integration branch is always green and every merge is tested
-        against everything already landed."""
+        against everything already landed.
+
+        Stopping part-way has to leave two things true, and neither used to be.
+        The worktree must be clean: `_reconcile` could raise out of an
+        unfinished merge, and the run does not always end there -- a sibling's
+        `Replan` continues at the plan stage, where `_author_tests` runs
+        `git add -A && git commit` and committed the conflict markers as the
+        resolution, shipping them in the patch. And a subtask still marked
+        `complete` must be on this branch: the members after the failure never
+        merged, and a complete subtask never rejoins a wave, so their work was
+        delivered as done and absent. They are reopened instead.
+        """
         integration = self._ensure_worktree()
-        for sub in wave:
+        for i, sub in enumerate(wave):
             branch = "adg/%s/%s" % (self.task.state["id"], sub["id"])
-            merge = subprocess.run(["git", "merge", "--no-edit", branch],
+            merge = subprocess.run(["git"] + IDENTITY + ["merge", "--no-edit", branch],
                                    cwd=integration, capture_output=True, text=True)
             if merge.returncode != 0:
                 self.log("  conflict merging %s" % sub["id"])
-                self._reconcile(sub, integration, merge.stdout + merge.stderr)
+                try:
+                    self._reconcile(sub, integration, merge.stdout + merge.stderr)
+                except Exception:         # noqa: BLE001 -- re-raised below
+                    # Any exception, not only `Halt`. `_reconcile` dispatches an
+                    # agent, so it can raise `AllChannelsCooled` (every
+                    # integrator seat walled mid-conflict) or an adapter
+                    # `RuntimeError_` (the CLI vanished) -- neither is a `Halt`,
+                    # and both used to unwind straight past this handler. The
+                    # cleanup is what matters, not which failure skipped it: the
+                    # tree is left mid-merge with MERGE_HEAD set and conflict
+                    # markers in the files, and the run does not always end here.
+                    # `_checkpoint` and `_author_tests` are blind
+                    # `git add -A && git commit`, so the markers were committed
+                    # as the resolution and shipped in the patch.
+                    self._abort_merge(integration)
+                    self._unfinish(wave[i:])
+                    raise
             result = verify.run(self.task, self.repo, integration, "fast")
             if not result.ok:
+                # The merge commit itself is sound and stays; what failed is the
+                # combination. This subtask owns that, so it goes back to pending
+                # along with everything behind it in the wave.
+                self._unfinish(wave[i:])
                 raise Halt("needs_human",
                            "%s broke the integration branch once merged" % sub["id"])
+            # Landed, and recorded so `_reap_worktrees` and a later rework can
+            # tell a merged branch from one still waiting.
+            def _mark(state, sid=sub["id"]):
+                for s in state.get("subtasks") or []:
+                    if s.get("id") == sid:
+                        s["merged"] = True
+            self.task.mutate(_mark)
+            sub["merged"] = True
+
+    @staticmethod
+    def _abort_merge(cwd):
+        """Put the worktree back the way it was. A merge nobody resolved leaves
+        MERGE_HEAD set and conflict markers in the files, and every later
+        `_checkpoint` is a blind `git add -A && git commit`."""
+        subprocess.run(["git", "merge", "--abort"], cwd=cwd, capture_output=True)
+
+    def _unfinish(self, subs):
+        """Send subtasks that did not make it onto the integration branch back
+        to pending, so `complete` keeps meaning `its work is on the branch`.
+        Their worktrees and branches are untouched -- the agent that picks one
+        up again finds its own work already there."""
+        ids = {s["id"] for s in subs}
+        def reopen(state):
+            for s in state.get("subtasks") or []:
+                if s["id"] in ids and s.get("status") == "complete" \
+                        and not s.get("merged"):
+                    s["status"] = "pending"
+        self.task.mutate(reopen)
+        for s in subs:
+            if not s.get("merged"):
+                s["status"] = "pending"
 
     def _reconcile(self, sub, cwd, conflict_text):
         """A conflict two agents produced is judgement, not mechanism: which
         side matches the plan, and what did the other one mean."""
         try:
             choice = self._pick("integrator")
+        except routing.AllChannelsCooled:
+            # Re-raised, never flattened. `AllChannelsCooled` subclasses
+            # `NoModelAvailable` precisely so a mandatory stage propagates it to
+            # the park handler, which meant the broader handler below swallowed
+            # the one exception carrying a reopen time: `run()`'s dedicated
+            # `except routing.AllChannelsCooled` was never reached, `_quota_park`
+            # never ran, and no `park` was written. `delegate status` showed a
+            # bare `needs_human` and `resume --when-open` returned immediately,
+            # so a run that was merely early read as broken.
+            raise
         except routing.NoModelAvailable as e:
             raise Halt("needs_human", "merge conflict in %s and no integrator: %s"
                        % (sub["id"], e))
@@ -1035,10 +1453,10 @@ a planner does that next, from your design.
         if left:
             raise Halt("needs_human", "conflict still unresolved in: %s" % left)
 
-    def _touched(self, cwd):
+    def _touched(self, cwd, sub=None):
         """Did anything actually change in this worktree?"""
         return bool(verify.changed_files(
-            self.repo, cwd, self.task.state["repo"].get("base_commit", "HEAD"),
+            self.repo, cwd, self._subtask_base(sub),
             ignore=self.vcfg.get("ignore")))
 
     def _checkpoint(self, cwd, message):
@@ -1050,25 +1468,60 @@ a planner does that next, from your design.
         status = git(["status", "--porcelain"], cwd, check=False)
         if not status.strip():
             return False
-        git(["-c", "user.email=orchestrator@agent-delegation", "-c", "user.name=adg",
-             "commit", "-q", "-m", message], cwd, check=False)
+        git(IDENTITY + ["commit", "-q", "-m", message], cwd, check=False)
         return True
 
     def _finish_subtask(self, sub, cwd):
-        files = verify.changed_files(self.repo, cwd,
-                                     self.task.state["repo"].get("base_commit", "HEAD"),
+        files = verify.changed_files(self.repo, cwd, self._subtask_base(sub),
                                      ignore=self.vcfg.get("ignore"))
-        violations = verify.scope_violations(files, sub.get("planned_scope") or ["**"])
+        # Everything this tree still changes against the task's own base. The
+        # union below has to be cumulative -- the diff base moves forward with
+        # the tree on every dispatch, so a rework measured from the refreshed
+        # base reports only what the rework touched, while the merge brief and
+        # the scope check want everything this subtask has written. But a union
+        # can only grow, so a file a rework DELETED could never leave it: the
+        # deletion is itself a change, so the path came straight back in
+        # `files`. It went on being reported as a scope violation, went on
+        # blocking `_skip_review`, and was still shown to the human at the merge
+        # gate as a changed file the patch does not contain. Intersecting keeps
+        # the accumulation and drops the paths whose net effect is nothing. It
+        # cannot pull in a sibling's file, because nothing enters this list
+        # except through this subtask's own `files`.
+        net = set(verify.changed_files(
+            self.repo, cwd, self.task.state["repo"].get("base_commit", "HEAD"),
+            ignore=self.vcfg.get("ignore")))
         def mark(state):
             for s in state["subtasks"]:
                 if s["id"] == sub["id"]:
                     s["status"] = "complete"
-                    s["actual_files"] = files
-                    s["scope_violations"] = violations
+                    s["actual_files"] = sorted(
+                        (set(s.get("actual_files") or []) | set(files)) & net)
+                    s["scope_violations"] = verify.scope_violations(
+                        s["actual_files"], sub.get("planned_scope") or ["**"])
+                    sub["actual_files"] = s["actual_files"]
+            # Only the findings THIS subtask owned. Clearing the whole list let
+            # the first subtask to finish disarm the rework for every other one:
+            # a reviewer that rejected st-1 and st-2 saw st-1 fixed, and st-2 was
+            # then re-dispatched by `_findings_brief` with nothing at all -- back
+            # to the same code with the same prompt, rebuilding exactly what was
+            # rejected, which is the failure the finding hand-off exists to stop.
+            # Not a race, and not a wave problem at all: siblings in one wave are
+            # dispatched before any of them finishes, so they all read the list
+            # intact. It bites wherever subtasks go one after another -- a cap of
+            # one, a dependency chain, or scopes that serialize them -- which is
+            # the ordinary case.
+            #
+            # An unowned finding survives, because it is addressed to whoever is
+            # reworking rather than to one subtask. The next verdict replaces the
+            # list wholesale, so nothing outlives the review that raised it.
+            state["pending_findings"] = [
+                f for f in (state.get("pending_findings") or [])
+                if not self._owned_by(f.get("suggested_owner"), sub["id"])]
         self.task.mutate(mark)
-        if violations:
-            self.log("  scope: %d file(s) outside declared scope" % len(violations))
-        self.task.update(pending_findings=[])
+        violations = [s.get("scope_violations") or [] for s in self.task.state["subtasks"]
+                      if s["id"] == sub["id"]]
+        if violations and violations[0]:
+            self.log("  scope: %d file(s) outside declared scope" % len(violations[0]))
 
     def _review_policy(self):
         """auto (default): independent review for complex work, deterministic
@@ -1168,14 +1621,21 @@ a planner does that next, from your design.
             # which `schema.validate_report` then rejected for every required
             # field it does not have. The card is pinned by a test; this string
             # was not, which is exactly how the two drifted.
+            # Resolved against the RUNTIME's schemas directory, not the workflow
+            # in force. `schema.schemas_dir()` says why -- the report envelope is
+            # how this program reads a result, so it does not move with
+            # `--workflow` and a hosted workflow need not ship a copy. Building
+            # these two from `prompts.skill_path()` put a second, different
+            # absolute path for the same file in the same prompt, and under any
+            # workflow but the bundled one it named a file that need not exist.
             "Write reports/review-reviewer.json as an ordinary report matching "
-            "%s/schemas/report.schema.json, carrying your verdict under "
-            "role_data.verdict, which must itself match "
-            "%s/schemas/verdict.schema.json."
+            "%s, carrying your verdict under role_data.verdict, which must "
+            "itself match %s."
             % (self.task.state["repo"].get("base_commit", "HEAD"),
                result.summary(),
                self.task.file("verify", result.run_id + ".json"),
-               prompts.skill_path(), prompts.skill_path()))
+               os.path.join(schema.schemas_dir(), "report.schema.json"),
+               os.path.join(schema.schemas_dir(), "verdict.schema.json")))
         chaff = winnow.as_text(self.task.state.get("winnow"))
         if chaff:
             extra += ("\n\n%s\nRead these after the diff, not before. They may only "
@@ -1214,10 +1674,37 @@ a planner does that next, from your design.
 
     def _apply_verdict(self, verdict):
         v = verdict["verdict"]
+        # A verdict is the authority on what is still outstanding, so each one
+        # replaces the last one's findings rather than adding to them. The
+        # branches below that do not carry findings forward clear them here:
+        # `_finish_subtask` now only consumes the findings a subtask owned, so
+        # an unowned one would otherwise outlive the review that raised it.
         if v == "APPROVE":
-            self.task.update(status="integrate")
+            self.task.update(pending_findings=[], status="integrate")
         elif v == "REQUEST_CHANGES":
             blocking = [f for f in verdict.get("findings", []) if f.get("severity") == "blocking"]
+            if not blocking:
+                # `severity: minor` is legal, so `blocking` can legally be
+                # empty -- and then `owners` is empty, `_reopen_subtasks`
+                # reopens EVERYTHING on its "no owners named" fallback, and
+                # `pending_findings` is empty, so every green subtask is
+                # rebuilt from scratch with no idea what was wrong. That is the
+                # failure the finding hand-off exists to prevent, arriving
+                # through a schema-legal verdict. verdict.schema.json defines
+                # REQUEST_CHANGES as "blocking findings fixable within the
+                # current plan"; one with none is incoherent, and guessing on
+                # the reviewer's behalf costs a full rebuild.
+                # The parentheses matter: `%` binds tighter than `or`, so
+                # without them the fallback was unreachable and a verdict with
+                # no findings at all trailed off after the colon.
+                raise Halt("needs_human",
+                           "the reviewer requested changes but raised no blocking "
+                           "finding, so there is nothing to send back. Re-run the "
+                           "review, or mark the finding blocking if it is: %s"
+                           % (", ".join(f.get("claim", "?")[:80]
+                                        for f in verdict.get("findings", [])[:3])
+                              or "(it listed no findings at all)"))
+            blocking = [self._addressable(f) for f in blocking]
             owners = {f.get("suggested_owner") for f in blocking if f.get("suggested_owner")}
             self._reopen_subtasks(owners)
             # Carry the findings to the implementer. Reopening a subtask without
@@ -1229,7 +1716,10 @@ a planner does that next, from your design.
         elif v == "REPLAN":
             self.budget.check_replan()
             self.budget.used_replan()
-            self.task.update(status="plan")
+            # Cleared, not carried: the planner is about to reissue the
+            # decomposition, so findings citing subtask ids that may not survive
+            # it would be handed to whoever inherited the id.
+            self.task.update(pending_findings=[], status="plan")
         else:
             raise Halt("needs_human", "reviewer escalated: %s" %
                        (verdict.get("findings") or [{}])[0].get("claim", "no detail"))
@@ -1281,6 +1771,29 @@ a planner does that next, from your design.
         """
         return (owner or "").strip().split(":")[-1].strip() == subtask_id
 
+    def _addressable(self, finding):
+        """A finding whose owner this plan can actually deliver to.
+
+        `suggested_owner` is written by hand by the reviewer, against ids the
+        planner chose. One that names no subtask used to be worse than useless:
+        `_reopen_subtasks` fell through to reopening `subtasks[0]`, and
+        `_findings_brief` then filtered the finding out of that subtask's brief
+        -- it has an owner, and this is not it -- so an agent was sent back to
+        rebuild something with the reason withheld. Dropping the bad owner makes
+        it unowned, which is the honest reading: it is addressed to whoever is
+        reworking.
+        """
+        owner = finding.get("suggested_owner")
+        if not owner:
+            return finding
+        known = [s["id"] for s in (self.task.state.get("subtasks") or [])]
+        if any(self._owned_by(owner, sid) for sid in known):
+            return finding
+        self.log("  review: finding %s names %r, which is no subtask in this plan "
+                 "— treating it as unaddressed so every reworking subtask sees it"
+                 % (finding.get("id", "?"), owner))
+        return dict(finding, suggested_owner=None)
+
     def _findings_brief(self, sub):
         """What the reviewer rejected, for the implementer that has to fix it."""
         findings = self.task.state.get("pending_findings") or []
@@ -1301,16 +1814,29 @@ a planner does that next, from your design.
 
     def _reopen_subtasks(self, owners=None):
         """Mark subtasks pending again. When the reviewer named owners, only
-        those reopen -- reworking everything would discard green work."""
+        those reopen -- reworking everything would discard green work.
+
+        `merged` is cleared with the status, because it describes the branch as
+        it stood when it landed and a reopened subtask is about to add commits
+        that have not. Leaving it set disarmed `_unfinish`, whose guard is
+        `complete and not merged`: a rework whose own merge was aborted stayed
+        `complete`, so on resume nothing was pending, the run fell through
+        review to integrate, and `_land` delivered a patch and a `done` for work
+        the reviewer had rejected and the implementer had redone. That is the
+        silent-loss invariant `_unfinish` exists to hold -- `complete` means
+        `its work is on the integration branch` -- defeated by a stale flag.
+        """
         def reopen(state):
             hit = False
             for s in state["subtasks"]:
                 named = owners and any(self._owned_by(o, s["id"]) for o in owners)
                 if not owners or named:
                     s["status"] = "pending"
+                    s.pop("merged", None)
                     hit = True
             if not hit and state["subtasks"]:
                 state["subtasks"][0]["status"] = "pending"
+                state["subtasks"][0].pop("merged", None)
         self.task.mutate(reopen)
 
     def _stage_integrate(self):
@@ -1575,7 +2101,7 @@ a planner does that next, from your design.
         estimate by construction -- no provider exposes a meter -- kept so the
         router drifts off a filling seat before it hits the wall."""
         window = quota.parse_window((choice.chan_spec.get("quota") or {}).get("window"))
-        cooldown.record_use(choice.channel, window, self.clock())
+        self._breaker_write(cooldown.record_use(choice.channel, window, self.clock()))
 
     def _reopen_at(self, choice, res):
         """The provider's own reset time, else the channel's configured window
@@ -1607,9 +2133,26 @@ a planner does that next, from your design.
     def _cool(self, choice, res):
         """Open the breaker for a channel that just said it is out."""
         at = self._reopen_at(choice, res)
-        cooldown.open_breaker(choice.channel, "quota", at, self.clock(),
-                              detail=(res.get("output") or "")[-200:])
+        self._breaker_write(
+            cooldown.open_breaker(choice.channel, "quota", at, self.clock(),
+                                  detail=(res.get("output") or "")[-200:]))
         return at
+
+    def _breaker_write(self, warning):
+        """Report a breaker file that could not be written.
+
+        `cooldown._mutate` returns the reason precisely so a caller can say it
+        -- its docstring is "it must not pretend the write happened" -- and both
+        production callers dropped it on the floor, which made the promise in
+        orchestrator/README.md that an unwritable file "is reported" false. A
+        read-only or full `$XDG_STATE_HOME` then cost real money silently: the
+        wall was never recorded, `delegate channels` showed every seat ready,
+        and the next run picked the exhausted one again and paid for its
+        refusal, every run, with nothing in the log to explain it.
+        """
+        if warning and warning not in self._warned_writes:
+            self._warned_writes.add(warning)
+            self.log("  warning: %s" % warning)
 
     def _ensure_worktree(self):
         state = self.task.state
@@ -1621,7 +2164,20 @@ a planner does that next, from your design.
                             ".adg-worktrees", state["project_key"], "%s-work" % state["id"])
         self.log("worktree: %s (%s)" % (path, self.adapter.name))
         self.adapter.create_worktree(self.repo, branch, base, path)
-        repo_info = dict(state["repo"], base_commit=base)
+        # Recorded only when there was none. This runs again whenever the
+        # checkout has gone missing -- a parked task whose worktree the user
+        # deleted, which both READMEs invite by calling them throwaway -- and
+        # `create_worktree` then reattaches the branch that already exists and
+        # ignores the base it was handed. The branch still forks where it always
+        # did, so overwriting the record with today's HEAD pointed every diff at
+        # a commit the branch had never been cut from: `_land` wrote
+        # `git diff <today> <branch>` into integrate.patch, which carries a
+        # reverse-delta for every commit the user made while the task was
+        # parked. Applying the patch this tool hands them would have reverted
+        # their own work.
+        repo_info = state["repo"]
+        if not repo_info.get("base_commit"):
+            repo_info = dict(repo_info, base_commit=base)
         self.task.update(worktree=path, branch=branch, repo=repo_info)
         return path
 
@@ -1726,7 +2282,8 @@ a planner does that next, from your design.
             # was there before the turn needs no clock and no tolerance.
             before = self._report_state()
             if session is None:
-                text = prompts.compose(role, self.task, subtask=subtask, extra=extra,
+                text = prompts.compose(role, self.task, subtask=subtask,
+                                       extra=self._with_failure(extra, failure),
                                        verify_cfg=self.vcfg)
                 session = self.adapter.start_agent(role, choice.agent_kind, cwd,
                                                    prompts.env_for(self.task, role))
@@ -1862,6 +2419,36 @@ a planner does that next, from your design.
             self.log("  salvaged %s's uncommitted work as a checkpoint" % label)
             return True
         return False
+
+    @staticmethod
+    def _with_failure(extra, failure):
+        """What a *fresh* agent is told about the attempt it is replacing.
+
+        A retry keeps its session, so `prompts.retry` carries the failure into
+        the follow-up turn. An escalation does not, and cannot: `_climb` returns
+        `session = None` by construction, because the whole point is a different
+        model. So the one path that most needs the context was the one path that
+        dropped it -- `_one_subtask` built `failure` (the signals, the evidence,
+        and the `attempted` list from `_signal_context`, or the failing check
+        output on a `test_stuck` climb), passed it to `_invoke`, and `_invoke`
+        read it only when continuing a session or handing over on a quota hop.
+        The stronger, dearer model opened on the plain role prompt and re-tried
+        what its predecessor had already reported as failed.
+        references/escalation.md: `attempted` prevents repetition, and the next
+        model is smarter, not clairvoyant.
+
+        Appended to the caller's `extra` rather than replacing it: that is the
+        findings brief, and a rework that loses its findings is the failure the
+        hand-off exists to stop.
+        """
+        if not failure:
+            return extra
+        note = ("The previous attempt on this did not succeed, and you are the "
+                "replacement. Read this before you touch anything, then "
+                "continue from the checkpoints already committed in this "
+                "worktree — do not start over, and do not repeat what is listed "
+                "as already tried:\n\n%s" % failure)
+        return "%s\n\n%s" % (extra, note) if extra else note
 
     def _handover(self, extra, failure):
         """What the replacement agent is told. It inherits a worktree holding the
