@@ -16,7 +16,8 @@ import subprocess
 import time
 
 from . import (brief, companions, cooldown, limits as lim, prompts, quota,
-               router as routing, schema, verify, winnow, yamlite)
+               router as routing, schema, verify, winnow, workflow as wf,
+               yamlite)
 from .store import git
 
 # Statuses the machine can actually be resumed at -- `cli.cmd_resume` validates
@@ -155,6 +156,10 @@ class Orchestrator:
         self.task = task
         self.reg = registry
         self.router = routing.Router(registry)
+        # The workflow in force. Read once per run and held, because two stages
+        # of one task reading different manifests would be two different
+        # workflows wearing one task id.
+        self.workflow = wf.current()
         self.adapter = adapter
         self.gate = gate            # callable(kind, brief_text) -> bool
         self.log = log
@@ -175,6 +180,17 @@ class Orchestrator:
                 status = self.task.state["status"]
                 if status in TERMINAL:
                     return status
+                # Switched off by the manifest. Checked here rather than inside
+                # each handler because the handlers choose their own successor
+                # -- `_stage_classify` sends simple work straight past
+                # `brainstorm` -- so this only decides which of the
+                # destinations they name is actually switched on.
+                if status in self.workflow.stages and not self.workflow.enabled(status):
+                    nxt = self.workflow.next_enabled(status)
+                    self.log("%s: disabled by workflow %r — skipping to %s"
+                             % (status, self.workflow.data.get("name", "?"), nxt))
+                    self.task.update(status=nxt)
+                    continue
                 handler = getattr(self, "_stage_" + status, None)
                 if handler is None:
                     raise Halt("needs_human", "no handler for stage %r" % status)
@@ -403,13 +419,13 @@ a planner does that next, from your design.
             self.log("brainstorm: skipped — %s" % e)
             self.task.update(status="plan")
             return
-        installed = (self.task.state.get("companions") or {}).get("superpowers")
-        discipline = ("Use the `superpowers:brainstorming` skill's discipline for this: "
-                      "explore the code first, then reason about purpose, constraints and "
-                      "success criteria before proposing anything. Ignore its instructions "
-                      "about where to save files and about committing."
-                      if installed else
-                      "Explore the code before proposing anything.")
+        # Asked of the manifest, not decided here. This was a hardcoded `if
+        # superpowers installed` with both texts inline -- which meant hosting
+        # any other design discipline was a patch to this function rather than
+        # a workflow edit, and that is precisely what stopped this project being
+        # a runtime that hosts a method instead of one that owns it.
+        discipline = self.workflow.discipline(
+            "brainstorm", self.task.state.get("companions"))
         self.log("brainstorm: %s via %s" % (choice.model, choice.channel))
         self._run_once(
             "planner", choice, cwd=self.repo,

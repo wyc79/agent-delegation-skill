@@ -206,7 +206,12 @@ policy:
     # orchestrator/README.md. Every attribution defect found on the way, in
     # product and harness both, is fixed and held by a deterministic test.
     max_parallel_agents: 3
-    human_approval_required: [design, plan, merge, dependency_change, destructive_op]
+    # The three gates the machine actually has. `dependency_change` and
+    # `destructive_op` were listed here and implemented nowhere -- a policy
+    # naming a control that does not exist reads as protection and is not,
+    # which is the same failure mode as a `max_cost_usd` that cannot bind.
+    # Add them back in the same commit that adds the gates.
+    human_approval_required: [design, plan, merge]
   escalation_thresholds:
     test_stuck_attempts: 3
     edit_churn_rewrites: 4

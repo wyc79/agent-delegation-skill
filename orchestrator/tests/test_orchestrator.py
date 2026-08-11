@@ -19,7 +19,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from adg import (brief, cli, limits, prompts, router, runtime, schema, store,
-                 verify, winnow, yamlite)
+                 verify, winnow, workflow as wf, yamlite)
 from adg.machine import Halt, Orchestrator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2971,6 +2971,125 @@ class TestEndToEnd(unittest.TestCase):
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=lambda *_: None).run()
         self.assertEqual(status, "needs_human")
+
+
+class TestWorkflowManifest(unittest.TestCase):
+    """The workflow is declared, not hardcoded.
+
+    What these pin is the boundary: a manifest may enable, disable, repoint and
+    re-discipline a stage, and may NOT invent one. The state machine stays code
+    -- `implement` runs worktrees, waves and an escalation ladder while
+    `classify` is one parsed line -- so a manifest that could add stages would
+    be promising something the machine cannot deliver.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.dir = tempfile.mkdtemp(prefix="wf-")
+        src = wf.default_dir()
+        shutil.copy(os.path.join(src, "PROTOCOL.md"), self.dir)
+        shutil.copytree(os.path.join(src, "roles"), os.path.join(self.dir, "roles"))
+
+    def tearDown(self):
+        wf._CURRENT = None          # the module-level workflow is process state
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.t.close()
+
+    def _manifest(self, body):
+        with open(os.path.join(self.dir, "workflow.yaml"), "w") as fh:
+            fh.write(body)
+        return wf.use(self.dir)
+
+    BASE = """name: t
+protocol: PROTOCOL.md
+stages:
+  intake: {role: intake}
+  classify: {role: classifier}
+  brainstorm:
+    role: planner
+    card: roles/planner.md
+    discipline:
+      skill: superpowers:brainstorming
+      text: Borrowed discipline.
+      fallback: Do it yourself.
+  plan: {role: planner, card: roles/planner.md}
+  implement: {role: implementer, card: roles/implementer.md}
+  review: {role: reviewer, card: roles/reviewer.md%s}
+  integrate: {role: integrator, card: roles/integrator.md}
+"""
+
+    def test_the_bundled_default_is_a_valid_manifest(self):
+        w = wf.Workflow.load()
+        self.assertEqual(w.order(),
+                         ["intake", "classify", "brainstorm", "plan",
+                          "implement", "review", "integrate"],
+                         "the manifest and machine.STAGES disagree on the pipeline")
+        for role in ("planner", "implementer", "reviewer", "integrator", "test-author"):
+            self.assertTrue(os.path.exists(w.card(role)),
+                            "%s's card is declared but not on disk" % role)
+        self.assertTrue(os.path.exists(w.protocol()))
+
+    def test_a_stage_borrows_its_method_from_an_installed_skill(self):
+        """The compatibility primitive. This used to be an `if superpowers` with
+        both texts inline in `_stage_brainstorm`, so hosting any other design
+        discipline meant patching the machine."""
+        w = self._manifest(self.BASE % "")
+        self.assertEqual(w.discipline("brainstorm", {"superpowers": True}),
+                         "Borrowed discipline.")
+        self.assertEqual(w.discipline("brainstorm", {}), "Do it yourself.")
+        self.assertEqual(w.discipline("brainstorm", {"superpowers": False}),
+                         "Do it yourself.")
+        self.assertEqual(w.wants_skill("brainstorm"), "superpowers:brainstorming")
+
+    def test_a_disabled_stage_is_skipped_and_the_run_still_finishes(self):
+        self._manifest(self.BASE % ", enabled: false")
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'import app; assert app.add(1,2)==3\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        script, _ = TestEndToEnd._script(self)
+        task = store.Task.create(self.t.repo, "T-WF", "# t\n\nAdd a subtract API function\n",
+                                 self.reg["policy"]["limits"])
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertTrue(any("review: disabled by workflow" in x for x in logs),
+                        "the skip was silent:\n%s" % "\n".join(logs))
+        self.assertFalse([h for h in task.state["delegation_history"]
+                          if h.get("role") == "reviewer"],
+                         "a disabled stage still dispatched its agent")
+
+    def test_a_workflow_with_no_card_for_a_role_omits_the_line(self):
+        """A stage whose method is entirely a foreign skill has no card of its
+        own. Pointing the agent at a path that does not exist sends it hunting
+        for a file instead of working."""
+        w = self._manifest("""name: cardless
+stages:
+  implement: {role: implementer}
+""")
+        self.assertIsNone(w.card("implementer"))
+        self.assertIsNone(w.protocol())
+        task = store.Task.create(self.t.repo, "T-WF2", "# t\n\nx\n",
+                                 self.reg["policy"]["limits"])
+        text = prompts.compose("implementer", task, subtask={"id": "s", "goal": "g"})
+        self.assertNotIn("role card", text)
+        self.assertNotIn("PROTOCOL.md", text)
+        self.assertIn("Task directory", text, "the dynamic facts must survive")
+
+    def test_a_directory_without_a_manifest_is_refused_by_name(self):
+        empty = tempfile.mkdtemp(prefix="nowf-")
+        try:
+            with self.assertRaises(wf.WorkflowError) as cm:
+                wf.Workflow.load(empty)
+            self.assertIn(empty, str(cm.exception), "the error does not say where it looked")
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+
+    def test_a_manifest_with_no_stages_is_refused(self):
+        with self.assertRaises(wf.WorkflowError):
+            self._manifest("name: empty\n")
 
 
 if __name__ == "__main__":

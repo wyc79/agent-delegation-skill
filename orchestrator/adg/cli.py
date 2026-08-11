@@ -8,7 +8,7 @@ import time
 import json
 
 from . import (companions, cooldown, limits as lim, quota, router as routing,
-               runtime, store, verify, winnow)
+               runtime, store, verify, winnow, workflow as wf)
 
 
 def _repo(path):
@@ -411,6 +411,10 @@ def main(argv=None):
     p = argparse.ArgumentParser("delegate", description="Multi-agent task delegation.")
     p.add_argument("--repo", default=".", help="repository (default: cwd)")
     p.add_argument("--registry", default=None, help="path to registry.default.yaml")
+    p.add_argument("--workflow", default=None, metavar="DIR",
+                   help="directory holding a workflow.yaml (default: the "
+                        "bundled orchestrator/workflows/default; also "
+                        "$AGENT_DELEGATION_WORKFLOW)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     i = sub.add_parser("init", help="show detected setup and role assignments")
@@ -476,4 +480,14 @@ def main(argv=None):
     ch.set_defaults(func=cmd_channels)
 
     args = p.parse_args(argv)
+    # Before any subcommand runs. The workflow decides which protocol and role
+    # cards every agent is pointed at, so resolving it late would mean the
+    # first stage of a run could be composed against a different manifest from
+    # the rest. Failing here, with the path in the message, beats failing three
+    # stages in with a missing file.
+    if getattr(args, "workflow", None):
+        try:
+            wf.use(args.workflow)
+        except wf.WorkflowError as e:
+            sys.exit("refusing to run: %s" % e)
     return args.func(args)
