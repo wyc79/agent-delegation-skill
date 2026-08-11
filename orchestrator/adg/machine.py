@@ -51,6 +51,21 @@ TERMINAL = {"done", "abandoned", "needs_human"}
 # patch.
 IDENTITY = ["-c", "user.email=orchestrator@agent-delegation", "-c", "user.name=adg"]
 
+# Transcript filenames are sequenced, and a wave writes them from several
+# threads at once. Lost with the classifier prompt block that happened to sit
+# above it -- which is exactly the kind of thing a smoke test catches and a
+# reading does not.
+def _stamp(epoch):
+    """A reopen time a human can act on, in their own zone."""
+    if not epoch:
+        return "an unknown time"
+    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(float(epoch)))
+
+
+_LOG_SEQ = [0]
+_LOG_LOCK = threading.Lock()
+
+
 class Halt(Exception):
     """Stop cleanly and leave the task resumable."""
 
@@ -419,7 +434,14 @@ admits only one sensible reading.
                 raise Halt("needs_human", "no subtasks and no parseable plan.md")
         pending = [s for s in state["subtasks"] if s.get("status") != "complete"]
         if not pending:
-            self.task.update(status="review")
+            # Asked, not written down. This used to name `review`, which stopped
+            # being a stage -- so every run where the jobs all finished halted
+            # with "no handler for stage 'review'", which is to say the success
+            # path was the broken one. The successor comes from the graph, so a
+            # manifest that switches `integrate` off routes past it correctly
+            # instead of falling into a stage nobody has.
+            self.task.update(status=self.workflow.next_enabled(
+                "implement", order=STAGES))
             return
         wave = self._wave(state["subtasks"])
         if not wave:

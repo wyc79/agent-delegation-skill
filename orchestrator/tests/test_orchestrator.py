@@ -60,8 +60,8 @@ class TestYamlite(unittest.TestCase):
     def test_parses_the_real_registry(self):
         with open(REGISTRY) as fh:
             reg = yamlite.load(fh.read())
-        self.assertEqual(reg["models"]["ultra-reasoner"]["enrolled_roles"], [])
-        self.assertEqual(reg["policy"]["escalation_ceiling"]["max_tier"], "t2")
+        self.assertIs(reg["models"]["ultra-reasoner"]["enrolled"], False)
+        self.assertEqual(reg["policy"]["escalation_ceiling"]["max_tier"], "t3")
         self.assertIn("balanced-coder", reg["channels"]["cursor-seat"]["exposes"])
 
     def test_flow_collections_and_types(self):
@@ -72,14 +72,6 @@ class TestYamlite(unittest.TestCase):
         self.assertEqual(d["d"], 2.5)
         self.assertEqual(d["e"], "x: y")
 
-    def test_list_of_maps_matches_plan_template(self):
-        data = yamlite.load(
-            "- id: st-1\n  goal: do a thing\n  file_scope: [\"src/**\"]\n"
-            "  capability_hint: {coding: high}\n- id: st-2\n  goal: another\n")
-        self.assertEqual([d["id"] for d in data], ["st-1", "st-2"])
-        self.assertEqual(data[0]["file_scope"], ["src/**"])
-        self.assertEqual(data[0]["capability_hint"], {"coding": "high"})
-
     def test_block_scalars_in_every_chomping_form(self):
         # A live planner emitted `test_notes: >-` and the whole plan failed to
         # parse. All block-scalar forms must work.
@@ -88,24 +80,6 @@ class TestYamlite(unittest.TestCase):
             joiner = "\n" if style.startswith("|") else " "
             self.assertEqual(d["a"], "one line%stwo line" % joiner, style)
             self.assertEqual(d["b"], 2, style)
-
-    def test_parses_a_realistic_planner_subtask_block(self):
-        block = (
-            '- id: st-1-subtract\n'
-            '  goal: Add subtract(a, b) to calc.py\n'
-            '  file_scope: ["calc.py", "test_calc.py"]\n'
-            '  frozen_interfaces:\n'
-            '    - "def subtract(a, b) -> a - b  # minuend first"\n'
-            '  capability_hint: {reasoning: low, coding: low}\n'
-            '  acceptance: [AC-1, AC-2]\n'
-            '  test_notes: >-\n'
-            '    Pure stdlib arithmetic. Verify with unittest discover;\n'
-            '    pytest is not installed here.\n')
-        data = yamlite.load(block)
-        self.assertEqual(data[0]["id"], "st-1-subtract")
-        self.assertEqual(data[0]["file_scope"], ["calc.py", "test_calc.py"])
-        self.assertIn("pytest is not installed", data[0]["test_notes"])
-        self.assertEqual(data[0]["acceptance"], ["AC-1", "AC-2"])
 
     def test_quoted_list_item_containing_a_colon(self):
         # A live planner wrote frozen_interfaces entries with prose containing
@@ -142,7 +116,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(store.project_key(self.t.repo), store.project_key(wt))
 
     def test_task_dir_is_outside_the_repository(self):
-        task = store.Task.create(self.t.repo, "T-001", "# t\n", {"max_cost_usd": 1})
+        task = _task(self.t.repo, "T-001", "# t\n", {"max_cost_usd": 1})
         self.assertFalse(task.path.startswith(os.path.realpath(self.t.repo)))
         out = subprocess.run(["git", "status", "--porcelain"], cwd=self.t.repo,
                              capture_output=True, text=True).stdout
@@ -152,7 +126,7 @@ class TestStore(unittest.TestCase):
         # The old version of this test simulated no crash and asserted a
         # property true of every directory. It would have passed with atomic
         # writes removed.
-        task = store.Task.create(self.t.repo, "T-001", "# t\n", {"max_cost_usd": 1})
+        task = _task(self.t.repo, "T-001", "# t\n", {"max_cost_usd": 1})
         before = task.update(status="planning")
         boom = RuntimeError("killed mid-write")
 
@@ -197,7 +171,7 @@ class TestLimits(unittest.TestCase):
         self.assertTrue(notes, "raising a limit should be reported, not silent")
 
     def test_checks_fire_before_the_action(self):
-        task = store.Task.create(self.t.repo, "T-001", "# t\n", self.full)
+        task = _task(self.t.repo, "T-001", "# t\n", self.full)
         b = limits.Budget(task)
         b.spend(9.5)
         with self.assertRaises(limits.LimitBreach):
@@ -225,15 +199,15 @@ class TestChannelPreference(unittest.TestCase):
             "models": {
                 "strong": {"tier": "t2", "reasoning": 5, "coding": 5,
                            "adherence": 4, "tool": 5, "speed": 2, "ctx": 200000,
-                           "cost_out": 75, "enrolled_roles": ["implementer"]},
+                           "cost_out": 75, "enrolled": True},
                 "worker": {"tier": "t2", "reasoning": 4, "coding": 5,
                            "adherence": 4, "tool": 5, "speed": 4, "ctx": 200000,
-                           "cost_out": 15, "enrolled_roles": ["implementer"]},
+                           "cost_out": 15, "enrolled": True},
             },
-            "profiles": {"implementer": {"require": {"coding": 4, "tool": 4},
-                                         "weights": {"coding": 3, "adherence": 2,
-                                                     "speed": 1},
-                                         "cost_sensitivity": "high"}},
+            "profiles": {"worker": {"require": {"coding": 4, "tool": 4},
+                                    "weights": {"coding": 3, "adherence": 2,
+                                                "speed": 1},
+                                    "cost_sensitivity": "high"}},
             "channels": {
                 "aaa-seat": {"type": "subscription", "adapter": "mock",
                              "agent_kind": "claude", "exposes": ["worker"]},
@@ -249,12 +223,12 @@ class TestChannelPreference(unittest.TestCase):
     def test_without_a_preference_the_tie_falls_to_the_alphabet(self):
         """The behaviour that made this necessary, pinned so the fix has
         something to be a fix *of*."""
-        top = router.Router(self._reg()).candidates("implementer")[0]
+        top = router.Router(self._reg()).candidates()[0]
         self.assertEqual(top.channel, "aaa-seat")
 
     def test_a_preference_decides_which_seat_serves_the_model(self):
         reg = self._reg(zzz_seat={"prefers": ["worker"]})
-        cands = router.Router(reg).candidates("implementer")
+        cands = router.Router(reg).candidates()
         self.assertEqual(cands[0].channel, "zzz-seat",
                          "the declared preference lost to the alphabet")
         # The other seat is still there, and still second: a preference orders
@@ -269,7 +243,7 @@ class TestChannelPreference(unittest.TestCase):
         reg = self._reg()
         reg["channels"]["aaa-seat"]["exposes"] = ["strong"]
         reg["channels"]["aaa-seat"]["prefers"] = ["strong"]
-        top = router.Router(reg).candidates("implementer")[0]
+        top = router.Router(reg).candidates()[0]
         self.assertEqual(top.model, "worker")
         self.assertEqual(top.channel, "zzz-seat")
 
@@ -277,7 +251,7 @@ class TestChannelPreference(unittest.TestCase):
         """A preference, not a pin. Moving work off a walled seat is the whole
         point of the project, and a routing preference must not undo it."""
         reg = self._reg(zzz_seat={"prefers": ["worker"]})
-        cands = router.Router(reg).candidates("implementer", cooldowns={"zzz-seat"})
+        cands = router.Router(reg).candidates(cooldowns={"zzz-seat"})
         self.assertEqual([c.channel for c in cands], ["aaa-seat"])
 
     def test_a_preferred_seat_that_is_drawn_down_still_yields(self):
@@ -286,9 +260,50 @@ class TestChannelPreference(unittest.TestCase):
         the cheaper one wins regardless of what the manifest would rather."""
         reg = self._reg(zzz_seat={"prefers": ["worker"]})
         cands = router.Router(reg).candidates(
-            "implementer", utilization={"zzz-seat": 0.95, "aaa-seat": 0.0})
+            utilization={"zzz-seat": 0.95, "aaa-seat": 0.0})
         self.assertEqual(cands[0].channel, "aaa-seat",
                          "a preference held a seat that had priced itself out")
+
+    def test_the_shipped_registry_gives_every_tier_a_provider(self):
+        """The table a calling skill picks from. It could not exist while two
+        models shared t2: `tier: t2` named both, the score took the cheaper
+        every time, and "the default provider for t2" had no answer."""
+        r = router.Router(router.load_registry(REGISTRY))
+        got = {t: r.candidates(tier=t)[0] for t in ("t1", "t2", "t3")}
+        self.assertEqual(got["t1"].model, "fast-cheap")
+        self.assertEqual(got["t2"].model, "balanced-coder")
+        self.assertEqual(got["t3"].model, "opus-class-strong")
+        self.assertEqual(got["t1"].channel, "cursor-seat")
+        self.assertEqual(got["t2"].channel, "cursor-seat")
+        self.assertEqual(got["t3"].channel, "claude-seat")
+        self.assertGreater(len({c.channel for c in got.values()}), 1,
+                           "every tier resolved to one seat, which is the "
+                           "indirection SKILL.md tells the caller not to pay for")
+
+    def test_a_tier_is_a_band_and_never_a_floor(self):
+        """`tier: t1` must reach the cheap seat. With a floor it never would:
+        the profile ranks the workhorse above the cheap model on every axis it
+        weighs, so anything at-or-above t1 resolves to t2 and t1 is unreachable
+        — which would quietly make the cheapest band cost the most."""
+        r = router.Router(router.load_registry(REGISTRY))
+        self.assertEqual([c.model for c in r.candidates(tier="t1")], ["fast-cheap"])
+        self.assertNotIn("balanced-coder",
+                         [c.model for c in r.candidates(tier="t1")])
+
+    def test_the_strong_seat_keeps_its_tier_when_a_rival_appears(self):
+        """`claude-seat: prefers: [opus-class-strong]` decides nothing today —
+        no other shipped seat exposes that model. It is not decoration: enrol a
+        second strong seat and the tie returns, and without the line it falls to
+        the alphabet again, which is the failure the mechanism replaced."""
+        reg = router.load_registry(REGISTRY)
+        reg["channels"]["aaa-strong-seat"] = {
+            "type": "subscription", "adapter": "herdr", "agent_kind": "codex",
+            "exposes": ["opus-class-strong"],
+            "quota": {"window": "5h", "est_capacity": 40}}
+        self.assertEqual(router.Router(reg).candidates(tier="t3")[0].channel,
+                         "claude-seat",
+                         "a newly enrolled seat took the tier purely by sorting "
+                         "earlier than the seat the registry prefers")
 
     def test_preferring_a_model_the_seat_cannot_serve_is_refused(self):
         """A line that reads like a policy and routes nothing is the shape of
@@ -314,52 +329,6 @@ policy: {escalation_ceiling: {max_tier: t2}}
         self.assertIn("nonesuch", str(cm.exception))
         self.assertIn("does not expose", str(cm.exception))
 
-    def test_the_shipped_registry_splits_the_work_across_both_seats(self):
-        """The deployment claim, checked against the file that makes it: the
-        strong seat plans and reviews, the other implements. With both seats
-        exposing `balanced-coder` and nothing to choose between them, this ran
-        entirely on one provider — testing none of the routing this exists for."""
-        r = router.Router(router.load_registry(REGISTRY))
-        by_role = {role: r.candidates(role)[0]
-                   for role in ("planner", "reviewer", "integrator",
-                                "implementer", "test-author")}
-        self.assertEqual(by_role["planner"].channel, "claude-seat")
-        self.assertEqual(by_role["reviewer"].channel, "claude-seat")
-        self.assertEqual(by_role["implementer"].channel, "cursor-seat")
-        self.assertEqual(by_role["test-author"].channel, "cursor-seat")
-        self.assertGreater(len({c.channel for c in by_role.values()}), 1,
-                           "every role resolved to one seat, which is the "
-                           "indirection SKILL.md tells the caller not to pay for")
-
-    def test_the_strong_seat_keeps_planning_when_a_rival_seat_appears(self):
-        """`claude-seat: prefers: [opus-class-strong]` decides nothing today —
-        no other shipped seat exposes that model. It is not decoration: the
-        moment a deployment enrols a second strong seat the tie returns, and
-        without the line it would fall to the alphabet again, which is the
-        failure the whole mechanism replaced. Pinned by adding that seat."""
-        reg = router.load_registry(REGISTRY)
-        reg["channels"]["aaa-strong-seat"] = {
-            "type": "subscription", "adapter": "herdr", "agent_kind": "codex",
-            "exposes": ["opus-class-strong"],
-            "quota": {"window": "5h", "est_capacity": 40},
-        }
-        top = router.Router(reg).candidates("planner")[0]
-        self.assertEqual(top.channel, "claude-seat",
-                         "a newly enrolled seat took planning purely by sorting "
-                         "earlier than the seat the registry prefers")
-
-    def test_escalation_still_crosses_to_the_strong_seat(self):
-        """And the preference must not trap an implementer on the worker seat:
-        rung 2 raises a reasoning floor, which only the strong model clears, so
-        the climb is itself a cross-provider hop."""
-        r = router.Router(router.load_registry(REGISTRY))
-        first = r.candidates("implementer")[0]
-        self.assertEqual(first.channel, "cursor-seat")
-        climbed = r.escalate("implementer", first)
-        self.assertIsNotNone(climbed, "rung 2 had nowhere to go")
-        self.assertEqual(climbed.channel, "claude-seat")
-
-
 class TestRouter(unittest.TestCase):
     def setUp(self):
         self.reg = router.load_registry(REGISTRY)
@@ -377,38 +346,29 @@ class TestRouter(unittest.TestCase):
         self.assertNotIn("ultra-reasoner", picked, "ceiling must still block it")
 
     def test_both_switches_unlock_ultra(self):
-        self.reg["models"]["ultra-reasoner"]["enrolled_roles"] = ["planner"]
+        """Two independent switches, on purpose: enrolling it is not enough, and
+        raising the ceiling is not enough. Ultra is scored and present and off."""
         self.reg["channels"]["claude-seat"]["exposes"].append("ultra-reasoner")
-        picked = [c.model for c in self.r.candidates("planner", ceiling={"max_tier": "t3"})]
-        self.assertIn("ultra-reasoner", picked)
-
-    def test_escalate_returns_none_at_the_ceiling(self):
-        top = self.r.select("planner")
-        self.assertIsNone(self.r.escalate("planner", top),
-                          "must stop climbing instead of exceeding the ceiling")
+        self.assertNotIn("ultra-reasoner",
+                         [c.model for c in self.r.candidates(ceiling={"max_tier": "t3"})],
+                         "the ceiling alone reached a model nobody enrolled")
+        self.reg["models"]["ultra-reasoner"]["enrolled"] = True
+        self.assertNotIn("ultra-reasoner",
+                         [c.model for c in self.r.candidates(ceiling={"max_tier": "t2"})],
+                         "enrolment alone reached past the ceiling")
+        self.assertIn("ultra-reasoner",
+                      [c.model for c in self.r.candidates(ceiling={"max_tier": "t3"})])
 
     def test_no_model_error_names_the_fix(self):
         with self.assertRaises(router.NoModelAvailable) as cm:
-            self.r.select("planner", ceiling={"max_tier": "t1"})
+            self.r.select(ceiling={"max_tier": "t1"}, tier="t3")
         self.assertIn("registry.default.yaml", str(cm.exception))
+        self.assertIn("t3", str(cm.exception), "the message does not say which "
+                      "tier could not be served")
 
     def test_bad_ceiling_refuses_rather_than_defaulting_open(self):
         with self.assertRaises(router.RoutingError):
             self.r.candidates("planner", ceiling={"max_tier": "unlimited"})
-
-    def test_the_strong_model_is_the_implementers_rung_not_its_default(self):
-        """The registry enrols opus for implementer so rung 2 has somewhere to
-        climb, and its note promises that does not make it the default. The
-        promise rests on the speed weight, which a later tuning pass could
-        erase without noticing what else it decided."""
-        self.assertIn("implementer",
-                      self.reg["models"]["opus-class-strong"]["enrolled_roles"])
-        first = self.r.select("implementer")
-        self.assertEqual(first.model, "balanced-coder",
-                         "the escalation target won a first attempt")
-        # And it is reachable, or enrolling it bought nothing.
-        self.assertEqual(self.r.escalate("implementer", first).model,
-                         "opus-class-strong")
 
     def test_the_implementer_rung_survives_a_drawn_down_seat(self):
         # The cheap model has a second seat and the strong one does not, so a
@@ -417,28 +377,6 @@ class TestRouter(unittest.TestCase):
             self.assertEqual(
                 self.r.select("implementer", utilization={"claude-seat": u}).model,
                 "balanced-coder", "at %.0f%% draw" % (u * 100))
-
-    def test_a_boost_raises_a_floor_the_profile_never_declared(self):
-        # The implementer profile requires coding and tool, not reasoning, and
-        # rung 2 of the ladder is exactly a reasoning+1 re-route.
-        # Applying the boost only to declared requirements made that rung a
-        # no-op for the one role that climbs it most.
-        self.assertNotIn("reasoning", self.reg["profiles"]["implementer"]["require"])
-        picked = [c.model for c in
-                  self.r.candidates("implementer", boost={"reasoning": 5})]
-        self.assertNotIn("balanced-coder", picked,
-                         "reasoning 4 cleared a boosted floor of 5")
-
-    def test_the_implementer_ladder_climbs_once_a_stronger_model_is_enrolled(self):
-        # The failure this fixes: an operator enrolls the strong model to make
-        # escalation work, and is still told nothing stronger is enrolled.
-        self.reg["models"]["opus-class-strong"]["enrolled_roles"].append("implementer")
-        r = router.Router(self.reg)
-        cur = r.select("implementer")
-        self.assertEqual(cur.model, "balanced-coder")
-        stronger = r.escalate("implementer", cur)
-        self.assertIsNotNone(stronger, "rung 2 refused a legal, enrolled rung")
-        self.assertEqual(stronger.model, "opus-class-strong")
 
     def test_an_unscored_capability_cannot_clear_a_boosted_floor(self):
         self.reg["models"]["balanced-coder"].pop("reasoning")
@@ -476,11 +414,6 @@ class TestSchema(unittest.TestCase):
             schema.validate_report({"stage": "implement", "role": "implementer",
                                     "status": "complete", "summary": "x"})
 
-    def test_verdict_enum_is_closed(self):
-        with self.assertRaises(schema.Invalid):
-            schema.validate_verdict({"verdict": "LGTM", "ac_table": [], "findings": []})
-
-
 class TestBriefLint(unittest.TestCase):
     def test_bare_jargon_is_caught(self):
         problems = brief.lint("We satisfied AC-2 and st-3 escalated to rung 2.")
@@ -509,6 +442,21 @@ Add a subtract function beside the existing add.
   acceptance: [AC-1]
 ```
 """
+
+def _task(repo, task_id, request, limits, mode="attended", plan=None):
+    """Create a task with its jobs already in place.
+
+    Every end-to-end test used to get `plan.md` from a scripted planner. There
+    is no planner: the caller supplies the decomposition, so a test that wants a
+    run to do anything has to supply one too. `plan=None` means the default
+    single-job plan; pass a string for a different shape, or `False` to create a
+    task with no jobs at all, which is its own thing worth testing.
+    """
+    task = store.Task.create(repo, task_id, request, limits, mode=mode)
+    if plan is not False:
+        task.write_text("plan.md", plan if plan is not None else PLAN_MD)
+    return task
+
 
 
 def _slurp(path):
@@ -549,7 +497,7 @@ class TestChannelAvailability(unittest.TestCase):
         self.t.close()
 
     def test_uninstalled_cli_is_skipped_not_crashed_on(self):
-        task = store.Task.create(self.t.repo, "T-001", "# t\n",
+        task = _task(self.t.repo, "T-001", "# t\n",
                                  dict(self.reg["policy"]["limits"]))
 
         class OnlyCursor(runtime.MockAdapter):
@@ -617,7 +565,7 @@ class TestClosedGaps(unittest.TestCase):
         self.assertEqual(cursor["elapsed_ms"], 14298)
 
     def test_the_delegation_record_keeps_tokens_and_time(self):
-        task = store.Task.create(self.t.repo, "T-C5", "# t\n", self.pol)
+        task = _task(self.t.repo, "T-C5", "# t\n", self.pol)
 
         class Metered(runtime.MockAdapter):
             def prompt(self, session, text, timeout):
@@ -635,7 +583,7 @@ class TestClosedGaps(unittest.TestCase):
         self.assertEqual(history[0]["elapsed_ms"], 4242)
 
     def test_spend_accumulates_and_then_parks_the_run(self):
-        task = store.Task.create(self.t.repo, "T-C1", "# t\n", dict(self.pol, max_cost_usd=0.5))
+        task = _task(self.t.repo, "T-C1", "# t\n", dict(self.pol, max_cost_usd=0.5))
 
         class Pricey(runtime.MockAdapter):
             def prompt(self, session, text, timeout):
@@ -657,7 +605,7 @@ class TestClosedGaps(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "--bare", src], check=True)
         sh(["git", "remote", "add", "origin", src], self.t.repo)
         script, _ = TestEndToEnd._script(self)[0], None
-        task = store.Task.create(self.t.repo, "T-C2", "# t\n\nAdd subtract\n",
+        task = _task(self.t.repo, "T-C2", "# t\n\nAdd subtract\n",
                                  self.pol, mode="autonomous")
         orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                             lambda k, t: True, log=lambda *_: None)
@@ -671,7 +619,7 @@ class TestClosedGaps(unittest.TestCase):
 
     # --- test author ------------------------------------------------------
     def test_simple_tasks_do_not_pay_for_a_test_author(self):
-        task = store.Task.create(self.t.repo, "T-C3", "# t\n\nAdd subtract\n", self.pol)
+        task = _task(self.t.repo, "T-C3", "# t\n\nAdd subtract\n", self.pol)
 
         class A(runtime.MockAdapter):
             def prompt(self, session, text, timeout):
@@ -683,69 +631,10 @@ class TestClosedGaps(unittest.TestCase):
         Orchestrator(task, self.reg, a, lambda k, t: True, log=lambda *_: None).run()
         self.assertNotIn("test-author", [h["role"] for h in task.state["delegation_history"]])
 
-    def test_test_author_is_told_not_to_read_the_implementation(self):
-        seen = {}
-
-        class A(runtime.MockAdapter):
-            def prompt(self, session, text, timeout):
-                if session.handle["role"] == "test-author":
-                    seen["prompt"] = text
-                return runtime.MockAdapter.prompt(self, session, text, timeout)
-
-        script, _ = self._e2e_script()
-        task = store.Task.create(self.t.repo, "T-C4", "# t\n\nAdd subtract API\n", self.pol)
-        Orchestrator(task, self.reg, A(script), lambda k, t: True, log=lambda *_: None).run()
-        self.assertIn("do not read any implementation", seen.get("prompt", "").lower())
-
     def _e2e_script(self):
         return TestEndToEnd._script(self)
 
     # --- reporter ---------------------------------------------------------
-    def test_polished_brief_replaces_the_template(self):
-        task = store.Task.create(self.t.repo, "T-C5", "# t\n", self.pol)
-        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
-                            log=lambda *_: None)
-        orch._polish = lambda t: "# Plain\n\n" + ("A readable sentence. " * 8)
-        text, problems = brief.write(task, "merge", "Land it?", polish=orch._polish)
-        self.assertIn("A readable sentence", text)
-        self.assertEqual(problems, [])
-
-    def test_deviations_written_from_the_shipped_template_reach_the_brief(self):
-        """The gate brief must say when the plan was departed from.
-
-        The section was guarded on the whole file not starting with `#`, and
-        `templates/deviations.md` -- the file agents are told to start from --
-        opens with `# Deviations — Task <id>`. Every task that used the template
-        therefore hid every deviation from every brief, which is the one line in
-        it a human reads to decide whether to look closer.
-        """
-        task = store.Task.create(self.t.repo, "T-C7", "# t\n", self.pol)
-        with open(os.path.join(wf.default_dir(), "templates", "deviations.md")) as fh:
-            template = fh.read()
-        self.assertTrue(template.lstrip().startswith("#"),
-                        "the template no longer opens with a heading")
-        task.write_text("deviations.md", template)
-        self.assertNotIn("What didn't go to plan", brief.render(task, "merge", "Land it?"),
-                         "an untouched template claimed the plan was departed from")
-
-        task.write_text("deviations.md", template + "\ndev-st-1-1 | implementer:st-1 | "
-                        "plan said add to calc.py\n        | did instead: added a module\n"
-                        "        | why: calc.py is generated\n        | severity: major\n")
-        self.assertIn("What didn't go to plan", brief.render(task, "merge", "Land it?"),
-                      "a logged deviation never reached the human")
-
-    def test_jargon_or_empty_rewrite_falls_back_to_the_template(self):
-        task = store.Task.create(self.t.repo, "T-C6", "# t\n", self.pol)
-
-        class A(runtime.MockAdapter):
-            def prompt(self, session, text, timeout):
-                return {"settled": "idle", "output": "AC-2 failed at rung 2", "code": 0}
-
-        orch = Orchestrator(task, self.reg, A(), lambda k, t: True, log=lambda *_: None)
-        original = "# Brief\n\nsomething the human can act on, at length. " * 3
-        self.assertEqual(orch._polish(original), original)
-
-
 class TestParallelism(unittest.TestCase):
     """max_parallel_agents governed nothing until subtasks could actually run
     concurrently."""
@@ -760,7 +649,7 @@ class TestParallelism(unittest.TestCase):
         self.t.close()
 
     def _orch(self, subtasks, cap=3):
-        task = store.Task.create(self.t.repo, "T-P", "# t\n", dict(self.pol,
+        task = _task(self.t.repo, "T-P", "# t\n", dict(self.pol,
                                                                    max_parallel_agents=cap))
         task.update(subtasks=subtasks)
         return Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
@@ -901,7 +790,7 @@ class TestParallelEndToEnd(unittest.TestCase):
         pol = dict(self.reg["policy"]["limits"],
                    escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
                    max_parallel_agents=2)
-        task = store.Task.create(self.t.repo, "T-PAR", "# t\n\nAdd alpha and beta\n", pol)
+        task = _task(self.t.repo, "T-PAR", "# t\n\nAdd alpha and beta\n", pol, plan=self.PLAN)
         logs = []
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=logs.append).run()
@@ -939,7 +828,7 @@ class TestParallelEndToEnd(unittest.TestCase):
         pol = dict(self.reg["policy"]["limits"],
                    escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
                    max_parallel_agents=2)
-        task = store.Task.create(self.t.repo, "T-PF", "# t\n\nAdd alpha and beta\n", pol)
+        task = _task(self.t.repo, "T-PF", "# t\n\nAdd alpha and beta\n", pol, plan=self.PLAN)
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=lambda *_: None).run()
         self.assertEqual(status, "needs_human")
@@ -1082,8 +971,8 @@ class TestSubtaskContinuity(unittest.TestCase):
         script = {"planner": self._planner(self.INDEPENDENT),
                   "implementer": implementer, "test-author": lambda e, c: None,
                   "reviewer": self._approve}
-        task = store.Task.create(self.t.repo, "T-SC1", "# t\n\nAdd two things\n",
-                                 self._pol(2))
+        task = _task(self.t.repo, "T-SC1", "# t\n\nAdd two things\n",
+                                 self._pol(2), plan=self.INDEPENDENT)
         logs = []
         first = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                              lambda k, t: True, log=logs.append).run()
@@ -1146,8 +1035,8 @@ class TestSubtaskContinuity(unittest.TestCase):
         script = {"planner": self._planner(self.CHAINED),
                   "implementer": implementer, "test-author": lambda e, c: None,
                   "reviewer": self._approve}
-        task = store.Task.create(self.t.repo, "T-SC2", "# t\n\nAdd three things\n",
-                                 self._pol(3))
+        task = _task(self.t.repo, "T-SC2", "# t\n\nAdd three things\n",
+                                 self._pol(3), plan=self.CHAINED)
         logs = []
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=logs.append).run()
@@ -1162,41 +1051,6 @@ class TestSubtaskContinuity(unittest.TestCase):
         self.assertEqual(by_id["st-2-beta"]["actual_files"], ["beta.py"])
         self.assertEqual(by_id["st-2-beta"]["scope_violations"], [])
         self.assertEqual(by_id["st-3-gamma"]["actual_files"], ["gamma.py"])
-
-    def test_a_wave_implementer_can_see_the_authored_tests(self):
-        """The same defect where it is most expensive: the Test Author writes
-        failing tests into the integration worktree during `plan`, and a wave
-        cut from the task base never contained them -- so the checks an
-        implementer ran were green because the requirement was absent, which is
-        exactly the evidence `_author_tests` exists to create."""
-        seen = {}
-
-        def test_author(env, cwd):
-            with open(os.path.join(cwd, "test_requirements.py"), "w") as fh:
-                fh.write("def test_alpha():\n    import alpha\n")
-
-        def implementer(env, cwd):
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
-            seen[sub] = os.path.isfile(os.path.join(cwd, "test_requirements.py"))
-            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
-                fh.write("V = 1\n")
-            _report(td, "implement-%s.json" % sub, {
-                "stage": "implement", "role": "implementer", "subtask": sub,
-                "status": "complete", "summary": "done",
-                "evidence": {"tests": "ok"}})
-
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": test_author,
-                  "reviewer": self._approve}
-        task = store.Task.create(self.t.repo, "T-SC3", "# t\n\nAdd two things\n",
-                                 self._pol(2))
-        logs = []
-        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
-                              lambda k, t: True, log=logs.append).run()
-        self.assertEqual(status, "done", "\n".join(logs))
-        self.assertEqual(seen, {"st-1-alpha": True, "st-2-beta": True},
-                         "the authored tests were invisible to the implementers")
 
     def test_the_second_sequential_subtask_is_credited_only_with_its_own_files(self):
         """A subtask working in the integration worktree measured its diff
@@ -1224,8 +1078,8 @@ class TestSubtaskContinuity(unittest.TestCase):
         script = {"planner": self._planner(self.INDEPENDENT),
                   "implementer": implementer, "test-author": test_author,
                   "reviewer": self._approve}
-        task = store.Task.create(self.t.repo, "T-SC5", "# t\n\nAdd two things\n",
-                                 self._pol(1))
+        task = _task(self.t.repo, "T-SC5", "# t\n\nAdd two things\n",
+                                 self._pol(1), plan=self.INDEPENDENT)
         logs = []
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=logs.append).run()
@@ -1261,8 +1115,8 @@ class TestSubtaskContinuity(unittest.TestCase):
         script = {"planner": self._planner(self.INDEPENDENT),
                   "implementer": implementer, "test-author": lambda e, c: None,
                   "reviewer": self._approve}
-        task = store.Task.create(self.t.repo, "T-SC6", "# t\n\nAdd two things\n",
-                                 self._pol(1))
+        task = _task(self.t.repo, "T-SC6", "# t\n\nAdd two things\n",
+                                 self._pol(1), plan=self.INDEPENDENT)
         logs = []
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=logs.append).run()
@@ -1272,212 +1126,35 @@ class TestSubtaskContinuity(unittest.TestCase):
         self.assertIn("changed no files", "\n".join(logs))
         self.assertFalse(os.path.exists(task.file("integrate.patch")))
 
-    def test_a_rework_sees_what_its_siblings_landed(self):
-        """A subtask's own checkout is a snapshot of the moment it was cut, so a
-        rework after `REQUEST_CHANGES` ran against a tree missing everything its
-        siblings merged in the meantime — the checks were evidence about an
-        incomplete tree, and a finding citing a sibling's file pointed at a file
-        the agent could not see. It stays in its own worktree, which is what
-        preserves an interrupted subtask's salvage checkpoints; `_catch_up`
-        brings that worktree up to the integration branch first."""
-        seen = []
-        rounds = {"n": 0}
+    def test_a_reused_worktree_is_brought_up_to_the_integration_branch(self):
+        """`_catch_up`, tested directly now that no reviewer exists to drive a
+        rework. The mechanism still matters: a job re-dispatched into a worktree
+        it already owns — a resume, or a second wave — would otherwise run
+        against a snapshot from before its siblings landed, so its checks would
+        be evidence about a tree that no longer exists.
+        """
+        task = _task(self.t.repo, "T-CU", "# t\n\ndo\n", self._pol(2),
+                     plan=self.INDEPENDENT)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter({}),
+                            lambda k, t: True, log=lambda *a: None)
+        integration = orch._ensure_worktree()
 
-        def implementer(env, cwd):
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
-            if rounds["n"] and sub == "st-1-alpha":
-                # the rework round: can it see what st-2-beta landed?
-                seen.append(os.path.isfile(os.path.join(cwd, "beta.py")))
-            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
-                fh.write("V = %d\n" % (rounds["n"] + 1))
-            _report(td, "implement-%s.json" % sub, {
-                "stage": "implement", "role": "implementer", "subtask": sub,
-                "status": "complete",
-                "summary": "round %s" % ("one" if not rounds["n"] else "two"),
-                "evidence": {"tests": "ok"}})
+        # A sibling lands beta.py on the integration branch.
+        with open(os.path.join(integration, "beta.py"), "w") as fh:
+            fh.write("BETA = 1\n")
+        sh(["git", "add", "-A"], integration)
+        sh(["git", "commit", "-qm", "sibling landed"], integration)
 
-        def reviewer(env, cwd):
-            rounds["n"] += 1
-            first = rounds["n"] == 1
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
-                "stage": "review", "role": "reviewer", "status": "complete",
-                "summary": "ruled", "evidence": {"tests": "ok"},
-                "role_data": {"verdict": {
-                    "verdict": "REQUEST_CHANGES" if first else "APPROVE",
-                    "ac_table": [{"ac": "AC-1",
-                                  "status": "unmet" if first else "met"}],
-                    "findings": ([{"id": "f-1", "severity": "blocking",
-                                   "claim": "alpha must agree with beta.py",
-                                   "cite": "AC-1",
-                                   "suggested_owner": "st-1-alpha"}]
-                                 if first else [])}}})
+        # st-1's own checkout was cut before that and cannot see it.
+        branch = "adg/%s/st-1-alpha" % task.state["id"]
+        tree = os.path.join(self.t.dir, "st1")
+        sh(["git", "worktree", "add", "-b", branch, tree,
+            store.git(["rev-parse", "HEAD^"], integration).strip()], self.t.repo)
+        self.assertFalse(os.path.isfile(os.path.join(tree, "beta.py")))
 
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "reviewer": reviewer}
-        task = store.Task.create(self.t.repo, "T-SC7", "# t\n\nAdd two things\n",
-                                 self._pol(2))
-        logs = []
-        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
-                              lambda k, t: True, log=logs.append).run()
-        self.assertEqual(status, "done", "\n".join(logs))
-        self.assertEqual(seen, [True],
-                         "the rework ran against a tree without the sibling's "
-                         "landed work: %s\n%s" % (seen, "\n".join(logs)))
-        # And it is still credited with its own file only, not the sibling's it
-        # can now see: the diff base follows the tree on every dispatch.
-        by_id = {s["id"]: s for s in task.state["subtasks"]}
-        self.assertEqual(by_id["st-1-alpha"]["actual_files"], ["alpha.py"])
-        self.assertEqual(by_id["st-1-alpha"]["scope_violations"], [])
-
-    def test_a_replan_keeps_what_a_surviving_subtask_already_owns(self):
-        """`_read_plan_subtasks` rebuilds every subtask from plan.md, so a
-        replan that reissues an id dropped its `worktree` and `base_commit`
-        while the checkout and branch stayed on disk. `create_worktree` then
-        reused the checkout and ignored the base it was handed, and the subtask
-        recorded TODAY's integration tip — a commit its own worktree had never
-        seen — so its diff was credited with every file its siblings landed."""
-        rounds = {"review": 0}
-
-        def implementer(env, cwd):
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
-            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
-                fh.write("V = %d\n" % (rounds["review"] + 1))
-            _report(td, "implement-%s.json" % sub, {
-                "stage": "implement", "role": "implementer", "subtask": sub,
-                "status": "complete",
-                "summary": "round %s" % ("one" if not rounds["review"] else "two"),
-                "evidence": {"tests": "ok"}})
-
-        def reviewer(env, cwd):
-            rounds["review"] += 1
-            first = rounds["review"] == 1
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
-                "stage": "review", "role": "reviewer", "status": "complete",
-                "summary": "ruled", "evidence": {"tests": "ok"},
-                "role_data": {"verdict": {
-                    "verdict": "REPLAN" if first else "APPROVE",
-                    "ac_table": [{"ac": "AC-1",
-                                  "status": "unmet" if first else "met"}],
-                    "findings": []}}})
-
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "reviewer": reviewer}
-        task = store.Task.create(self.t.repo, "T-SC8", "# t\n\nAdd two things\n",
-                                 self._pol(2))
-        logs = []
-        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
-                              lambda k, t: True, log=logs.append).run()
-        self.assertEqual(status, "done", "\n".join(logs))
-        by_id = {s["id"]: s for s in task.state["subtasks"]}
-        self.assertEqual(by_id["st-1-alpha"]["actual_files"], ["alpha.py"],
-                         "the replan rebased its diff onto its sibling's work")
-        self.assertEqual(by_id["st-2-beta"]["actual_files"], ["beta.py"])
-        for s in by_id.values():
-            self.assertEqual(s["scope_violations"], [], s["id"])
-
-    def test_a_replan_reaps_the_worktree_of_a_subtask_it_drops(self):
-        """`_reap_worktrees` names paths out of `state["subtasks"]`, so a plan
-        that renames a subtask leaves a checkout nobody can name and the reaper
-        walks past it forever — the failure the persistence it relies on exists
-        to prevent."""
-        rounds = {"review": 0}
-        RENAMED = self.INDEPENDENT.replace("st-1-alpha", "st-9-delta")
-
-        def planner(env, cwd):
-            # Keyed on the review, not on a call counter: `brainstorm`
-            # dispatches the planner too, so counting planner calls made the
-            # very first plan the renamed one and st-1-alpha never existed.
-            body = self.INDEPENDENT if rounds["review"] == 0 else RENAMED
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
-                fh.write(body)
-
-        def implementer(env, cwd):
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            name = _tree_name(cwd)
-            sub = next((s for s in ("st-1-alpha", "st-9-delta", "st-2-beta")
-                        if s in name), "st-2-beta")
-            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
-                fh.write("V = %d\n" % (rounds["review"] + 1))
-            _report(td, "implement-%s.json" % sub, {
-                "stage": "implement", "role": "implementer", "subtask": sub,
-                "status": "complete",
-                "summary": "round %s" % ("one" if not rounds["review"] else "two"),
-                "evidence": {"tests": "ok"}})
-
-        def reviewer(env, cwd):
-            rounds["review"] += 1
-            first = rounds["review"] == 1
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
-                "stage": "review", "role": "reviewer", "status": "complete",
-                "summary": "ruled", "evidence": {"tests": "ok"},
-                "role_data": {"verdict": {
-                    "verdict": "REPLAN" if first else "APPROVE",
-                    "ac_table": [{"ac": "AC-1",
-                                  "status": "unmet" if first else "met"}],
-                    "findings": []}}})
-
-        script = {"planner": planner, "implementer": implementer,
-                  "test-author": lambda e, c: None, "reviewer": reviewer}
-        task = store.Task.create(self.t.repo, "T-SC9", "# t\n\nAdd two things\n",
-                                 self._pol(2))
-        logs = []
-        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
-                              lambda k, t: True, log=logs.append).run()
-        self.assertEqual(status, "done", "\n".join(logs))
-        trees = subprocess.run(["git", "worktree", "list"], cwd=self.t.repo,
-                               capture_output=True, text=True).stdout
-        self.assertNotIn("T-SC9-st-1-alpha", trees,
-                         "the dropped subtask's worktree outlived the task:\n" + trees)
-
-    def test_a_merge_failure_does_not_swallow_a_siblings_replan(self):
-        """Merging the finished members before classifying the wave's outcomes
-        let a `Halt` from `_integrate_wave` outrank a sibling's `Replan` — the
-        ladder's rung 3, with its escalation bundle already written — and would
-        do the same to a quota park's reopen time. That is the very
-        "the sequential and parallel paths disagreed about the same event"
-        failure the re-raises exist to prevent."""
-        def implementer(env, cwd):
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            name = _tree_name(cwd)
-            if "st-3-gamma" in name:
-                _report(td, "implement-st-3-gamma.json", {
-                    "stage": "implement", "role": "implementer",
-                    "subtask": "st-3-gamma", "status": "escalate",
-                    "summary": "the plan is wrong",
-                    "signals": [{"type": "plan_conflict",
-                                 "detail": "gamma cannot be built as planned",
-                                 "evidence": "no interface to build against"}],
-                    "evidence": {"not_verified": ["everything"]}})
-                return
-            sub = "st-1-alpha" if "st-1-alpha" in name else "st-2-beta"
-            # Both write the same file with different content. Their DECLARED
-            # scopes are disjoint, so the wave still forms all three — and the
-            # second merge is an add/add conflict the scripted integrator
-            # cannot resolve, which is how `_integrate_wave` is made to Halt.
-            with open(os.path.join(cwd, "shared.py"), "w") as fh:
-                fh.write("OWNER = %r\n" % sub)
-            _report(td, "implement-%s.json" % sub, {
-                "stage": "implement", "role": "implementer", "subtask": sub,
-                "status": "complete", "summary": "did %s" % sub,
-                "evidence": {"tests": "ok"}})
-
-        script = {"planner": self._planner(self.CONFLICTING),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "integrator": lambda e, c: None, "reviewer": self._approve}
-        task = store.Task.create(self.t.repo, "T-SCA", "# t\n\nAdd three things\n",
-                                 self._pol(3))
-        logs = []
-        Orchestrator(task, self.reg, runtime.MockAdapter(script),
-                     lambda k, t: True, log=logs.append).run()
-        self.assertEqual(task.state["spent"]["replans"], 1,
-                         "the sibling's rung 3 was swallowed by the merge "
-                         "failure\n" + "\n".join(logs))
-        self.assertIn("plan_conflict", task.read_text("escalation.md", ""),
-                      "the escalation bundle names the wrong signal")
+        orch._catch_up({"id": "st-1-alpha"}, tree)
+        self.assertTrue(os.path.isfile(os.path.join(tree, "beta.py")),
+                        "the reused worktree never saw what its sibling landed")
 
     def test_a_failed_merge_leaves_no_conflict_markers_behind(self):
         """`_reconcile` could raise out of an unfinished merge, and the run does
@@ -1509,8 +1186,8 @@ class TestSubtaskContinuity(unittest.TestCase):
         script = {"planner": self._planner(self.CONFLICTING),
                   "implementer": implementer, "test-author": lambda e, c: None,
                   "integrator": lambda e, c: None, "reviewer": self._approve}
-        task = store.Task.create(self.t.repo, "T-SCD", "# t\n\nAdd three things\n",
-                                 self._pol(3))
+        task = _task(self.t.repo, "T-SCD", "# t\n\nAdd three things\n",
+                                 self._pol(3), plan=self.CONFLICTING)
         logs = []
         Orchestrator(task, self.reg, runtime.MockAdapter(script),
                      lambda k, t: True, log=logs.append).run()
@@ -1576,8 +1253,8 @@ class TestSubtaskContinuity(unittest.TestCase):
         script = {"planner": self._planner(self.CONFLICTING),
                   "implementer": implementer, "test-author": lambda e, c: None,
                   "integrator": lambda e, c: None, "reviewer": self._approve}
-        task = store.Task.create(self.t.repo, "T-SCE", "# t\n\nAdd three things\n",
-                                 self._pol(3))
+        task = _task(self.t.repo, "T-SCE", "# t\n\nAdd three things\n",
+                                 self._pol(3), plan=self.CONFLICTING)
         logs = []
         first = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                              lambda k, t: True, log=logs.append).run()
@@ -1587,192 +1264,6 @@ class TestSubtaskContinuity(unittest.TestCase):
             if s.get("status") == "complete":
                 self.assertTrue(s.get("merged"),
                                 "%s is complete but its branch never merged" % sid)
-
-    def test_a_request_for_changes_with_nothing_blocking_stops(self):
-        """`severity: minor` is legal, so `blocking` can legally be empty — and
-        then no owner is named, `_reopen_subtasks` falls through to reopening
-        EVERYTHING, and `pending_findings` is empty. Every green subtask was
-        rebuilt from scratch with no idea what was wrong, through a
-        schema-legal verdict."""
-        def implementer(env, cwd):
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
-            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
-                fh.write("V = 1\n")
-            _report(td, "implement-%s.json" % sub, {
-                "stage": "implement", "role": "implementer", "subtask": sub,
-                "status": "complete", "summary": "done", "evidence": {"tests": "ok"}})
-
-        def reviewer(env, cwd):
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
-                "stage": "review", "role": "reviewer", "status": "complete",
-                "summary": "ruled", "evidence": {"tests": "ok"},
-                "role_data": {"verdict": {
-                    "verdict": "REQUEST_CHANGES",
-                    "ac_table": [{"ac": "AC-1", "status": "unmet"}],
-                    "findings": [{"id": "f-1", "severity": "minor",
-                                  "claim": "naming could be better",
-                                  "cite": "taste"}]}}})
-
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "reviewer": reviewer}
-        task = store.Task.create(self.t.repo, "T-SCB", "# t\n\nAdd two things\n",
-                                 self._pol(2))
-        logs = []
-        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
-                              lambda k, t: True, log=logs.append).run()
-        self.assertEqual(status, "needs_human")
-        self.assertIn("no blocking finding", "\n".join(logs))
-
-    def test_a_request_for_changes_with_no_findings_at_all_says_so(self):
-        # `%` binds tighter than `or`, so the fallback clause was unreachable
-        # and the message trailed off after its colon.
-        task = store.Task.create(self.t.repo, "T-SCF", "# t\n", self._pol(1))
-        task.update(subtasks=[{"id": "st-1", "status": "complete",
-                               "planned_scope": ["**"], "actual_files": []}])
-        orch = Orchestrator(task, self.reg, runtime.MockAdapter(),
-                            lambda k, t: True, log=lambda *_: None)
-        with self.assertRaises(Halt) as cm:
-            orch._apply_verdict({"verdict": "REQUEST_CHANGES", "ac_table": [],
-                                 "findings": []})
-        self.assertIn("listed no findings at all", str(cm.exception))
-
-    def test_a_finding_naming_no_subtask_still_reaches_whoever_reworks(self):
-        """`suggested_owner` is written by hand against ids the planner chose.
-        One naming no subtask reopened `subtasks[0]` on the no-owners
-        fallback — and `_findings_brief` then filtered it out of that subtask's
-        brief, because it has an owner and this is not it. The agent was sent
-        back to rebuild with the reason withheld."""
-        seen, rounds = [], {"review": 0}
-
-        def implementer(env, cwd):
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            sub = "st-1-alpha" if "st-1-alpha" in _tree_name(cwd) else "st-2-beta"
-            if _tree_name(cwd).endswith("-work"):
-                sub = "st-1-alpha"
-            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
-                fh.write("V = %d\n" % (rounds["review"] + 1))
-            _report(td, "implement-%s.json" % sub, {
-                "stage": "implement", "role": "implementer", "subtask": sub,
-                "status": "complete",
-                "summary": "round %s" % ("one" if not rounds["review"] else "two"),
-                "evidence": {"tests": "ok"}})
-
-        def reviewer(env, cwd):
-            rounds["review"] += 1
-            first = rounds["review"] == 1
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
-                "stage": "review", "role": "reviewer", "status": "complete",
-                "summary": "ruled", "evidence": {"tests": "ok"},
-                "role_data": {"verdict": {
-                    "verdict": "REQUEST_CHANGES" if first else "APPROVE",
-                    "ac_table": [{"ac": "AC-1",
-                                  "status": "unmet" if first else "met"}],
-                    "findings": ([{"id": "f-1", "severity": "blocking",
-                                   "claim": "the guard is missing",
-                                   "cite": "AC-1",
-                                   "suggested_owner": "st-7-nonexistent"}]
-                                 if first else [])}}})
-
-        class Recorder(runtime.MockAdapter):
-            def prompt(self, session, text, timeout):
-                if session.handle["role"] == "implementer":
-                    seen.append(text)
-                return runtime.MockAdapter.prompt(self, session, text, timeout)
-
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "reviewer": reviewer}
-        task = store.Task.create(self.t.repo, "T-SCC", "# t\n\nAdd two things\n",
-                                 self._pol(2))
-        logs = []
-        status = Orchestrator(task, self.reg, Recorder(script), lambda k, t: True,
-                              log=logs.append).run()
-        self.assertEqual(status, "done", "\n".join(logs))
-        rework = [t for t in seen if "the guard is missing" in t]
-        self.assertTrue(rework,
-                        "the finding reached nobody: it named a subtask that "
-                        "does not exist, so it was filtered out of every brief")
-
-    def test_every_reworking_subtask_gets_its_own_findings(self):
-        """`_finish_subtask` cleared the whole `pending_findings` list, so the
-        first subtask to go green disarmed the rework for every other one: a
-        reviewer that rejected st-1 and st-2 saw st-1 fixed, and st-2 was then
-        re-dispatched with nothing -- back to the same code with the same
-        prompt, rebuilding what was rejected. Sequential, with a cap of one:
-        no concurrency is involved, the second subtask is simply dispatched
-        after the first has finished."""
-        seen, rounds, holder = [], {"review": 0}, {}
-
-        class Recorder(runtime.MockAdapter):
-            """The prompt is how a sequential mock knows which subtask it is:
-            at a cap of one every subtask runs in the same integration
-            worktree, so there is no directory name to read."""
-
-            last = ""
-
-            def prompt(self, session, text, timeout):
-                if session.handle["role"] == "implementer":
-                    self.last = text
-                    seen.append(text)
-                return runtime.MockAdapter.prompt(self, session, text, timeout)
-
-        def implementer(env, cwd):
-            sub = ("st-1-alpha" if "Your subtask: st-1-alpha" in holder["a"].last
-                   else "st-2-beta")
-            with open(os.path.join(cwd, sub.split("-")[-1] + ".py"), "w") as fh:
-                fh.write("V = %d\n" % rounds["review"])
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-%s.json" % sub, {
-                "stage": "implement", "role": "implementer", "subtask": sub,
-                "status": "complete",
-                # Distinct per round, and it has to be: `_collect_report`
-                # decides freshness on (mtime, size), so a byte-identical
-                # rewrite inside one filesystem tick reads as no report at all.
-                "summary": "round %s" % ("one" if rounds["review"] == 0 else "two"),
-                "evidence": {"tests": "ok"}})
-
-        def reviewer(env, cwd):
-            rounds["review"] += 1
-            first = rounds["review"] == 1
-            verdict = {
-                "verdict": "REQUEST_CHANGES" if first else "APPROVE",
-                "ac_table": [{"ac": "AC-1", "status": "unmet" if first else "met"}],
-                "findings": ([{"id": "f-1", "severity": "blocking",
-                               "claim": "alpha is wrong", "cite": "AC-1",
-                               "suggested_owner": "st-1-alpha"},
-                              {"id": "f-2", "severity": "blocking",
-                               "claim": "beta is wrong", "cite": "AC-2",
-                               "suggested_owner": "st-2-beta"}] if first else []),
-            }
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
-                "stage": "review", "role": "reviewer", "status": "complete",
-                "summary": "ruled", "evidence": {"tests": "ok"},
-                "role_data": {"verdict": verdict}})
-
-        script = {"planner": self._planner(self.INDEPENDENT),
-                  "implementer": implementer, "test-author": lambda e, c: None,
-                  "reviewer": reviewer}
-        adapter = Recorder(script)
-        holder["a"] = adapter
-        task = store.Task.create(self.t.repo, "T-SC4", "# t\n\nAdd two things\n",
-                                 self._pol(1))
-        logs = []
-        status = Orchestrator(task, self.reg, adapter, lambda k, t: True,
-                              log=logs.append).run()
-        self.assertEqual(status, "done", "\n".join(logs))
-
-        mine = [t for t in seen if "Your subtask: st-2-beta" in t]
-        self.assertEqual(len(mine), 2, "st-2-beta should have been dispatched "
-                                       "once, then again for the rework")
-        self.assertIn("beta is wrong", mine[-1],
-                      "the second reworking subtask was dispatched with no "
-                      "findings — a sibling's completion had cleared them")
-        self.assertNotIn("alpha is wrong", mine[-1],
-                         "it was handed another subtask's finding")
-        self.assertEqual(task.state.get("pending_findings"), [],
-                         "findings outlived the review that raised them")
-
 
 class TestSecondColdRead(unittest.TestCase):
     """What a third cold read found under `TestSubtaskContinuity`.
@@ -1789,7 +1280,7 @@ class TestSecondColdRead(unittest.TestCase):
         self.reg = router.load_registry(REGISTRY)
         self.pol = dict(self.reg["policy"]["limits"],
                         escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
-        self.task = store.Task.create(self.t.repo, "T-CR", "# t\n\ndo it\n", self.pol)
+        self.task = _task(self.t.repo, "T-CR", "# t\n\ndo it\n", self.pol)
         self.logs = []
 
     def tearDown(self):
@@ -1813,52 +1304,6 @@ class TestSecondColdRead(unittest.TestCase):
         sh(["git", "commit", "-qm", "add %s" % name], cwd)
 
     # --- the flag that outlived what it described ---------------------------
-
-    def test_reopening_a_subtask_clears_the_flag_that_says_it_landed(self):
-        """`merged` is what `_unfinish` reads to decide whether a subtask that
-        did not make it onto the integration branch may stay `complete`. It was
-        set on a successful merge and cleared nowhere, so a subtask that landed
-        in wave one and was then sent back by the reviewer carried the flag into
-        its rework: when THAT merge was aborted, `_unfinish`'s
-        `complete and not merged` guard was false, the subtask stayed complete,
-        and the run fell through review to integrate and delivered a patch with
-        none of the rework in it."""
-        self.task.update(subtasks=[
-            {"id": "st-1", "status": "complete", "merged": True, "actual_files": []},
-            {"id": "st-2", "status": "complete", "merged": True, "actual_files": []}])
-        orch = self._orch()
-        orch._reopen_subtasks({"st-1"})
-
-        by_id = {s["id"]: s for s in self.task.state["subtasks"]}
-        self.assertEqual(by_id["st-1"]["status"], "pending")
-        self.assertFalse(by_id["st-1"].get("merged"),
-                         "a reopened subtask still claims its work is on the "
-                         "integration branch, so `_unfinish` will refuse to "
-                         "reopen it when the rework's own merge fails")
-        # The one that was not reopened is untouched: its work really is landed.
-        self.assertEqual(by_id["st-2"]["status"], "complete")
-        self.assertTrue(by_id["st-2"]["merged"])
-
-        # And the guard now bites: mark it complete again without a merge, and
-        # `_unfinish` sends it back rather than letting it be delivered as done.
-        self.task.update(subtasks=[dict(s, status="complete")
-                                   for s in self.task.state["subtasks"]])
-        orch._unfinish([{"id": "st-1"}])
-        self.assertEqual({s["id"]: s["status"]
-                          for s in self.task.state["subtasks"]}["st-1"], "pending")
-
-    def test_the_no_owners_fallback_clears_the_flag_too(self):
-        """`_reopen_subtasks` with nothing named reopens `subtasks[0]` through a
-        separate branch, which is exactly the path a REQUEST_CHANGES whose
-        findings name no subtask takes."""
-        self.task.update(subtasks=[{"id": "st-1", "status": "complete",
-                                    "merged": True, "actual_files": []}])
-        self._orch()._reopen_subtasks({"st-nonexistent"})
-        s = self.task.state["subtasks"][0]
-        self.assertEqual(s["status"], "pending")
-        self.assertFalse(s.get("merged"))
-
-    # --- the handler narrower than what reaches it --------------------------
 
     def _conflicting_wave(self, orch):
         """An integration worktree and one subtask branch that cannot merge into
@@ -1919,14 +1364,14 @@ class TestSecondColdRead(unittest.TestCase):
         cooled = router.AllChannelsCooled("integrator", ["claude-seat"],
                                            time.time() + 3600, "all cooled")
 
-        def pick(role, **kw):
+        def pick(role=None, **kw):
             raise cooled
         orch._pick = pick
         with self.assertRaises(router.AllChannelsCooled):
             orch._reconcile({"id": "st-1"}, self.t.repo, "CONFLICT")
 
         # ... and an ordinary "nothing enrolled" still halts, as it always did.
-        def none_available(role, **kw):
+        def none_available(role=None, **kw):
             raise router.NoModelAvailable("no integrator enrolled")
         orch._pick = none_available
         with self.assertRaises(Halt):
@@ -2115,103 +1560,6 @@ class TestSecondColdRead(unittest.TestCase):
 
     # --- the context the escalation paid for and threw away ------------------
 
-    def test_the_stronger_model_is_told_what_the_last_one_already_tried(self):
-        """`_one_subtask` builds the escalation context -- the signals, the
-        evidence, the `attempted` list -- and hands it to `_invoke` as
-        `failure`. `_invoke` read it only when continuing a session or handing
-        over on a quota hop, and `_climb` returns `session = None` by
-        construction, because the whole point is a different model. So the one
-        path that most needs the context was the one path that dropped it: the
-        dearer model opened on the plain role prompt and re-tried what its
-        predecessor had already reported as failed. references/escalation.md:
-        the next model is smarter, not clairvoyant."""
-        PLAN = """# Plan
-
-## Subtasks
-```yaml
-- id: st-1-alpha
-  goal: add alpha
-  file_scope: ["alpha.py"]
-  acceptance: [AC-1]
-```
-"""
-        rounds = {"n": 0}
-
-        def implementer(env, cwd):
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            rounds["n"] += 1
-            with open(os.path.join(cwd, "alpha.py"), "w") as fh:
-                fh.write("ALPHA = %d\n" % rounds["n"])
-            if rounds["n"] == 1:
-                _report(td, "implement-st-1-alpha.json", {
-                    "stage": "implement", "role": "implementer",
-                    "subtask": "st-1-alpha", "status": "escalate",
-                    "summary": "the fixture will not build",
-                    "evidence": {"tests": "red"},
-                    "signals": [{
-                        "type": "test_stuck",
-                        "detail": "the fixture deadlocks on import",
-                        "evidence": "E   RuntimeError: event loop is closed",
-                        "attempted": ["raising the timeout",
-                                      "running the fixture eagerly"]}]})
-                return
-            _report(td, "implement-st-1-alpha.json", {
-                "stage": "implement", "role": "implementer",
-                "subtask": "st-1-alpha", "status": "complete",
-                "summary": "did alpha", "evidence": {"tests": "ok"}})
-
-        def reviewer(env, cwd):
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "review-reviewer.json", {
-                "stage": "review", "role": "reviewer", "status": "complete",
-                "summary": "ok", "evidence": {"tests": "ok"},
-                "role_data": {"verdict": {"verdict": "APPROVE",
-                                          "ac_table": [{"ac": "AC-1",
-                                                        "status": "met"}],
-                                          "findings": []}}})
-
-        def planner(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
-                fh.write(PLAN)
-
-        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
-            fh.write('fast:\n  - "python3 -c \'print(1)\'"\ntest_author: never\n')
-        sh(["git", "add", "-A"], self.t.repo)
-        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
-
-        adapter = runtime.MockAdapter({
-            "planner": planner, "implementer": implementer,
-            "test-author": lambda e, c: None, "reviewer": reviewer})
-        task = store.Task.create(self.t.repo, "T-ESC", "# t\n\nAdd alpha\n", self.pol)
-        logs = []
-        status = Orchestrator(task, self.reg, adapter, lambda k, t: True,
-                              log=logs.append).run()
-        self.assertEqual(status, "done", "\n".join(logs))
-
-        sent = [text for role, text in adapter.calls if role == "implementer"]
-        self.assertEqual(len(sent), 2, "the subtask should have been dispatched "
-                                       "once, then again on the stronger seat")
-        self.assertIn("event loop is closed", sent[-1],
-                      "the escalated-to model was given no evidence")
-        self.assertIn("raising the timeout", sent[-1],
-                      "`attempted` never reached the replacement, so it is free "
-                      "to repeat what already failed")
-        # And the first dispatch is untouched: there is nothing to carry yet.
-        self.assertNotIn("event loop is closed", sent[0])
-
-    def test_the_failure_note_is_folded_in_without_losing_the_brief(self):
-        """The caller's `extra` is the findings brief. A rework that loses its
-        findings is the failure the hand-off exists to stop, so the note is
-        appended rather than substituted."""
-        both = Orchestrator._with_failure("THE FINDINGS", "WHAT FAILED")
-        self.assertIn("THE FINDINGS", both)
-        self.assertIn("WHAT FAILED", both)
-        self.assertEqual(Orchestrator._with_failure("only extra", None),
-                         "only extra")
-        self.assertIn("only failure", Orchestrator._with_failure(None, "only failure"))
-        self.assertIsNone(Orchestrator._with_failure(None, None))
-
-    # --- the write that failed and said nothing -----------------------------
-
     def test_a_breaker_that_cannot_be_written_is_reported(self):
         """`cooldown._mutate` returns the reason precisely so a caller can say
         it -- "it must not pretend the write happened" -- and both production
@@ -2223,7 +1571,7 @@ class TestSecondColdRead(unittest.TestCase):
         real = cooldown.record_use
         cooldown.record_use = lambda *a, **k: "channels.json is not writable"
         try:
-            choice = orch.router.candidates("implementer")[0]
+            choice = orch.router.candidates()[0]
             orch._meter(choice)
             orch._meter(choice)
         finally:
@@ -2300,8 +1648,7 @@ class TestDispatchWorkflow(unittest.TestCase):
         self.pol = dict(self.reg["policy"]["limits"],
                         escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
                         max_parallel_agents=2)
-        self.dispatch = os.path.join(
-            os.path.dirname(wf.default_dir()), "dispatch")
+        self.dispatch = wf.default_dir()
         self.addCleanup(setattr, wf, "_CURRENT", None)
 
     def tearDown(self):
@@ -2312,15 +1659,15 @@ class TestDispatchWorkflow(unittest.TestCase):
     def test_the_bundled_dispatch_workflow_runs_only_execution(self):
         self.assertTrue(os.path.isdir(self.dispatch), self.dispatch)
         w = wf.use(self.dispatch)
-        for off in ("intake", "classify", "brainstorm", "plan", "review"):
-            self.assertFalse(w.enabled(off), "%s should be switched off" % off)
+        self.assertEqual(w.order(), ["implement", "integrate"],
+                         "the manifest names a stage the machine does not have, "
+                         "which reads like policy and routes nothing")
         for on in ("implement", "integrate"):
             self.assertTrue(w.enabled(on), "%s must stay on" % on)
         # `integrate` in particular: it is the stage that merges the subtask
         # branches and writes the patch, so a dispatcher without it would end
         # the run with the work stranded on branches nobody merges.
         self.assertEqual(w.next_enabled("implement", order=STAGES), "integrate")
-        self.assertEqual(w.next_enabled("intake", order=STAGES), "implement")
 
     def test_a_supplied_plan_is_executed_with_no_planner_or_reviewer(self):
         wf.use(self.dispatch)
@@ -2342,7 +1689,7 @@ class TestDispatchWorkflow(unittest.TestCase):
                 raise AssertionError("%s ran under the dispatch workflow" % role)
             return fn
 
-        task = store.Task.create(self.t.repo, "T-DIS", "# t\n\ntwo things\n",
+        task = _task(self.t.repo, "T-DIS", "# t\n\ntwo things\n",
                                  self.pol)
         task.write_text("plan.md", self.PLAN)      # what `--plan` does
         logs = []
@@ -2457,7 +1804,7 @@ class TestWaveRaces(unittest.TestCase):
         subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
         self.t.close()
 
-    def _run(self, implementer, task_id="T-W"):
+    def _run(self, implementer, task_id="T-W", plan=None):
         def planner(env, cwd):
             with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
                 fh.write(self.PLAN)
@@ -2472,8 +1819,8 @@ class TestWaveRaces(unittest.TestCase):
                                                                    "status": "met"}],
                                                      "findings": []}}}, fh)
 
-        task = store.Task.create(self.t.repo, task_id, "# t\n\nAdd three things\n",
-                                 self.pol)
+        task = _task(self.t.repo, task_id, "# t\n\nAdd three things\n",
+                                 self.pol, plan=plan or self.PLAN)
         script = {"planner": planner, "implementer": implementer,
                   "test-author": lambda e, c: None, "reviewer": reviewer}
         logs = []
@@ -2526,7 +1873,7 @@ class TestWaveRaces(unittest.TestCase):
             with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
                 fh.write(self.PLAN)
 
-        task = store.Task.create(self.t.repo, "T-W1", "# t\n\nAdd things\n", self.pol)
+        task = _task(self.t.repo, "T-W1", "# t\n\nAdd things\n", self.pol, plan=self.PLAN)
         logs = []
         status = Interleaved(task, self.reg, runtime.MockAdapter(
             {"planner": planner, "implementer": implementer,
@@ -2656,7 +2003,7 @@ class TestWaveRaces(unittest.TestCase):
                 # file is a legal way for an implementer to finish, and any
                 # escalate attributed to st-1 can only have been read across.
 
-        task = store.Task.create(self.t.repo, "T-W11", "# t\n\nAdd things\n", self.pol)
+        task = _task(self.t.repo, "T-W11", "# t\n\nAdd things\n", self.pol, plan=PLAN)
         logs = []
         status = Orchestrator(task, self.reg, runtime.MockAdapter(
             {"planner": planner, "implementer": implementer,
@@ -2673,7 +2020,7 @@ class TestWaveRaces(unittest.TestCase):
     def test_hotspots_from_a_real_plan_force_serialization(self):
         # The old test hand-wrote a `hotspots` key the plan parser dropped, so
         # it proved the scheduler's arithmetic and nothing about the pipeline.
-        task = store.Task.create(self.t.repo, "T-W3", "# t\n", self.pol)
+        task = _task(self.t.repo, "T-W3", "# t\n", self.pol)
         orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
                             log=lambda *_: None)
         task.write_text("plan.md", self.PLAN)
@@ -2689,7 +2036,7 @@ class TestWaveRaces(unittest.TestCase):
     def test_a_project_declared_hotspot_also_serializes(self):
         with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
             fh.write('fast: []\nhotspots:\n  - "alpha.py"\n')
-        task = store.Task.create(self.t.repo, "T-W4", "# t\n", self.pol)
+        task = _task(self.t.repo, "T-W4", "# t\n", self.pol)
         orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
                             log=lambda *_: None)
         task.update(subtasks=[
@@ -2920,7 +2267,7 @@ class TestLiveRunRegressions(unittest.TestCase):
         self.t.close()
 
     def _simple(self, script):
-        task = store.Task.create(self.t.repo, "T-R", "# t\n\nAdd a thing\n", self.pol)
+        task = _task(self.t.repo, "T-R", "# t\n\nAdd a thing\n", self.pol)
 
         class A(runtime.MockAdapter):
             def prompt(self, session, text, timeout):
@@ -2948,13 +2295,22 @@ class TestLiveRunRegressions(unittest.TestCase):
         # The live failure: the agent said "no code written", the orchestrator
         # saw green tests and marked the subtask complete.
         def honest(env, cwd):
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
-                "stage": "implement", "role": "implementer", "status": "escalate",
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-subtract.json", {
+                "stage": "implement", "role": "implementer",
+                "subtask": "st-1-subtract", "status": "escalate",
                 "summary": "No code written — wrong repository in the worktree.",
-                "evidence": {"tests": "green but irrelevant"}})
+                "evidence": {"tests": "green but irrelevant"},
+                "signals": [{"type": "blocked_command",
+                             "detail": "the worktree is not the repo I was told",
+                             "attempted": ["re-reading the task dir"]}]})
         status, task, logs = self._simple({"implementer": honest})
         self.assertEqual(status, "needs_human")
-        self.assertIn("reported escalate", "\n".join(logs))
+        joined = "\n".join(logs)
+        self.assertIn("stopped and asked for help", joined)
+        # and the caller is handed what the agent knew, not a summary of it:
+        # nothing here decides what to do about a stuck job any more.
+        self.assertIn("blocked_command", joined)
+        self.assertIn("already tried: re-reading the task dir", joined)
 
     def test_worktrees_of_different_projects_do_not_collide(self):
         # Two repos sharing a parent produced the same .adg-worktrees/T-001-work.
@@ -2998,7 +2354,7 @@ class TestResume(unittest.TestCase):
         # "parked" dropped --stage exactly when it mattered and re-ran the very
         # stage the user was skipping past.
         from adg import cli
-        task = store.Task.create(self.t.repo, "T-RS", "# t\n",
+        task = _task(self.t.repo, "T-RS", "# t\n",
                                  dict(self.reg["policy"]["limits"]))
         task.update(status="plan")
 
@@ -3029,7 +2385,7 @@ class TestResume(unittest.TestCase):
         # handler for stage", which reads as a corrupted task rather than a
         # typo the user can retype.
         from adg import cli
-        task = store.Task.create(self.t.repo, "T-RT", "# t\n",
+        task = _task(self.t.repo, "T-RT", "# t\n",
                                  dict(self.reg["policy"]["limits"]))
         task.update(status="plan")
 
@@ -3053,7 +2409,7 @@ class TestStatusReadsTheBreaker(unittest.TestCase):
 
     def setUp(self):
         self.t = TempRepo()
-        self.task = store.Task.create(self.t.repo, "T-Q", "# t\n",
+        self.task = _task(self.t.repo, "T-Q", "# t\n",
                                       {"max_cost_usd": 1})
         self.task.update(status="needs_human",
                          park={"reason": "quota_all_exhausted", "role": "implementer",
@@ -3155,246 +2511,6 @@ class TestCostBreakdown(unittest.TestCase):
         self.assertEqual(brief.lint("\n".join(brief._cost_section(self.STATE))), [])
 
 
-class TestSkillContract(unittest.TestCase):
-    """The systemic gap: schemas and role cards were written in separate passes
-    and never checked against each other. A reviewer literally could not write a
-    file that satisfied both, and nothing caught it because every fixture in
-    this suite was hand-written to be valid."""
-
-    # The dispatched-agent protocol, which moved under orchestrator/ when the
-    # repo-root `agent-delegation/` became the front-door skill for the
-    # user's own agent. Two audiences, two directories.
-    SKILL = os.path.join(REPO_ROOT, "orchestrator", "workflows", "default")
-
-    def _card(self, name):
-        with open(os.path.join(self.SKILL, "roles", "%s.md" % name)) as fh:
-            return fh.read()
-
-    def test_a_reviewer_report_validates_as_a_report(self):
-        report = {
-            "stage": "review", "role": "reviewer", "status": "complete",
-            "summary": "checked the criteria", "evidence": {"tests": "214 passed"},
-            "role_data": {"verdict": {
-                "verdict": "APPROVE",
-                "ac_table": [{"ac": "AC-1", "status": "met", "evidence": "t.py:9"}],
-                "findings": []}},
-        }
-        schema.validate_report(report)
-        schema.validate_verdict(report["role_data"]["verdict"])
-
-    def test_the_reviewer_can_report_blocked(self):
-        # It had no legal way to say "I could not review this".
-        schema.validate_report({
-            "stage": "review", "role": "reviewer", "status": "blocked",
-            "summary": "no diff was provided", "evidence": {"not_verified": ["everything"]}})
-
-    def test_every_field_a_card_names_is_legal(self):
-        # Fields a role card tells an agent to write must exist in the schema or
-        # be explicitly routed to role_data.
-        report = json.loads(_slurp(os.path.join(self.SKILL, "schemas",
-                                            "report.schema.json")))
-        allowed = set(report["properties"])
-        for role, named in [("planner", ["subtask_ids", "estimated_total_loc"]),
-                            ("test-author", ["ac_coverage"])]:
-            card = self._card(role)
-            for field in named:
-                self.assertIn(field, card, "%s no longer names %s" % (role, field))
-                self.assertNotIn(field, allowed, "schema gained %s; update the card" % field)
-                near = card[max(0, card.find(field) - 220):card.find(field) + 40]
-                self.assertIn("role_data", near,
-                              "%s tells the agent to write %s without routing it to "
-                              "role_data" % (role, field))
-
-    def test_cards_do_not_point_at_the_verdict_schema_as_a_file(self):
-        self.assertNotIn("per `schemas/verdict.schema.json`", self._card("reviewer"))
-
-    def test_namespaced_deviation_ids_are_accepted_and_bare_ones_are_not(self):
-        base = {"stage": "implement", "role": "implementer", "status": "complete",
-                "summary": "s", "evidence": {"tests": "ok"}}
-        schema.validate_report(dict(base, deviations=["dev-st-2-1"]))
-        with self.assertRaises(schema.Invalid):
-            schema.validate_report(dict(base, deviations=["dev-3"]))
-
-    def test_empty_evidence_is_rejected(self):
-        with self.assertRaises(schema.Invalid):
-            schema.validate_report({"stage": "implement", "role": "implementer",
-                                    "status": "complete", "summary": "s", "evidence": {}})
-
-    def test_out_of_scope_severity_is_stated_once_and_agrees(self):
-        ref = _slurp(os.path.join(self.SKILL, "references", "deviations.md"))
-        impl = self._card("implementer")
-        self.assertIn("One exception:", ref, "the carve-out belongs with the rule")
-        self.assertNotIn("Small mechanical exceptions", impl,
-                         "implementer.md restates the severity rule differently again")
-
-    def test_task_md_authority_matches_what_the_planner_is_told(self):
-        skill = _slurp(os.path.join(self.SKILL, "PROTOCOL.md"))
-        self.assertNotIn("amended only by humans", skill)
-        self.assertIn("planner may add criteria", skill)
-        self.assertIn("missing entirely", self._card("planner"))
-
-    def test_the_protocol_does_not_advertise_itself_as_an_installable_skill(self):
-        """It is data the orchestrator reads, handed to an agent by absolute
-        path, so it must not carry a skill identity.
-
-        This replaces a test that asserted the frontmatter description triggered
-        on `$AGENT_DELEGATION_ROLE` rather than on a path. That property is not
-        gone -- it moved. With no frontmatter there is no loader trigger at all,
-        which is the stronger form of the same guarantee, and what still
-        enlists an agent is `env_for` withholding the role variable (see
-        TestRoleMandate). What this guards now is the collision that replaced
-        it: two files in one repo both declaring `name: agent-delegation`, with
-        a loader free to pick either.
-        """
-        text = _slurp(os.path.join(self.SKILL, "PROTOCOL.md"))
-        self.assertFalse(text.startswith("---"),
-                         "the protocol still declares skill frontmatter")
-        self.assertNotIn("\nname: agent-delegation", text)
-        root_skill = _slurp(os.path.join(REPO_ROOT, "agent-delegation", "SKILL.md"))
-        self.assertTrue(root_skill.startswith("---"),
-                        "the front-door skill lost the frontmatter it needs")
-
-    def test_the_skill_cites_nothing_outside_itself(self):
-        """The protocol travels: an agent reads it from whatever machine the
-        orchestrator put it on, so a citation of DESIGN.md or the repo root is a
-        pointer that dangles wherever it is unpacked -- and it is invisible from
-        inside this repo, where the file it names is always there."""
-        for base, _dirs, names in os.walk(self.SKILL):
-            for name in names:
-                if not name.endswith((".md", ".json")):
-                    continue
-                path = os.path.join(base, name)
-                body = _slurp(path)
-                rel = os.path.relpath(path, self.SKILL)
-                for outsider in ("DESIGN.md", "orchestrator/", "registry.default.yaml"):
-                    self.assertNotIn(outsider, body,
-                                     "%s cites %s, which is not shipped with the "
-                                     "skill" % (rel, outsider))
-
-    def test_the_integrator_names_its_report_by_subtask_not_by_role(self):
-        """`_reconcile` passes a subtask, so `_collect_report` identifies the
-        report by that id alone -- the wave-attribution rule. A card that says
-        `integrate-integrator.json` describes a file the orchestrator can never
-        credit, and a conflicting wave calls two integrators anyway."""
-        card = self._card("integrator")
-        self.assertIn("reports/integrate-<subtask-id>.json", card)
-        self.assertIn("Not `integrate-integrator.json`", card)
-
-    def test_a_card_named_integrator_report_is_actually_collected(self):
-        d = tempfile.mkdtemp()
-        try:
-            os.makedirs(os.path.join(d, "reports"))
-            task = store.Task(d)
-            task.write_json("task.json", {"id": "T-1"})
-            sub = {"id": "st-2-beta"}
-            _report(d, "integrate-%s.json" % sub["id"], {
-                "stage": "integrate", "role": "integrator", "status": "complete",
-                "summary": "kept st-4's registration", "evidence": {"tests": "3 passed"}})
-            orch = Orchestrator.__new__(Orchestrator)
-            orch.task = task
-            report, problems = orch._collect_report("integrator", sub)
-            self.assertIsNone(problems)
-            self.assertEqual(report["status"], "complete")
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-
-class TestRoleMandate(unittest.TestCase):
-    """`AGENT_DELEGATION_ROLE` is what enlists an agent into this protocol. Every
-    role that carries it must have somewhere to go when the agent obeys."""
-
-    # The dispatched-agent protocol, which moved under orchestrator/ when the
-    # repo-root `agent-delegation/` became the front-door skill for the
-    # user's own agent. Two audiences, two directories.
-    SKILL = os.path.join(REPO_ROOT, "orchestrator", "workflows", "default")
-
-    def _task(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        task = store.Task(d)
-        task.write_json("task.json", {"id": "T-1", "limits": {}})
-        return task
-
-    def test_text_reply_roles_are_not_conscripted(self):
-        task = self._task()
-        for role in sorted(prompts.TEXT_REPLY_ROLES):
-            env = prompts.env_for(task, role)
-            self.assertNotIn("AGENT_DELEGATION_ROLE", env,
-                             "%s has no card, no task id and no report to write; "
-                             "telling it the protocol applies makes it answer with "
-                             "a blocked report instead of the verdict" % role)
-            # The location still travels: that is the whole point of the split.
-            self.assertEqual(env["AGENT_DELEGATION_TASK_DIR"], task.path)
-
-    def test_every_conscripted_role_has_a_card(self):
-        task = self._task()
-        for role in ("planner", "implementer", "test-author", "reviewer", "integrator"):
-            env = prompts.env_for(task, role)
-            self.assertEqual(env["AGENT_DELEGATION_ROLE"], role)
-            self.assertTrue(os.path.isfile(
-                os.path.join(self.SKILL, "roles", "%s.md" % role)),
-                "%s is given the mandate with no card to read" % role)
-
-    def test_runtime_does_not_keep_a_second_copy_of_the_list(self):
-        self.assertIs(runtime.HerdrAdapter.TEXT_REPLY_ROLES, prompts.TEXT_REPLY_ROLES)
-
-    def test_the_attempt_budget_is_not_quoted_to_roles_that_have_none(self):
-        task = self._task()
-        task.write_json("task.json", {"id": "T-1",
-                                      "limits": {"max_attempts_per_subtask": 8}})
-        self.assertNotIn("attempts on this subtask",
-                         prompts.compose("reviewer", task))
-        self.assertIn("attempts on this subtask",
-                      prompts.compose("implementer", task,
-                                      subtask={"id": "st-1", "file_scope": ["src/**"]}))
-
-    def test_the_scope_line_promises_only_what_happens(self):
-        task = self._task()
-        text = prompts.compose("implementer", task,
-                               subtask={"id": "st-1", "file_scope": ["src/**"]})
-        self.assertNotIn("reverted", text,
-                         "nothing in this program reverts an out-of-scope hunk; "
-                         "it records the files and forces a review")
-        self.assertIn("recorded and sent to a reviewer", text)
-
-
-class TestCapabilityHint(unittest.TestCase):
-    """subtask.schema.json has always said a hint "raises the router's
-    requirements for this subtask". Nothing read it, so a subtask marked
-    very_high drew the same model as a one-line rename."""
-
-    def setUp(self):
-        self.reg = router.load_registry(REGISTRY)
-
-    def test_a_hint_becomes_a_numeric_floor(self):
-        self.assertEqual(router.as_boost({"reasoning": "high", "coding": "very_high"}),
-                         {"reasoning": 4, "coding": 5})
-
-    def test_a_typo_is_dropped_rather_than_guessed_at(self):
-        self.assertEqual(router.as_boost({"reasoning": "extremely_high"}), {})
-        self.assertEqual(router.as_boost(None), {})
-
-    def test_the_hint_raises_the_floor(self):
-        r = router.Router(self.reg)
-        plain = r.candidates("implementer")[0]
-        strong = r.candidates("implementer", boost=router.as_boost({"reasoning": "very_high"}))
-        self.assertEqual(plain.model, "balanced-coder")
-        self.assertTrue(strong, "reasoning 5 is enrolled for implementer")
-        for c in strong:
-            self.assertGreaterEqual(c.spec["reasoning"], 5)
-
-    def test_an_unreachable_hint_degrades_instead_of_parking_the_task(self):
-        t = TempRepo()
-        self.addCleanup(t.close)
-        task = store.Task.create(t.repo, "T-CH", "# t\n",
-                                 dict(self.reg["policy"]["limits"]))
-        orch = Orchestrator(task, self.reg, runtime.MockAdapter(),
-                            lambda k, txt: True, log=lambda *_: None)
-        # ctx 10**9 is above every enrolled model: a floor nothing can clear.
-        choice = orch._pick_implementer({"id": "st-1", "capability_hint": {"ctx": 10 ** 9}})
-        self.assertEqual(choice.model, "balanced-coder")
-
-
 class TestRoundVersioning(unittest.TestCase):
     def setUp(self):
         self.t = TempRepo()
@@ -3402,22 +2518,6 @@ class TestRoundVersioning(unittest.TestCase):
 
     def tearDown(self):
         self.t.close()
-
-    def test_a_second_round_does_not_destroy_the_first(self):
-        task = store.Task.create(self.t.repo, "T-A", "# t\n",
-                                 dict(self.reg["policy"]["limits"]))
-        _report(task.path, "review-reviewer.json", {"round": 1})
-        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
-                            log=lambda *_: None)
-        orch._archive_reports("review-")
-        _report(task.path, "review-reviewer.json", {"round": 2})
-        orch._archive_reports("review-")
-        archived = sorted(os.listdir(task.file("reports", "archive")))
-        self.assertEqual(archived, ["review-reviewer-r1.json", "review-reviewer-r2.json"])
-        rounds = [json.loads(_slurp(task.file("reports", "archive", a)))["round"]
-                  for a in archived]
-        self.assertEqual(rounds, [1, 2], "an earlier round was overwritten")
-
 
 class TestWinnow(unittest.TestCase):
     """code-winnow is referenced, never vendored: a stale copy that reports
@@ -3608,152 +2708,6 @@ class TestWinnow(unittest.TestCase):
         self.assertIn("boom", s["why"])
 
 
-class TestAgentRaisedSignals(unittest.TestCase):
-    """An agent that follows references/escalation.md -- stops at the threshold
-    and attaches a signal -- has to reach the ladder, not the human.
-
-    `status: escalate` was read as rung 4 whatever it carried, so an agent that
-    obeyed the protocol was routed strictly worse than one that failed in
-    silence: the silent one got rungs 2 and 3, the honest one got a parked run.
-    `report.signals` had no reader anywhere in the orchestrator, which is what
-    made the two defects one defect -- there was nothing to route on."""
-
-    PLAN = """# Plan
-
-## Subtasks
-```yaml
-- id: st-1-alpha
-  goal: add alpha
-  file_scope: ["alpha.py"]
-  acceptance: [AC-1]
-```
-"""
-
-    def setUp(self):
-        self.t = TempRepo()
-        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
-            fh.write('fast:\n  - "python3 -c \'print(1)\'"\ntest_author: never\n')
-        sh(["git", "add", "-A"], self.t.repo)
-        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
-        self.reg = router.load_registry(REGISTRY)
-        self.pol = dict(self.reg["policy"]["limits"],
-                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
-        self.planner_calls = 0
-        self.planner_bundle = ""
-
-    def tearDown(self):
-        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
-        self.t.close()
-
-    def _run(self, signals, escalate_forever=False):
-        """One implementer that escalates with `signals`, then does the job.
-
-        Escalating once and succeeding afterwards is what separates the rungs:
-        a run that recovers proves the ladder moved, where a run that parks
-        cannot tell rung 4 from a rung that was never walked."""
-        calls = {"impl": 0}
-
-        def planner(env, cwd):
-            self.planner_calls += 1
-            td = env["AGENT_DELEGATION_TASK_DIR"]
-            if os.path.exists(os.path.join(td, "escalation.md")):
-                with open(os.path.join(td, "escalation.md")) as fh:
-                    self.planner_bundle = fh.read()
-            with open(os.path.join(td, "plan.md"), "w") as fh:
-                fh.write(self.PLAN)
-
-        def implementer(env, cwd):
-            calls["impl"] += 1
-            with open(os.path.join(cwd, "alpha.py"), "w") as fh:
-                fh.write("A = %d\n" % calls["impl"])
-            first = calls["impl"] == 1 or escalate_forever
-            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-alpha.json", {
-                "stage": "implement", "role": "implementer", "subtask": "st-1-alpha",
-                "status": "escalate" if first else "complete",
-                "summary": "stopping at the threshold, signal attached",
-                "signals": signals, "evidence": {"tests": "captured"}})
-
-        def reviewer(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
-                                   "reports", "review-reviewer.json"), "w") as fh:
-                json.dump({"verdict": "APPROVE",
-                           "ac_table": [{"ac": "AC-1", "status": "met",
-                                         "evidence": "checks pass"}],
-                           "findings": []}, fh)
-
-        task = store.Task.create(self.t.repo, "T-SIG", "# t\n\nAdd alpha\n", self.pol)
-        logs = []
-        status = Orchestrator(task, self.reg, runtime.MockAdapter(
-            {"planner": planner, "implementer": implementer, "reviewer": reviewer}),
-            lambda k, t: True, log=logs.append).run()
-        return status, task, logs
-
-    def test_a_test_stuck_signal_climbs_to_a_stronger_model(self):
-        # rung 2. The shipped registry enrols opus-class-strong for
-        # implementer precisely so this rung has somewhere to go.
-        status, task, logs = self._run([{
-            "type": "test_stuck", "detail": "test_alpha fails on the third fix",
-            "evidence": "$ pytest -q\nE   assert 1 == 2",
-            "attempted": ["widened the guard", "reordered the calls"]}])
-        self.assertEqual(status, "done", "\n".join(logs))
-        self.assertEqual(int(task.state["spent"]["replans"]), 0,
-                         "rung 2 was available and it skipped to rung 3")
-        self.assertTrue(any("escalating to" in l for l in logs),
-                        "no rung was climbed\n%s" % "\n".join(logs))
-
-    def test_a_plan_conflict_reaches_the_planner_not_the_human(self):
-        # : plan_conflict enters at rung 3 directly -- a stronger
-        # implementer cannot fix a plan that is wrong about reality.
-        status, task, logs = self._run([{
-            "type": "plan_conflict",
-            "detail": "plan.md:L4 scopes alpha.py, but alpha.py is generated",
-            "evidence": "$ git check-ignore -q alpha.py && echo ignored\nignored"}])
-        self.assertEqual(int(task.state["spent"]["replans"]), 1,
-                         "rung 3 never fired\n%s" % "\n".join(logs))
-        self.assertGreaterEqual(self.planner_calls, 2, "the planner was never re-run")
-        self.assertEqual(status, "done", "\n".join(logs))
-
-    def test_the_planner_is_handed_the_signal_the_agent_wrote(self):
-        # The whole point of `attempted`: the next reader skips what is already
-        # ruled out. Dropping it makes the field decoration.
-        self._run([{
-            "type": "plan_conflict", "detail": "plan.md:L4 contradicts the tree",
-            "evidence": "$ git check-ignore -q alpha.py\n(exit 0)",
-            "attempted": ["renaming the module", "widening the scope glob"]}])
-        bundle = self.planner_bundle
-        self.assertIn("plan_conflict", bundle)
-        self.assertIn("plan.md:L4 contradicts the tree", bundle)
-        self.assertIn("renaming the module", bundle,
-                      "the agent's ruled-out attempts never reached the planner")
-
-    def test_a_missing_dependency_still_stops_for_a_human(self):
-        # Rung 4 is right here and nothing below it helps: no model and no plan
-        # can install a package.
-        status, _, logs = self._run([{
-            "type": "missing_dependency", "detail": "needs libfoo>=2",
-            "evidence": "ModuleNotFoundError: No module named 'libfoo'"}],
-            escalate_forever=True)
-        self.assertEqual(status, "needs_human", "\n".join(logs))
-        self.assertTrue(any("libfoo" in l or "missing_dependency" in l for l in logs),
-                        "it parked without saying which signal parked it")
-
-    def test_low_confidence_alone_routes_nowhere(self):
-        # D4. Self-reported confidence is a tiebreaker; on its own it carries no
-        # routing information, so this is an escalate with nothing to act on.
-        status, task, logs = self._run([{
-            "type": "low_confidence", "detail": "unsure about the approach",
-            "evidence": "(none)"}], escalate_forever=True)
-        self.assertEqual(status, "needs_human", "\n".join(logs))
-        self.assertEqual(int(task.state["spent"]["replans"]), 0,
-                         "a confidence report alone spent a replan")
-        # Parking is the right answer, but it has to be the *reasoned* one.
-        # Asserting only the status cannot tell "nothing to route on" from the
-        # old behaviour, where every escalate parked whatever it carried.
-        self.assertTrue(any("low_confidence" in l for l in logs),
-                        "it parked without saying what it could not route\n%s"
-                        % "\n".join(logs))
-
-
 class TestReportFreshness(unittest.TestCase):
     """A report already on disk when the turn began is not this turn's report.
 
@@ -3767,7 +2721,7 @@ class TestReportFreshness(unittest.TestCase):
     def setUp(self):
         self.t = TempRepo()
         self.reg = router.load_registry(REGISTRY)
-        self.task = store.Task.create(self.t.repo, "T-FRESH", "# t\n",
+        self.task = _task(self.t.repo, "T-FRESH", "# t\n",
                                       dict(self.reg["policy"]["limits"]))
         self.orch = Orchestrator(self.task, self.reg, runtime.MockAdapter({}),
                                  lambda k, t: True, log=lambda *_: None)
@@ -3815,22 +2769,6 @@ class TestResourceHygiene(unittest.TestCase):
     def tearDown(self):
         self.t.close()
 
-    def test_reading_the_repo_for_facts_leaks_no_file_handles(self):
-        # `open(...).read()` per tracked file, never closed. Harmless on a small
-        # repo and not harmless at the 400-file cap it is written to tolerate,
-        # which is exactly where it would first matter.
-        import warnings
-        task = store.Task.create(self.t.repo, "T-FD", "# t\n",
-                                 dict(self.reg["policy"]["limits"]))
-        orch = Orchestrator(task, self.reg, runtime.MockAdapter({}),
-                            lambda k, t: True, log=lambda *_: None)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", ResourceWarning)
-            orch._repo_facts()
-        leaks = [w for w in caught if issubclass(w.category, ResourceWarning)]
-        self.assertEqual([str(w.message) for w in leaks], [])
-
-
 class TestEndToEnd(unittest.TestCase):
     """Milestone 1."""
 
@@ -3877,11 +2815,12 @@ class TestEndToEnd(unittest.TestCase):
 
         return {"planner": planner, "implementer": implementer, "reviewer": reviewer}, state
 
-    def _run(self, script, gate=lambda k, t: True, request="Add a subtract API function"):
+    def _run(self, script, gate=lambda k, t: True, request="Add a subtract API function",
+             plan=None):
         pol = dict(self.reg["policy"]["limits"])
         pol["escalation_ceiling"] = self.reg["policy"]["escalation_ceiling"]
-        task = store.Task.create(self.t.repo, "T-001",
-                                 "# Task T-001\n\n## Request\n\n%s\n" % request, pol)
+        task = _task(self.t.repo, "T-001",
+                     "# Task T-001\n\n## Request\n\n%s\n" % request, pol, plan=plan)
         adapter = runtime.MockAdapter(script)
         logs = []
         orch = Orchestrator(task, self.reg, adapter, gate, log=logs.append)
@@ -3895,9 +2834,9 @@ class TestEndToEnd(unittest.TestCase):
         state = task.state
         # every role actually ran, in order
         steps = [(h["stage"], h["role"]) for h in state["delegation_history"]]
-        self.assertEqual(steps, [("brainstorm", "planner"), ("plan", "planner"),
-                                 ("plan", "test-author"), ("implement", "implementer"),
-                                 ("review", "reviewer")])
+        self.assertEqual(steps, [("implement", "implementer")],
+                         "delegate dispatched something other than the work: %s"
+                         % steps)
         # the plan produced a real subtask, completed, with files from git
         self.assertEqual(state["subtasks"][0]["status"], "complete")
         self.assertEqual(state["subtasks"][0]["actual_files"], ["app.py"])
@@ -3946,7 +2885,7 @@ class TestEndToEnd(unittest.TestCase):
         would delete exactly the cases where the files still matter."""
         script, _ = self._script()
         script["reviewer"] = lambda env, cwd: None
-        task = store.Task.create(self.t.repo, "T-KEEP",
+        task = _task(self.t.repo, "T-KEEP",
                                  "# t\n\nAdd a subtract API function\n",
                                  self.reg["policy"]["limits"])
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
@@ -3964,15 +2903,6 @@ class TestEndToEnd(unittest.TestCase):
         log = subprocess.run(["git", "log", "--oneline", "main"], cwd=self.t.repo,
                              capture_output=True, text=True).stdout
         self.assertEqual(len(log.strip().splitlines()), 2, "orchestrator committed to main")
-
-    def test_failing_checks_force_rework_before_review(self):
-        script, state = self._script(fail_first=True)
-        status, task, _, logs = self._run(script)
-        self.assertEqual(status, "done", "\n".join(logs))
-        self.assertEqual(state["impl_calls"], 2, "should have retried after a red check")
-        roles = [h["role"] for h in task.state["delegation_history"]]
-        self.assertEqual(roles.count("implementer"), 2)
-        self.assertLess(roles.index("implementer"), roles.index("reviewer"))
 
     def test_retry_continues_the_same_agent_instead_of_restarting(self):
         # A fresh agent per attempt re-reads the protocol, the task and the
@@ -3996,26 +2926,17 @@ class TestEndToEnd(unittest.TestCase):
 
         pol = dict(self.reg["policy"]["limits"],
                    escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
-        task = store.Task.create(self.t.repo, "T-003", "# t\n\nAdd subtract\n", pol)
+        task = _task(self.t.repo, "T-003", "# t\n\nAdd subtract\n", pol)
         Orchestrator(task, self.reg, A(script), lambda k, t: True, log=lambda *_: None).run()
         self.assertTrue(captured, "no follow-up sent")
         self.assertIn("did not pass", captured[0])
         self.assertIn("import app", captured[0], "should quote the failing command")
 
-    def test_reviewer_is_always_a_fresh_session(self):
-        # Independence is the whole point of review: it must not inherit the
-        # implementer's context.
-        script, _ = self._script()
-        status, task, adapter, _ = self._run(script)
-        self.assertEqual(status, "done")
-        roles = [c[1] for c in adapter.calls if c[0] == "follow_up"]
-        self.assertNotIn("reviewer", roles)
-
     def _run_simple(self, script, review=None, break_scope=False):
         """A task the classifier calls simple, so the review policy applies."""
         pol = dict(self.reg["policy"]["limits"],
                    escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
-        task = store.Task.create(self.t.repo, "T-00S", "# t\n\nAdd subtract\n", pol)
+        task = _task(self.t.repo, "T-00S", "# t\n\nAdd subtract\n", pol)
         if review:
             task.update(review=review)
 
@@ -4032,81 +2953,14 @@ class TestEndToEnd(unittest.TestCase):
                               log=logs.append).run()
         return status, task, adapter, logs
 
-    def test_simple_task_skips_llm_review_by_default(self):
-        script, _ = self._script()
-        status, task, adapter, logs = self._run_simple(script)
-        self.assertEqual(status, "done", "\n".join(logs))
-        self.assertFalse(task.state["review_outcome"]["reviewed"])
-        # `c[0]`, the role. `c[1]` is the whole prompt body for a prompt() call
-        # (MockAdapter.calls holds (role, text)), so the old form asked whether
-        # any element of a list of multi-KB prompts was exactly "reviewer" --
-        # which nothing can be. Dispatching a reviewer on every simple task
-        # passed it.
-        self.assertNotIn("reviewer", [c[0] for c in adapter.calls])
-        self.assertIn("checks green", task.state["review_outcome"]["why"])
-
     def test_brief_says_plainly_that_no_review_ran(self):
         script, _ = self._script()
         _, task, _, _ = self._run_simple(script)
         text = task.read_text("brief.md")
-        self.assertIn("No independent review was run", text)
-        self.assertIn("--review always", text)
+        self.assertIn("Nothing reviewed this", text,
+                      "the brief lets a human read 'complete, checks pass' as "
+                      "'something looked at this'")
         self.assertEqual(brief.lint(text), [], "the notice must stay jargon-free")
-
-    def test_review_always_forces_it_on_a_simple_task(self):
-        script, _ = self._script()
-        status, task, adapter, logs = self._run_simple(script, review="always")
-        self.assertEqual(status, "done", "\n".join(logs))
-        self.assertTrue(task.state["review_outcome"]["reviewed"])
-
-    def test_complex_task_still_always_reviewed(self):
-        script, _ = self._script()
-        status, task, _, logs = self._run(script)  # planner path = complex
-        self.assertEqual(status, "done", "\n".join(logs))
-        self.assertTrue(task.state["review_outcome"]["reviewed"])
-
-    def test_reviewer_findings_reach_the_implementer(self):
-        # Reopening a subtask without the findings sends the agent back to the
-        # same code with the same prompt -- it rebuilds what was rejected.
-        script, _ = self._script()
-        rounds = {"n": 0}
-        seen = []
-
-        def reviewer(env, cwd):
-            rounds["n"] += 1
-            first = rounds["n"] == 1
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"],
-                                   "reports", "review-reviewer.json"), "w") as fh:
-                json.dump({
-                    "verdict": "REQUEST_CHANGES" if first else "APPROVE",
-                    "ac_table": [{"ac": "AC-1", "status": "unmet" if first else "met"}],
-                    "findings": ([{"id": "f-1", "severity": "blocking",
-                                   "claim": "subtract must reject non-numeric input",
-                                   "cite": "task.md#AC-1", "file": "app.py"}]
-                                 if first else []),
-                }, fh)
-        script["reviewer"] = reviewer
-
-        class A(runtime.MockAdapter):
-            def prompt(self, session, text, timeout):
-                if session.handle["role"] == "implementer":
-                    seen.append(text)
-                return runtime.MockAdapter.prompt(self, session, text, timeout)
-
-        pol = dict(self.reg["policy"]["limits"],
-                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
-        task = store.Task.create(self.t.repo, "T-004", "# t\n\nAdd subtract API\n", pol)
-        status = Orchestrator(task, self.reg, A(script), lambda k, t: True,
-                              log=lambda *_: None).run()
-        self.assertEqual(status, "done")
-        self.assertGreaterEqual(len(seen), 2, "implementer should have run twice")
-        self.assertIn("reject non-numeric input", seen[-1], "findings not delivered")
-        self.assertIn("task.md#AC-1", seen[-1], "citation not delivered")
-
-    def test_findings_are_cleared_once_the_subtask_is_green(self):
-        script, _ = self._script()
-        _, task, _, _ = self._run(script)
-        self.assertEqual(task.state.get("pending_findings"), [])
 
     def test_declined_gate_parks_instead_of_proceeding(self):
         script, _ = self._script()
@@ -4193,7 +3047,7 @@ class TestEndToEnd(unittest.TestCase):
         is doing exactly what the human asked.
         """
         script, _ = self._script()
-        task = store.Task.create(self.t.repo, "T-042", "# t\n\nAdd a subtract API function\n",
+        task = _task(self.t.repo, "T-042", "# t\n\nAdd a subtract API function\n",
                                  self.reg["policy"]["limits"])
         task.update(gate_note={"kind": "plan", "note": "keep the old endpoint working"})
         orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
@@ -4218,7 +3072,7 @@ class TestEndToEnd(unittest.TestCase):
         """An unqualified yes must not append an empty paragraph to every
         downstream prompt — `_with_note` has to be a no-op, not a formatter."""
         script, _ = self._script()
-        task = store.Task.create(self.t.repo, "T-043", "# t\n\nAdd a subtract API function\n",
+        task = _task(self.t.repo, "T-043", "# t\n\nAdd a subtract API function\n",
                                  self.reg["policy"]["limits"])
         orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                             lambda k, t: True, log=lambda *_: None)
@@ -4256,7 +3110,7 @@ class TestEndToEnd(unittest.TestCase):
         """A task parked at its first gate, via the real park path."""
         from adg.machine import AwaitingApproval
         script, _ = self._script()
-        task = store.Task.create(self.t.repo, task_id,
+        task = _task(self.t.repo, task_id,
                                  "# t\n\nAdd a subtract API function\n",
                                  self.reg["policy"]["limits"])
 
@@ -4342,7 +3196,7 @@ class TestEndToEnd(unittest.TestCase):
         was never shown.
         """
         script, _ = self._script()
-        task = store.Task.create(self.t.repo, "T-060",
+        task = _task(self.t.repo, "T-060",
                                  "# t\n\nAdd a subtract API function\n",
                                  self.reg["policy"]["limits"])
         Orchestrator(task, self.reg, runtime.MockAdapter(script),
@@ -4370,7 +3224,7 @@ class TestEndToEnd(unittest.TestCase):
         """An empty scope means `**` to `scope_violations`. Printing "a hard
         boundary:" with nothing under it reads as unspecified when it means
         unrestricted."""
-        task = store.Task.create(self.t.repo, "T-061", "# t\n\nwhatever\n",
+        task = _task(self.t.repo, "T-061", "# t\n\nwhatever\n",
                                  self.reg["policy"]["limits"])
         text = prompts.compose("implementer", task,
                                subtask={"id": "st-1", "goal": "g", "planned_scope": []})
@@ -4379,14 +3233,12 @@ class TestEndToEnd(unittest.TestCase):
 
     def test_unparseable_plan_parks_rather_than_guessing(self):
         script, _ = self._script()
-        script["planner"] = lambda env, cwd: _spit(
-            os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "no yaml here")
-        status, task, _, _ = self._run(script)
+        status, task, _, _ = self._run(script, plan="no yaml here")
         self.assertEqual(status, "needs_human")
 
     def test_cost_cap_stops_the_run(self):
         script, _ = self._script()
-        task = store.Task.create(
+        task = _task(
             self.t.repo, "T-002", "# t\n\nAdd a subtract API function\n",
             dict(self.reg["policy"]["limits"], max_cost_usd=5))
         b = limits.Budget(task)
@@ -4427,28 +3279,21 @@ class TestWorkflowManifest(unittest.TestCase):
     BASE = """name: t
 protocol: PROTOCOL.md
 stages:
-  intake: {role: intake}
-  classify: {role: classifier}
-  brainstorm:
-    role: planner
-    card: roles/planner.md
+  implement:
+    role: implementer
+    card: roles/worker.md
     discipline:
       skill: superpowers:brainstorming
       text: Borrowed discipline.
       fallback: Do it yourself.
-  plan: {role: planner, card: roles/planner.md}
-  implement: {role: implementer, card: roles/implementer.md}
-  review: {role: reviewer, card: roles/reviewer.md%s}
-  integrate: {role: integrator, card: roles/integrator.md}
+  integrate: {role: integrator, card: roles/integrator.md%s}
 """
 
     def test_the_bundled_default_is_a_valid_manifest(self):
         w = wf.Workflow.load()
-        self.assertEqual(w.order(),
-                         ["intake", "classify", "brainstorm", "plan",
-                          "implement", "review", "integrate"],
+        self.assertEqual(w.order(), ["implement", "integrate"],
                          "the manifest and machine.STAGES disagree on the pipeline")
-        for role in ("planner", "implementer", "reviewer", "integrator", "test-author"):
+        for role in ("implementer", "integrator"):
             self.assertTrue(os.path.exists(w.card(role)),
                             "%s's card is declared but not on disk" % role)
         self.assertTrue(os.path.exists(w.protocol()))
@@ -4458,12 +3303,12 @@ stages:
         both texts inline in `_stage_brainstorm`, so hosting any other design
         discipline meant patching the machine."""
         w = self._manifest(self.BASE % "")
-        self.assertEqual(w.discipline("brainstorm", {"superpowers": True}),
+        self.assertEqual(w.discipline("implement", {"superpowers": True}),
                          "Borrowed discipline.")
-        self.assertEqual(w.discipline("brainstorm", {}), "Do it yourself.")
-        self.assertEqual(w.discipline("brainstorm", {"superpowers": False}),
+        self.assertEqual(w.discipline("implement", {}), "Do it yourself.")
+        self.assertEqual(w.discipline("implement", {"superpowers": False}),
                          "Do it yourself.")
-        self.assertEqual(w.wants_skill("brainstorm"), "superpowers:brainstorming")
+        self.assertEqual(w.wants_skill("implement"), "superpowers:brainstorming")
 
     def test_a_disabled_stage_is_skipped_and_the_run_still_finishes(self):
         self._manifest(self.BASE % ", enabled: false")
@@ -4472,17 +3317,19 @@ stages:
         sh(["git", "add", "-A"], self.t.repo)
         sh(["git", "commit", "-qm", "cfg"], self.t.repo)
         script, _ = TestEndToEnd._script(self)
-        task = store.Task.create(self.t.repo, "T-WF", "# t\n\nAdd a subtract API function\n",
+        task = _task(self.t.repo, "T-WF", "# t\n\nAdd a subtract API function\n",
                                  self.reg["policy"]["limits"])
         logs = []
         status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
                               lambda k, t: True, log=logs.append).run()
         self.assertEqual(status, "done", "\n".join(logs))
-        self.assertTrue(any("review: disabled by workflow" in x for x in logs),
-                        "the skip was silent:\n%s" % "\n".join(logs))
         self.assertFalse([h for h in task.state["delegation_history"]
-                          if h.get("role") == "reviewer"],
+                          if h.get("role") == "integrator"],
                          "a disabled stage still dispatched its agent")
+        # And the observable consequence, which is the point of switching it
+        # off: no merge happened, so there is no patch to apply.
+        self.assertFalse(os.path.exists(task.file("integrate.patch")),
+                         "integrate was disabled and still wrote its output")
 
     def test_a_workflow_with_no_card_for_a_role_omits_the_line(self):
         """A stage whose method is entirely a foreign skill has no card of its
@@ -4494,7 +3341,7 @@ stages:
 """)
         self.assertIsNone(w.card("implementer"))
         self.assertIsNone(w.protocol())
-        task = store.Task.create(self.t.repo, "T-WF2", "# t\n\nx\n",
+        task = _task(self.t.repo, "T-WF2", "# t\n\nx\n",
                                  self.reg["policy"]["limits"])
         text = prompts.compose("implementer", task, subtask={"id": "s", "goal": "g"})
         self.assertNotIn("role card", text)
@@ -4564,24 +3411,6 @@ stages:
         self.assertEqual(w.next_enabled("review"), "done",
                          "an unplaceable stage sent the run backwards")
 
-    def test_skipping_a_disabled_stage_can_still_reach_an_undeclared_one(self):
-        """`enabled()` treats an undeclared stage as on, but `next_enabled`
-        walked the manifest's declared stages alone and so could never route to
-        one — the same two-answers-to-one-question shape. A manifest that
-        disables `review` and never mentions `integrate` skipped straight to
-        `done`, ending the run without the stage that writes the patch."""
-        from adg.machine import STAGES
-        w = self._manifest("""name: partial
-stages:
-  plan: {role: planner, card: roles/planner.md}
-  implement: {role: implementer, card: roles/implementer.md}
-  review: {role: reviewer, card: roles/reviewer.md, enabled: false}
-""")
-        self.assertEqual(w.next_enabled("review"), "done",
-                         "the manifest's own order ends at review")
-        self.assertEqual(w.next_enabled("review", order=STAGES), "integrate",
-                         "the run would end before the stage that lands the work")
-
     def test_a_run_skipping_a_disabled_review_still_reaches_integrate(self):
         """The same property from the machine's side, which is where it is load
         bearing: `machine.run` has to walk STAGES when it skips, or a manifest
@@ -4601,7 +3430,7 @@ stages:
         sh(["git", "add", "-A"], self.t.repo)
         sh(["git", "commit", "-qm", "cfg"], self.t.repo)
         script, _ = TestEndToEnd._script(self)
-        task = store.Task.create(self.t.repo, "T-WFI",
+        task = _task(self.t.repo, "T-WFI",
                                  "# t\n\nAdd a subtract API function\n",
                                  self.reg["policy"]["limits"])
         logs = []
@@ -4698,36 +3527,6 @@ stages:
                                 "status": "complete", "summary": "did it",
                                 "evidence": {"tests": "ok"}})
 
-    def test_the_reviewer_is_sent_to_the_runtimes_schemas_not_the_workflows(self):
-        """The same contract, from the side that names it in a prompt. The
-        review prompt built both schema paths from `prompts.skill_path()`, so
-        under any workflow but the bundled one it sent the reviewer to files
-        that need not exist — and put a second, different absolute path for
-        report.schema.json in the same prompt `compose` had already named
-        correctly. Under the bundled workflow the two are one string, which is
-        why this has to be asserted from a foreign workflow directory.
-        """
-        self._manifest(self.BASE % "")
-        self.assertFalse(os.path.isdir(os.path.join(self.dir, "schemas")),
-                         "the fixture ships schemas, so it proves nothing")
-        _spit(os.path.join(self.t.repo, ".adg.yaml"), 'fast:\n  - "true"\n')
-        task = store.Task.create(self.t.repo, "T-WS", "# t\n\n- **AC-1** — works\n",
-                                 dict(self.reg["policy"]["limits"]))
-        task.update(status="review", classification={"tier": "complex"},
-                    subtasks=[{"id": "st-1-main", "status": "complete",
-                               "actual_files": ["app.py"], "planned_scope": ["**"]}])
-        orch = Orchestrator(task, self.reg, runtime.MockAdapter(),
-                            lambda k, t: True, log=lambda *_: None)
-        with self.assertRaises(Halt):
-            orch._stage_review()          # no verdict from the mock
-        text = "".join(_slurp(task.file("agent-logs", n))
-                       for n in os.listdir(task.file("agent-logs"))
-                       if n.startswith("reviewer-"))
-        self.assertIn(os.path.join(schema.schemas_dir(), "report.schema.json"), text)
-        self.assertNotIn(os.path.join(self.dir, "schemas"), text,
-                         "the reviewer was sent to a schemas directory this "
-                         "workflow does not have")
-
     def test_a_design_report_is_a_legal_report(self):
         """`_stage_brainstorm` dispatches a planner and `compose` tells it to
         write a report, but `brainstorm` was not in the stage enum — so a design
@@ -4736,16 +3535,6 @@ stages:
                                 "status": "complete", "summary": "designed it",
                                 "evidence": {"not_verified": ["nothing is built yet"]}})
 
-    def test_a_finding_against_st_11_does_not_reopen_st_1(self):
-        """`"st-1" in "st-11"` is true, so a finding against one subtask sent a
-        different, already-green one back to be rebuilt."""
-        owns = Orchestrator._owned_by
-        self.assertFalse(owns("st-11", "st-1"))
-        self.assertTrue(owns("st-1", "st-1"))
-        # both forms the schema documents ("e.g. impl:st-2")
-        self.assertTrue(owns("impl:st-2", "st-2"))
-        self.assertFalse(owns("impl:st-2", "st-2x"))
-        self.assertFalse(owns("", "st-1"))
 
 
 if __name__ == "__main__":
