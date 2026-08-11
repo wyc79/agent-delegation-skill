@@ -114,6 +114,9 @@ class Orchestrator:
         # one line per call for the whole run; the fault is a property of the
         # file, not of the call that noticed it.
         self._warned_writes = set()
+        # The agent session currently in flight, so a failure between starting
+        # one and handing it back can still tear it down. See `_invoke`.
+        self._session = None
         self.budget = lim.Budget(task)
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
@@ -493,6 +496,21 @@ admits only one sensible reading.
         self.log("  %s: worktree brought up to %s" % (sub["id"], branch))
 
     def _one_subtask(self, sub, base):
+        try:
+            return self._one_subtask_inner(sub, base)
+        finally:
+            # Every exit, not just the two that used to remember. A `blocked`
+            # report, the changed-no-files guard, a LimitBreach out of the
+            # budget, a crash inside `verify` -- each of them raised straight
+            # past the teardown and left an agent running with nothing holding
+            # its handle. Under the herdr adapter that is a visible orphaned
+            # pane; under any adapter it is a process outliving the run.
+            # Idempotent: the paths that close early null the handle, so this
+            # is a no-op for them rather than a second teardown.
+            self._close(self._session)
+            self._session = None
+
+    def _one_subtask_inner(self, sub, base):
         role_choice = self._pick_worker(sub)
         # All per-subtask state stays local: this method runs concurrently in a
         # wave, and anything on self is shared with the siblings.
@@ -528,6 +546,7 @@ admits only one sensible reading.
                 # A wrapper that runs its own ladder is competing with the
                 # skill that called it, and doing it with less context.
                 self._close(session)
+                self._session = session = None
                 raise Halt("needs_human", self._escalated(sub, report))
             if result.ok and not sub.get("actual_files") and not self._touched(base, sub):
                 # Only for a subtask that has never produced anything. Now that
@@ -544,6 +563,7 @@ admits only one sensible reading.
                            % sub["id"])
             if result.ok:
                 self._close(session)
+                self._session = session = None
                 self._checkpoint(base, ("adg %s: %s" % (sub["id"], sub.get("goal", "")))[:72])
                 break
             # Retried on the same seat, with what broke. Bounded by
@@ -1386,7 +1406,16 @@ admits only one sensible reading.
 
     def _run_once(self, role, choice, cwd, **kw):
         """Invoke, close, and return the report. For roles that get one turn."""
-        session, report, _ = self._invoke(role, choice, cwd, **kw)
+        try:
+            session, report, _ = self._invoke(role, choice, cwd, **kw)
+        finally:
+            # The integrator reaches this. `_invoke` tears down what it started
+            # when it raises, but a one-turn role has no retry loop to fall back
+            # into, so anything raised between the turn returning and the close
+            # below -- a report that will not validate, most likely -- would
+            # otherwise strand the agent.
+            self._close(self._session)
+            self._session = None
         self._close(session)
         return report
 
@@ -1400,6 +1429,22 @@ admits only one sensible reading.
         if self.dry_run:
             self.log("  [dry-run] would run %s as %s" % (choice.model, role))
             return None, None, choice
+        try:
+            return self._invoke_inner(role, choice, cwd, subtask, extra,
+                                      session, failure)
+        except BaseException:
+            # An agent process must not outlive the call that started it. This
+            # method creates sessions locally and only hands one back on the
+            # way out, so anything raised in between -- a report that will not
+            # parse, a limit breach, a KeyboardInterrupt -- left a live process
+            # nobody had a handle to. `self._session` is where the current one
+            # is parked so this handler can find it.
+            self._close(self._session)
+            self._session = None
+            raise
+
+    def _invoke_inner(self, role, choice, cwd, subtask=None, extra=None,
+                      session=None, failure=None):
         cooled, base_extra = [], extra
         while True:
             # Snapshot the reports directory: on a rework loop the previous
@@ -1411,8 +1456,8 @@ admits only one sensible reading.
                 text = prompts.compose(role, self.task, subtask=subtask,
                                        extra=extra,
                                        verify_cfg=self.vcfg)
-                session = self.adapter.start_agent(role, choice.agent_kind, cwd,
-                                                   prompts.env_for(self.task, role))
+                session = self._session = self.adapter.start_agent(
+                    role, choice.agent_kind, cwd, prompts.env_for(self.task, role))
                 res = self.adapter.prompt(session, text, timeout=3600)
             else:
                 text = prompts.retry(failure)
@@ -1505,6 +1550,9 @@ admits only one sensible reading.
         # Returned, never stashed on self: wave threads share this object, and
         # a sibling overwriting the attribute is how an escalation gets read as
         # a success.
+        # `self._session` deliberately still points at it. The caller holds the
+        # session too, but only this handle survives the caller raising before
+        # it gets to close -- which is most of the ways `_one_subtask` can end.
         return session, report, choice
 
     def _replacement(self, role, choice, cooled):
