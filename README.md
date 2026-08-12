@@ -422,7 +422,7 @@ Green suites, from a clone of this repo:
 
 ```bash
 python3 orchestrator/tests/test_orchestrator.py  # 198 tests, no tokens spent
-python3 orchestrator/tests/test_failover.py      # 101 more, same
+python3 orchestrator/tests/test_failover.py      # 107 more, same
 ```
 
 They drive the real state machine over a real git repository with a scripted

@@ -8,6 +8,7 @@ Run: python3 orchestrator/tests/test_failover.py
 
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -94,6 +95,120 @@ class TestClassification(unittest.TestCase):
         # A provider nobody wrote a table for must not inherit claude's.
         kind, _ = quota.classify("nobody-ships-this", blocked("usage limit reached"), T0)
         self.assertEqual(kind, "other")
+
+
+CORPUS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "fixtures", "provider-messages.json"),
+                        encoding="utf-8"))
+
+
+class TestProviderMessageCorpus(unittest.TestCase):
+    """Detection, driven from `fixtures/provider-messages.json`.
+
+    Through `runtime._result` rather than `quota.classify` directly, because the
+    thing that decides a run's fate is the whole path: which stream the text
+    arrived on, whether the CLI wrapped it in an envelope, and only then the
+    pattern table. `PROVIDER_SHAPES` above builds a result dict by hand and so
+    cannot see any of that -- it was green while an agent's own summary of the
+    retry handler it had just written was being read as its provider refusing.
+
+    Adding a provider message is a data edit, which is the same trade
+    `quota.PATTERNS` makes one file over.
+    """
+
+    # `{T0+N}` in a corpus message becomes an absolute epoch here. Writing one
+    # into the JSON would pin the file to whatever this suite's fixed clock
+    # happens to be, and a reset stamp is only meaningful relative to `now`.
+    _STAMP = re.compile(r"\{T0\+(\d+)\}")
+
+    @classmethod
+    def _run(cls, case):
+        kind, via = case["kind"], case["via"]
+        text = cls._STAMP.sub(lambda m: str(int(T0 + int(m.group(1)))), case["text"])
+        if via == "stderr":
+            return runtime._result("", text, 1, kind=kind, now=T0)
+        if via == "stdout":
+            return runtime._result(text, "", 1, kind=kind, now=T0)
+        if via == "result":
+            # The shape a JSON CLI actually returns: the agent's prose inside an
+            # envelope, nothing on stderr, non-zero exit for some unrelated
+            # reason. The provider said nothing at all here.
+            return runtime._result(json.dumps({"result": text}), "", 1,
+                                   kind=kind, now=T0)
+        if via == "error_code":
+            return runtime._result("", "", 1, kind=kind, now=T0, error_code=text)
+        raise AssertionError("unknown via %r" % via)
+
+    def _cases(self):
+        return [c for c in CORPUS["cases"] if "_class" not in c]
+
+    def test_every_case_classifies_as_the_corpus_says(self):
+        for case in self._cases():
+            with self.subTest(kind=case["kind"], via=case["via"],
+                              text=case["text"][:48]):
+                res = self._run(case)
+                self.assertEqual(res["failure"], case["expect"], case.get("note", ""))
+
+    def test_every_case_carries_the_reopen_time_the_corpus_says(self):
+        for case in self._cases():
+            want = case["reset"]
+            with self.subTest(text=case["text"][:48]):
+                got = self._run(case)["reset_at"]
+                if want is None:
+                    self.assertIsNone(got)
+                elif want == "some":
+                    self.assertIsNotNone(got)
+                else:
+                    self.assertEqual(got, T0 + want)
+
+    def test_an_agents_own_words_are_never_the_provider_speaking(self):
+        """The corpus's reason for existing, asserted on its own.
+
+        A job whose work IS rate limiting -- write the retry handler, review the
+        limiter, grep for the error constant -- puts every string in
+        `quota.PATTERNS` into its own transcript. Read as a provider refusal
+        that does not cost an attempt, it opens a five-hour breaker on a healthy
+        seat, machine-wide. Every `via: result` case is one of those.
+        """
+        prose = [c for c in self._cases() if c["via"] == "result"]
+        self.assertTrue(prose, "the corpus lost its agent-prose cases")
+        for case in prose:
+            with self.subTest(text=case["text"][:48]):
+                self.assertEqual(self._run(case)["failure"], "other")
+
+    def test_a_refusal_on_stderr_still_wins_over_a_clean_envelope(self):
+        """The other side of that split, and the thing it must not break: the
+        envelope is not a licence to ignore stderr. A CLI can hand back a
+        partial result AND report the wall it hit."""
+        res = runtime._result('{"result": "partial work, all fine"}',
+                              "HTTP 429 rate limit", 1, kind="claude", now=T0)
+        self.assertEqual(res["failure"], "quota_exhausted")
+
+    def test_an_error_envelope_is_still_read(self):
+        """`error`/`subtype` are the provider talking, not the agent, so they
+        stay in scope when `result` is dropped."""
+        res = runtime._result(
+            json.dumps({"result": "I stopped early.", "is_error": True,
+                        "subtype": "usage limit reached"}),
+            "", 1, kind="claude", now=T0)
+        self.assertEqual(res["failure"], "quota_exhausted")
+
+    KNOWN_WRONG = 3
+
+    def test_the_corpus_pins_how_many_cases_detection_still_gets_wrong(self):
+        """Pinned so the number cannot drift in either direction unnoticed.
+
+        Both survivors are plain-text CLIs, where the whole stream is the
+        agent's transcript and there is no envelope to separate its words from
+        the provider's. Fixing one should fail this test -- move the case and
+        drop the count.
+        """
+        wrong = [c for c in self._cases() if c.get("wrong")]
+        self.assertEqual(len(wrong), self.KNOWN_WRONG)
+        for c in wrong:
+            self.assertIn(c["via"], ("stdout",),
+                          "a JSON-envelope case is fixable and should not be "
+                          "carried as known-wrong")
 
 
 class TestResetParsing(unittest.TestCase):

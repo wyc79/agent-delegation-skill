@@ -38,6 +38,29 @@ def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
         data = json.loads(stdout or "")
     except ValueError:
         data = None
+    # What the QUOTA CLASSIFIER is allowed to read, which is not the same as
+    # what the log keeps. Everything except the agent's own `result` prose.
+    #
+    # An agent whose job is a retry handler writes "429" and "rate_limit" in its
+    # summary; one reviewing a limiter quotes "quota exceeded"; one grepping for
+    # RESOURCE_EXHAUSTED prints the matches. Classifying the whole transcript
+    # read those as the PROVIDER refusing, and a `quota_exhausted` verdict does
+    # not merely lose an attempt -- it opens a five-hour breaker on a healthy
+    # seat, machine-wide, across every repository. Five of six such transcripts
+    # were misread before this split.
+    #
+    # The envelope's other fields stay in scope on purpose: `error`, `subtype`,
+    # `is_error` and stderr are where a CLI reports a refusal, and a message
+    # that arrives there is the provider talking. Only `result`/`output` are
+    # definitionally the agent's own words.
+    #
+    # Plain-text CLIs (no parseable envelope) keep the whole stream, because
+    # there is nothing to separate the two with. `fixtures/provider-messages.json`
+    # carries that remaining exposure as cases marked `wrong`.
+    probe = raw
+    if isinstance(data, dict):
+        rest = {k: v for k, v in data.items() if k not in ("result", "output")}
+        probe = json.dumps(rest) + "\n" + (stderr or "")
     usage, elapsed_ms, turns = None, None, None
     if isinstance(data, dict):
         text = data.get("result") or data.get("output") or raw
@@ -66,7 +89,7 @@ def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
     res = {"settled": "idle" if code == 0 else "blocked",
            "output": text, "code": code, "cost_usd": cost, "usage": usage,
            "elapsed_ms": elapsed_ms, "turns": turns, "error_code": error_code}
-    return classify(res, kind, now, raw)
+    return classify(res, kind, now, probe)
 
 
 def classify(res, kind, now=None, text=None):
