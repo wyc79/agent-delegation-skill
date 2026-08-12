@@ -23,6 +23,7 @@ diffed against reference images, 31 points, pass only at 31/31.
 | **E2** | B, with a quota wall injected mid-job on a two-seat band | yes | 2 |
 | **F** | B's jobs, run through delegate with Claude as the only seat | yes | **1** |
 | **O** ✦ | D's jobs, run by a session following the skill instead of a script | no | 1 |
+| **P** ✦ | O, with the briefs pre-written to files so batching is trivial | no | 1 |
 
 ✦ ran 2026-08-12, a day after the rest; see *What O settles*.
 
@@ -205,6 +206,54 @@ Two behaviours worth recording, because they are what the arm was really for:
 The pair of them is the useful signal: the step that shipped as a runnable
 command was copied; the step that shipped as an instruction was not.
 
+### P: the batching rule was wrong about its own cost
+
+If instructions do not propagate and commands do, the obvious repair for the
+dispatch step is to give it an artifact. **P is O with one variable changed** —
+identical tree (`994b39c6`), identical `jobs.md`, identical brief — where
+`one-seat.md` step 2 asked for each brief to be written to `../briefs/<id>.md`
+first, so that every dispatch is three uniform lines pointing at a file and
+batching them is trivial.
+
+It worked on its own terms and still lost. Dispatch prompts fell from
+2,558–3,683 chars to 442–454. The stagger fell from 36s to 6s. **And the
+dispatches still went out one per message** — the third run in a row, now
+including one designed to make batching effortless.
+
+| | N | O | P |
+|---|---|---|---|
+| dispatches / messages | 3 / 3 | 4 / 4 | 4 / 4 |
+| stagger | 68s | 36s | **6s** |
+| dispatcher overhead | — | 160s | **197s** |
+| Score | 31/31 | 31/31 | 31/31 |
+| Wall clock | 14.2 min | 8.3 min | 6.6 min |
+| Cost | $5.76 | $3.44 | $3.27 |
+
+Wall clock is again not the story — P's clip agent ran 197s where O's ran 313s,
+which is most of the gap. Summed agent time: P 461s, O 509s, D 495s.
+
+**Writing the briefs cost 77s during which no agent was running.** Composing a
+prompt *between* dispatches, as O did, overlaps with agents already working.
+Moving it earlier converts overlapped time into serial time — 19s of stagger
+bought for 77s of dead air. The step was reverted.
+
+What the three runs do settle is what the batching rule was ever worth. Every
+run ended exactly when its longest job ended, and that job was dispatched third
+in all three:
+
+| | slowest job | sent | stagger cost |
+|---|---|---|---|
+| N | clip, 151s | 3rd, 69s in | 69s |
+| O | clip, 313s | 3rd, 23s in | 23s |
+| P | clip, 197s | 3rd, 4s in | 4s |
+
+The cost was never the message count — it is **how late the critical-path job
+goes out**, and it is zero if that job goes first. `one-seat.md` step 2 now asks
+for the longest job first and treats batching as a preference. Three attempts to
+make an agent batch its dispatches failed; the ordering rule needs no compliance
+at all, because getting it right costs nothing and the run is bounded by that one
+job either way.
+
 ## What E settles — and it is the only thing no other arm can do
 
 **E2: a provider went down mid-job, twice, and the run finished at 31/31.**
@@ -302,8 +351,10 @@ arm here paid for producing its own decomposition.
   "assistant"` alone reads a subagent's writes and commits as the dispatcher's
   own, which inverts the conclusion. Two claims in `one-seat.md` were published
   from that mistake and had to be withdrawn.
-- `arm-o-results.json` — arm O's record: per-job times against D's, the
-  dispatcher overhead breakdown, and the dispatch pattern.
+- `arm-o-results.json`, `arm-p-results.json` — O's record (per-job times against
+  D's, the dispatcher overhead breakdown, the dispatch pattern) and P's, which
+  includes the rejected hypothesis and why it lost. A negative result is kept
+  here because the step it tested is one somebody will propose again.
 
 The per-run task state, patches and briefs are not committed: they are large,
 specific to one machine's paths, and nothing in the repository reads them.

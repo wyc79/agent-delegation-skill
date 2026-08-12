@@ -26,21 +26,35 @@ silent until something breaks. The warning is about the shared tree, not about
 parallelism.
 
 Give each agent its own git worktree and the premise is gone. There is no shared
-checkout to conflict in; the only place two jobs can disagree is at merge, and
-disjoint write scopes make that mechanical. So this composes two superpowers
-skills that are documented separately and warned against jointly:
-`using-git-worktrees` for the isolation, `dispatching-parallel-agents` for the
-fan-out.
+checkout to conflict in. So this composes two superpowers skills that are
+documented separately and warned against jointly: `using-git-worktrees` for the
+isolation, `dispatching-parallel-agents` for the fan-out.
 
 **The rule that replaces the warning:** two jobs may run at once only if their
 write scopes do not overlap. Overlapping scopes go back to being sequential, and
 SDD's advice applies again unchanged.
 
-That rule is the one thing here worth checking mechanically rather than
-believing, so it appears twice below as a command — once before you dispatch and
-once before you merge. Overlap is the failure this pattern cannot absorb: two
-agents writing one file surface it at merge with both sides already written, and
-the run that produced it looks fine the whole way through.
+**The worktree does not make that rule redundant** — it is why the rule is
+needed. Isolation does not remove a collision, it *defers* one:
+
+| | prevents |
+|---|---|
+| a worktree per agent | two agents writing one file **at the same time** |
+| disjoint write scopes | their two unreviewed edits being **reconciled at merge** by a tool that cannot read |
+
+If two branches both changed `alpha.c`, git does a three-way merge. Where the
+edits overlap textually you get a conflict — loud, and an agent can resolve it.
+Where they do not, git merges them **clean**, having no opinion about meaning:
+two independently invented helpers for one job, a call written against a
+signature the other branch just changed, two coherent rewrites of one invariant
+that are incoherent together. It builds. Often it passes. Nothing reports
+anything, so nothing gets invoked to fix it — which is why "another agent can
+resolve the conflict" does not cover this case. There is no conflict.
+
+Deferred is also worse than immediate, in one specific way: by the time it
+surfaces both sides are fully written, so you have paid for both and can drop
+neither cheaply. That is what the two commands below are for — one before you
+spend anything, one before you merge.
 
 ## The pattern
 
@@ -66,38 +80,44 @@ while read -r job _; do git worktree add "../wt/$job" -b "$job" "$base"; done < 
 If that prints `OVERLAP`, you do not have N parallel jobs — you have fewer. Merge
 the colliding ones into a single job or run them in sequence.
 
-**2. Write every prompt out first. Then send them all in one message**, so they
-run concurrently. Each gets its own goal, its write scope, and the frozen
-contracts — nothing else. No plan file, no session history, no summary of what
-its siblings are doing.
+**2. Dispatch the longest job first, and send the rest without stopping to read
+anything.** Each gets its own goal, its write scope, and the frozen contracts —
+nothing else. No plan file, no session history, no summary of what its siblings
+are doing. All in one message if you can manage it, but the order matters more
+than the batching, and that part is measured:
 
-Do it in that order deliberately, because the obvious order fails:
-
-> **Measured twice, and both times the agent did it the other way.** One had
-> read this file four tool calls earlier and sent three dispatches in three
-> separate messages. The second read this file *with this warning already in
-> it*, and sent four in four. Right worktrees, right scopes, right contracts,
-> one per message, both times.
+> **Three runs, three times one dispatch per message.** One had read this file
+> four tool calls earlier. One read it with a warning about this exact mistake
+> already in it. In the third the prompts were pre-written to files specifically
+> so that batching would be trivial — and it still sent them one at a time. Take
+> it as given that you will too.
 >
-> Both got away with it. In that harness a dispatch returns immediately and its
-> agent runs in the background, so the jobs overlapped regardless: the stagger
-> cost 68s of a 219s parallel phase in the first run and 23s of 336s in the
-> second. Only the first was slow enough to matter — one agent **finished**
-> before the third was sent, holding peak concurrency at two of three.
+> Which is survivable, because the number of messages is not what costs. Every
+> one of those runs ended exactly when its longest job ended, and the longest job
+> went out **third** every time:
 >
-> Do not read that as permission. It survives on one property, which neither
-> dispatcher set out to preserve: **neither waited on a result before sending
-> the next.** Protect that and the rest is a rounding error. Break it — a
-> harness where dispatch blocks until the agent returns, or a habit of reading
-> the first result before composing the second — and the same shape serializes
-> completely, having paid the entire setup cost of isolation for none of the
-> speed.
+> | | slowest job | sent | stagger cost |
+> |---|---|---|---|
+> | run 1 | clip, 151s | 3rd, 69s in | **69s** |
+> | run 2 | clip, 313s | 3rd, 23s in | **23s** |
+> | run 3 | clip, 197s | 3rd, 4s in | **4s** |
 >
-> Drafting all N prompts before sending any is what makes that impossible to get
-> wrong, which is why this is written as an order of operations rather than a
-> rule to remember: composing a prompt and sending it is one motion, and N jobs
-> is that motion N times. If you do end up sending them one at a time anyway,
-> **send them back to back and read nothing in between.**
+> The whole cost is **how late the critical-path job went out.** Send it first
+> and there is nothing left to save — the others finish inside its shadow whether
+> you batched them or not. You almost always know which one it is: it is the job
+> you would have marked `t3`, the one with the subtlety in it.
+>
+> Pre-writing the prompts to files was tried, as run 3, and does not pay. The
+> stagger did fall to 4s — but writing them cost 77 seconds during which no agent
+> existed yet, where composing a prompt *between* dispatches overlaps with agents
+> already running. It bought 19 seconds for 77.
+>
+> One thing does still matter independently of order: **never wait on a result
+> before sending the next dispatch.** All three runs held that without trying,
+> which is the only reason one-per-message stayed cheap. A harness where dispatch
+> blocks until its agent returns, or a habit of reading the first result before
+> composing the second, serializes the whole thing — and then you have paid the
+> entire setup cost of isolation for none of the speed.
 
 ```text
 You are implementing one file of <the thing>. Other agents are implementing

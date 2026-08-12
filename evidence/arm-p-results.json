@@ -1,0 +1,65 @@
+{
+  "arm": "P",
+  "date": "2026-08-12",
+  "what": "O with one variable changed: one-seat.md step 2 asked for each brief to be written to ../briefs/<id>.md before dispatching, so the dispatch itself is three uniform lines and batching is trivial. Same tree (994b39c6), same jobs.md, same brief as O.",
+  "hypothesis": "if runnable artifacts propagate where instructions do not, making the dispatch a lookup rather than an authoring act should produce batching",
+  "verdict": "rejected, and the step was reverted",
+  "score": "31/31",
+  "wall_clock_s": 398,
+  "cost_usd": 3.27,
+  "dispatch_pattern": {
+    "messages": 4,
+    "dispatches_per_message": 1,
+    "stagger_s": 6,
+    "peak_concurrency": "4 of 4",
+    "cost_of_stagger_s": 4,
+    "prompt_chars": [
+      454,
+      442,
+      443,
+      454
+    ],
+    "o_prompt_chars": [
+      2558,
+      3245,
+      3683,
+      3520
+    ]
+  },
+  "why_it_lost": "writing the four briefs cost 77s with no agent running. Composing a prompt between dispatches (as O did) overlaps with agents already working, so moving it earlier turns overlapped time into serial time: 19s of stagger bought for 77s of dead air.",
+  "dispatcher_overhead_s": {
+    "orientation_scopes_worktrees": 59,
+    "writing_briefs": 77,
+    "audit_merge_grade": 61,
+    "total": 197,
+    "O_total": 160
+  },
+  "jobs": [
+    {
+      "id": "st-1-buffers",
+      "ran_s": 60,
+      "sent_offset_s": 0
+    },
+    {
+      "id": "st-2-render",
+      "ran_s": 85,
+      "sent_offset_s": 2
+    },
+    {
+      "id": "st-3-clip",
+      "ran_s": 197,
+      "sent_offset_s": 4
+    },
+    {
+      "id": "st-4-raster",
+      "ran_s": 119,
+      "sent_offset_s": 6
+    }
+  ],
+  "summed_agent_time_s": {
+    "P": 461,
+    "O": 509,
+    "D": 495
+  },
+  "what_it_settled": "across N, O and P the makespan equalled the slowest job plus how late that job was dispatched (69s, 23s, 4s) -- clip was third out of the door every time. The batching rule was chasing the wrong variable; step 2 now asks for the longest job first."
+}
