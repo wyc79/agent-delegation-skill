@@ -142,6 +142,16 @@ def main():
 
     answer, calls, cost = ask(repo, TASK.format(skills=skills, delegate=DELEGATE))
     joined = "\n".join(calls)
+    # Persisted, because a run that costs money and prints to a terminal is a
+    # run nobody can cite afterwards. Two earlier runs of this test produced
+    # findings that went straight into the skill -- a size gate it was missing,
+    # and a toothless check in this fixture -- and both had to be recovered
+    # from scrollback.
+    record = os.path.join(REPO_ROOT, "evidence", "skill-behaviour-latest.json")
+    with open(record, "w", encoding="utf-8") as fh:
+        json.dump({"cost_usd": cost, "tool_calls": calls, "answer": answer},
+                  fh, indent=2)
+    print("recorded: %s" % record)
     print("cost $%.3f, %d tool calls\n%s\n%s\n%s\n"
           % (cost or 0, len(calls), "=" * 66, answer, "=" * 66))
 
