@@ -89,15 +89,28 @@ Match them exactly; changing one breaks work you cannot inspect:
 Verify with `<your check>` before you finish. Commit when it is green.
 ```
 
-**3. Merge one at a time, checking after each**, so a break surfaces against the
-smallest diff:
+**3. Check each branch actually has a commit, then merge one at a time,
+checking after each**, so a break surfaces against the smallest diff:
 
 ```bash
 git checkout -b integration "$base"
 for job in st-1-alpha st-2-beta st-3-gamma; do
+  [ "$(git rev-list --count "$base..$job")" -gt 0 ] || { echo "EMPTY: $job"; break; }
   git merge --no-edit "$job" && <your check> || break
 done
 ```
+
+That first line is not ceremony. Measured: of three agents told in their prompt
+to commit — with the exact `git add … && git commit -m …` line written out for
+them — **one finished, reported success, and left the work uncommitted.** The
+dispatcher happened to run `git status` in that worktree and committed on its
+behalf.
+
+Had it not, the merge would have **succeeded**, because merging a branch with
+no commits is a clean no-op. The stub still compiles, so the build check passes
+too. You would have got a green integration and a missing feature, with nothing
+anywhere reporting a problem. Never take "done" from an agent as evidence a
+commit exists — the branch is the evidence.
 
 ## The frozen contracts are the whole thing
 
