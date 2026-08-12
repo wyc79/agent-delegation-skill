@@ -3,8 +3,9 @@
 Same task, same starting tree and same grader as an earlier round that recorded
 arms **A** (the retired role protocol) and **C** (one warm Claude session). Their
 figures are quoted here; the raw records for those two are not in this
-repository. This round adds **B**, **D**, **E** and **F**. Course code is not reproduced here; only what
-each arm cost and scored.
+repository. This round adds **B**, **D**, **E** and **F**, then **O** and **P** a
+day later, and **K**, which is the one arm that leaves this task entirely. Course
+code is not reproduced here; only what each arm cost and scored.
 
 **Task.** Implement four stages of a software rasterizer (`initialize_render`,
 `render`, `clip_triangle`, `rasterize_triangle`), pre-split one stage per file
@@ -24,8 +25,13 @@ diffed against reference images, 31 points, pass only at 31/31.
 | **F** | B's jobs, run through delegate with Claude as the only seat | yes | **1** |
 | **O** ✦ | D's jobs, run by a session following the skill instead of a script | no | 1 |
 | **P** ✦ | O, with the briefs pre-written to files so batching is trivial | no | 1 |
+| **K** ◆ | **a different task entirely**: a foreign package's five review passes | yes | 2 |
 
 ✦ ran 2026-08-12, a day after the rest; see *What O settles*.
+◆ not the rasterizer, and the only arm here that is not. Its figures below are
+transcribed from the run; unlike D, O and P it has no `arm-k-results.json` in
+this directory, so treat every number in *What K settles* as reported rather
+than re-derivable.
 
 **F is D's twin, and the pair is the cleanest measurement here.** Same provider,
 same model, same four jobs, same frozen contracts — the only difference is
@@ -305,6 +311,76 @@ weaker model gets wrong, and it is why arm C needed a second pass. E1 only
 implemented `clip.cpp`, so it scores 0/31 by construction and gives no quality
 signal either way.
 
+## What K settles — that any of this generalises (2026-08-11)
+
+Every arm above is the same task. Four stages of one rasterizer, pre-split one
+per file, on a decomposition this project wrote, graded by one script. That is a
+workload chosen to be friendly to parallel decomposition, and the caveats below
+say so. **A pipeline measured only against the workload it was designed for has
+not been shown to work; it has been shown not to have been broken yet.**
+
+K is the arm that leaves it. It dispatched **code-winnow's** five judgment
+passes — a package this repository does not own, whose plan its author wrote,
+against a diff rather than a spec. Two waves, five agents, both providers, every
+check green, **$7.18** of a $15 cap, stopping at the merge gate as attended mode
+should.
+
+It differs from every other arm on the axes that could plausibly have been
+load-bearing:
+
+| | B / D / F / O / P | K |
+|---|---|---|
+| the work | write four files | read one diff five ways |
+| disjointness comes from | each job owns a file | each job owns its findings file |
+| who wrote the plan | this project | the foreign package's author |
+| job ids | `st-<n>-<name>` | five names with no numbers |
+| what "done" means | a grader scores 31 points | five findings files exist |
+
+Three things held that were not designed for this shape:
+
+**Scope accounting survived the inversion.** The rule is "disjoint write scopes
+buy parallelism", and it was built for N writers of N files. Here all five jobs
+*read* the same diff and are disjoint only in what they write. **Zero scope
+violations** — the accounting held for a reason it was not designed around,
+which is the useful kind of result because nobody arranged it.
+
+**The tier bands needed no translation.** code-winnow ships its own guidance —
+*keep the supervisor passes at your tier, tier down the volume passes* — and it
+mapped onto `tier:` verbatim, by copying a sentence. The two supervisor passes
+drew `opus-class-strong` on the Claude seat; the volume passes ran `fast-cheap`
+and `balanced-coder` on the other provider, concurrently.
+
+| | cost |
+|---|---|
+| two supervisor passes (`t3`) | **$6.69** |
+| two volume passes (tiered down) | **$0.13** |
+| total, five passes | **$7.18** |
+
+That is a ~51× spread between the bands, bought by a caller who never read this
+repository's routing code. The fifth pass is the $0.36 remainder and its share
+was not recorded separately — an arithmetic gap in the record, noted rather than
+assigned.
+
+**The bands bought what the caller was promising itself.** Output tracked them:
+the two `t3` passes wrote 11–12 KB of findings each, the tiered-down passes
+about 1 KB, **107 `file:line` citations** between them. One `t3` pass did not
+read statically at all — it built an instrumented copy of the tree with branch
+counters, ran all 26 grading scenes through it, and reported measured counts.
+That is a pass doing work the cheap band could not have done, on the band its
+own author said to put it on.
+
+**What it cost to find out.** Building K's plan is what exposed the job id
+pattern accepting only `st-<number>-`, which fitted this repository's first task
+and nothing else. Five named review passes have no numbers to give. That is the
+characteristic finding of a generalisation arm: not that the pipeline was wrong,
+but that a constraint nobody had questioned was a fossil of the first workload.
+
+**What K does not settle.** It is one run, on one foreign package, by an author
+who knows both codebases. It says the shape survives contact with a workload it
+was not designed for; it does not say the shape is general. And it produced no
+score — five findings files are not 31/31, so K carries no correctness signal at
+all, only that the pipeline placed the work and the accounting held.
+
 ## Conclusion
 
 **Do not reach for delegate to be cheaper or faster.** On one provider it costs
@@ -314,6 +390,12 @@ about 1.5x a script that does the same thing with none of the machinery.
 survives a provider failing mid-job, and it survived two without losing a
 point. That is a capability, not an optimisation, and nothing in A, C or D has
 an answer to it.
+
+**And it is not confined to the task it was built on.** K placed a foreign
+package's review passes — a workload that inverts the disjointness premise and
+was planned by somebody else — with zero scope violations and its tier bands
+mapped over verbatim. One run, no correctness signal, and the strongest evidence
+here that the pipeline is a pipeline rather than a fixture.
 
 The honest form of the pitch is the one the skill already makes to callers:
 run `delegate init`, and if every tier resolves to one provider, do not
@@ -351,7 +433,8 @@ which is why B's cost above is a recomputation rather than a measurement and is
 marked as one. Figures for D and F are unaffected -- their costs are billed by the
 provider, not derived. n=1 per arm. No arm hit a *real* quota wall — E's was
 injected. The task is unusually favourable to parallel
-decomposition (four pre-split files, disjoint by construction). And B's
+decomposition (four pre-split files, disjoint by construction) — **K is the only
+arm that is not this task**, and it is one run. And B's
 `jobs.md` is downstream of arm A's $2.93 planner: the frozen contracts I handed
 the four agents, including the FI-7 subtlety, were written by that planner. No
 arm here paid for producing its own decomposition, except N, which paid ~$2.32
@@ -377,10 +460,24 @@ and ~5.9 min for it.
   "assistant"` alone reads a subagent's writes and commits as the dispatcher's
   own, which inverts the conclusion. Two claims in `one-seat.md` were published
   from that mistake and had to be withdrawn.
-- `arm-o-results.json`, `arm-p-results.json` — O's record (per-job times against
-  D's, the dispatcher overhead breakdown, the dispatch pattern) and P's, which
-  includes the rejected hypothesis and why it lost. A negative result is kept
-  here because the step it tested is one somebody will propose again.
+- `arm-d-results.json`, `arm-o-results.json`, `arm-p-results.json` — D's record,
+  O's (per-job times against D's, the dispatcher overhead breakdown, the dispatch
+  pattern) and P's, which includes the rejected hypothesis and why it lost. A
+  negative result is kept here because the step it tested is one somebody will
+  propose again.
+- `skill-behaviour-latest.json` — the output of `tests/test_skill_behaviour.py`,
+  the one suite that launches a real agent CLI and costs money.
+
+**Arm K has no file here**, which is the weakest link in this document: the arm
+carrying the generalisation claim is the one you cannot re-derive. Its figures
+in *What K settles* are transcribed from the run, and the artifacts live with
+the code-winnow work rather than in this repository. Anyone leaning on K should
+know they are trusting a transcription.
+
+`arm-j-results.json` is the raw record of a run no longer written up. It
+measured an agent handed the dispatch skill with no planning step, which is not
+a flow these documents describe; the file is kept because deleting a
+measurement is not something to do casually.
 
 The per-run task state, patches and briefs are not committed: they are large,
 specific to one machine's paths, and nothing in the repository reads them.

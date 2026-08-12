@@ -399,23 +399,13 @@ judgement:
   queueing on one provider's quota.
 
   **That direction has been run, and it works.** Winnow's five judgment passes
-  (S, A, B, D, E) went out as one plan: two waves, five agents, both providers,
-  every check green, $7.18 of a $15 cap, stopping at the merge gate as attended
-  mode should. Tiers came from winnow's own band guidance verbatim — *keep S and
-  E at your own tier, tier down the volume passes* — so S and E drew
-  `opus-class-strong` on the Claude seat while A, B and D ran `fast-cheap` and
-  `balanced-coder` on the other provider, concurrently.
-
-  The output tracked the bands it was given: the two `t3` passes wrote 11–12 KB
-  of findings each, the three tiered-down passes about 1 KB, 107 `file:line`
-  citations between them. Pass E did not read statically — it built an
-  instrumented copy of the tree with branch counters, ran all 26 grading scenes
-  through it, and reported measured counts.
-
-  It is also the one workload here that is not N writers of disjoint code. It is
-  N readers of a single diff, disjoint because each writes only its own findings
-  file — which is what makes it worth reporting: the scope rule holds for a
-  reason it was not designed around.
+  went out as one plan: two waves, five agents, both providers, every check
+  green, $7.18 of a $15 cap, stopping at the merge gate as attended mode should.
+  Its own band guidance mapped onto `tier:` with no translation, and the scope
+  accounting held on a workload that inverts its premise — N readers of one
+  diff, disjoint only because each writes its own findings file. That is **arm
+  K** under Experiments, and it is the evidence that any of this generalises past
+  the task it was built on.
 
   `delegate` used to run winnow's scanner itself at the merge gate. That was
   backwards: it made a quality pass a property of the dispatcher, chose one
@@ -511,8 +501,12 @@ Two earlier arms are deliberately absent. They measured the **role protocol**
 against a plain warm session — a question about a product this no longer is —
 and their raw records are not in this repository. Their one surviving
 conclusion, that the roles were not worth their cost, is in *Why this is a
-wrapper and not a workflow* above. Everything below is a run whose data you can
-open.
+wrapper and not a workflow* above.
+
+Everything below is a run, and every one but **K** has its data in
+`evidence/`. K's artifacts live with the code-winnow work rather than here, so
+its figures are transcribed rather than re-derivable — which is worth knowing,
+because K is the arm carrying the generalisation claim.
 
 | # | What it tested | Result | What changed here |
 |---|---|---|---|
@@ -523,8 +517,7 @@ open.
 | **E2** | a wall mid-job, twice, 2 seats | 31/31 across two provider changes | the failover claim is earned |
 | **E3** | a wall mid-job on a **single** seat | salvaged, parked, resumed from the checkpoint | found a bug that failed the recovery |
 | **G/H** | inlining the protocol to save turns | **no change** — 30 turns either way | progressive disclosure kept |
-| **J** | an agent handed the *dispatch* skill and a task, no planning step at all | 31/31, $6.01, 6 min — merged at 29/31 first and had to debug | **not comparable to D**; see below |
-| **K** | code-winnow's five judgment passes dispatched as jobs, 2 seats | five findings files, zero scope violations, $7.18 | the tier bands generalise to a foreign package |
+| **K** | **a foreign package's** five judgment passes dispatched as jobs, 2 seats | five findings files, zero scope violations, $7.18 | the pipeline generalises past the task it was built on |
 
 **A third of the wall-clock gap is a config default, not overhead.** F's clean
 rerun took 576s against D's 210s — 2.74×, worse than the 1.8× its per-agent
@@ -535,36 +528,41 @@ four concurrently would have been 381s. So ~195s of that gap is the cap. Whether
 `3` is the right default is open: raising it trades wall clock against
 contention on one provider's rate limits, and only the first has been measured.
 
-**J is not the comparison it looks like.** It was handed the dispatch skill and
-a task with no planning skill in the loop, so it invented its contracts while
-already executing. The flow the docs actually describe starts earlier — decide
-what the work is, write the plan whose Interfaces section *is* the contracts,
-then discover how many seats you have and fan out accordingly. J skipped
-straight to the fan-out. What it measures is the cost of dispatching without
-planning first, which is worth knowing and is not what D measures.
+**It generalises past the task it was built on, and arm K is the evidence.**
+Every other arm here is the same rasterizer: four writers of four pre-split
+files, disjoint by construction, on a decomposition this project wrote. A
+pipeline that only works on the workload it was designed against has not been
+shown to work at all.
 
-**What the decomposition is worth, and who paid for it.** D and J run the same
-recipe on one seat. D cost $2.92, J cost $6.01. The difference is that D was
-handed the frozen contracts and J had to derive them — and did not, at first:
-it merged at 29/31, with the two scenes that turn on one interpolation rule
-failing, then diagnosed and fixed it. Nothing planned for J — there is no
-planner — so that **$3.09 is what deriving the contracts cost when the work
-itself had to pay for it**, most of it spent recovering from the one rule it got
-wrong. For scale, the retired planner that originally wrote those contracts cost
-$2.93; the two figures are not connected, but they are the same size, and both
-are the price of the same artifact.
+K is a different shape on every axis that could have mattered. It dispatched
+**code-winnow's** five judgment passes — a package this repository does not own,
+whose plan its author wrote — as **five readers over one diff** rather than
+writers of disjoint code. Two waves, five agents, both providers, every check
+green, **$7.18** of a $15 cap, stopping at the merge gate as attended mode
+should.
 
-Every single-seat figure in this table except J's is subsidised by a
-decomposition somebody else paid for. J is the only end-to-end number here.
+Three things held that were not designed for it:
 
-**It generalises past the task it was built on.** Arm K dispatched code-winnow's
-judgment passes — five readers over *one* diff, rather than writers of disjoint
-code — and the scope accounting held with zero violations. code-winnow's own
-band guidance ("tier down the volume passes, keep the supervisor passes at your
-tier") mapped onto `tier:` with no translation: the two volume passes cost $0.13
-together, the two supervisor passes $6.69. Building that plan also found the job
-id pattern only accepted `st-<number>-`, which fitted this repository's first
-task and nothing else.
+- **Scope accounting, on a workload that inverts its premise.** Disjointness
+  here is not "each job owns a file" — every pass *reads* the same diff, and
+  they are disjoint only because each writes its own findings file. Zero
+  violations. The rule held for a reason it was not built around.
+- **The tier bands, translated by nobody.** code-winnow's own guidance — *keep
+  the supervisor passes at your tier, tier down the volume passes* — mapped onto
+  `tier:` verbatim. The two supervisor passes drew `opus-class-strong` on the
+  Claude seat; the volume passes ran `fast-cheap` and `balanced-coder` on the
+  other provider, concurrently. The two volume passes cost **$0.13** together
+  against the supervisor pair's **$6.69**, a ~51× spread the caller got by
+  copying a sentence out of its own docs.
+- **The bands bought what they were supposed to.** Output tracked them: the two
+  `t3` passes wrote 11–12 KB of findings each, the tiered-down passes about 1 KB,
+  **107 `file:line` citations** between them. One `t3` pass did not read
+  statically at all — it built an instrumented copy of the tree with branch
+  counters, ran all 26 grading scenes through it, and reported measured counts.
+
+Building that plan is also what found the job id pattern only accepted
+`st-<number>-`, which fitted this repository's first task and nothing else. Five
+named review passes have no numbers to give.
 
 **Why the skill tells you not to use this on one seat.** D and F are the same
 jobs, provider and model; only `delegate` differs. Per job it ran 1.77× and
