@@ -1,0 +1,41 @@
+[
+  {
+    "label": "delegate",
+    "turns": 21,
+    "cost_usd": 0.9652579999999998,
+    "assistant_messages": 35,
+    "secs": 184.4,
+    "tools": {
+      "Bash": 9,
+      "Read:PROTOCOL.md": 1,
+      "Read:worker.md": 1,
+      "Read:report.schema.json": 1,
+      "Read:raster.cpp": 1,
+      "Read:driver_state.h": 1,
+      "Read:common.h": 1,
+      "Read:SConstruct": 1,
+      "Read:handover.md": 1,
+      "Read:check-grade.sh": 1,
+      "Read:driver_state.cpp": 1,
+      "Write:implement-st-4-raster.json": 1
+    },
+    "prompt_chars": 3691
+  },
+  {
+    "label": "handrolled",
+    "turns": 13,
+    "cost_usd": 0.5454564999999999,
+    "assistant_messages": 25,
+    "secs": 93.8,
+    "tools": {
+      "Bash": 6,
+      "Read:driver_state.h": 1,
+      "Read:common.h": 1,
+      "Read:raster.cpp": 1,
+      "Read:vec.h": 1,
+      "Read:check-grade.sh": 1,
+      "Read:shaders.cpp": 1
+    },
+    "prompt_chars": 2378
+  }
+]

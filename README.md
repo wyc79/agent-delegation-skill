@@ -261,6 +261,12 @@ orchestrator/
     │                     parallelism, handover, scratch-files
     └── schemas/          JSON Schema for reports and job blocks
 
+evidence/                 the measurements the Status section cites, and the
+                          scripts that produced them. `run-arm-d.py` is the
+                          control: this program's structure with no delegate in
+                          it, which is what the cost figures are measured
+                          against.
+
 registry.default.yaml     model capability scores, the one job profile,
                           channels (seats), and policy — the only file that
                           names models
@@ -495,7 +501,7 @@ Green suites, from a clone of this repo:
 
 ```bash
 python3 orchestrator/tests/test_orchestrator.py  # 173 tests, no tokens spent
-python3 orchestrator/tests/test_failover.py      # 99 more, same
+python3 orchestrator/tests/test_failover.py      # 101 more, same
 ```
 
 They drive the real state machine over a real git repository with a scripted
@@ -561,8 +567,10 @@ then the merge gate ran the grader itself: `FINAL SCORE: 31`. Routing across
 providers mid-flight cost no correctness. Every other arm in that table simply
 stops when a seat goes out.
 
-Full write-up, per-agent figures and the scripts:
-[`gpudriver-shakedown-result-wrapper/RESULTS.md`](https://github.com/wyc79/agent-delegation-skill).
+Full write-up, per-agent figures, and the scripts that produced them:
+[`evidence/`](evidence/) — including `run-arm-d.py`, the control this is
+measured against, and `diagnose-turns.py`, which attributes every turn to the
+tool that made it.
 
 **Built and exercised:** dependency waves in isolated worktrees; scope measured
 per job; cost and elapsed time recorded per delegation from the CLI's own JSON;

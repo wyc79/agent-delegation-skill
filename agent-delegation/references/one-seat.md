@@ -113,8 +113,9 @@ hard enough to hit walls, it is the reason to pay the overhead anyway.
 
 ## A worked implementation
 
-`run-arm-d.py` in the project's results directory is this pattern as ~150 lines
-of Python — worktree setup, concurrent dispatch, ordered merge, grade — used to
-produce the measurements quoted above. It is a worked example, not a supported
-tool: nothing in this repository's test suite exercises it, and it shells out to
-one specific agent CLI. Read it for the shape; write your own for your setup.
+`evidence/run-arm-d.py`, beside this skill's repository, is this pattern as ~150
+lines of Python — worktree setup, concurrent dispatch, ordered merge, grade —
+and it is what produced the measurements quoted above. It is a worked example,
+not a supported tool: nothing in the test suite exercises it, its paths are the
+ones it was run with, and it shells out to one specific agent CLI. Read it for
+the shape; write your own for your setup.

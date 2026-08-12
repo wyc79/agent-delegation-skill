@@ -143,14 +143,14 @@ class Router:
     def _meets(self, spec, require, boost):
         """Does this model clear the role's floors, as raised by `boost`?
 
-        Both key sets, not just `require`. A boost is how the ladder asks for
-        something the profile did not think to demand, so iterating `require`
-        alone dropped every boost on an undeclared capability -- silently, and
-        exactly where it mattered: `escalate` boosts `reasoning`, and neither
-        the implementer nor the test-author profile requires it. Rung 2 was
-        therefore never legal for the two roles that actually climb it,
-        `escalate` returned None, and the caller told an operator that nothing
-        stronger was enrolled when they had just enrolled it.
+        Both key sets, not just `require`. A boost asks for something the
+        profile did not think to demand, so iterating `require` alone dropped
+        every boost on an undeclared capability -- silently. The live caller is
+        `machine._replacement`, which after a quota wall asks for at least the
+        walled model's `reasoning` so a failover cannot quietly hand the job to
+        a weaker one; the worker profile does not require `reasoning` at all, so
+        reading only `require` would have made that floor a no-op and the
+        downgrade invisible.
 
         Sorted so a refusal is decided by the same capability every run; the
         answer is order-independent, but which floor it trips on is not.
@@ -192,7 +192,13 @@ class Router:
 
     def _reserved_out(self, chan, role, utilization):
         """Does this channel's headroom reservation exclude this role right now?
-        (: 'keep >=30% of the strong window free for planner/reviewer'.)"""
+
+        The shipped registry reserves 30% of the strong seat for `integrator`,
+        the call that arrives last and cannot be deferred: a wave that draws the
+        seat down and then cannot pay for its own merge conflict strands
+        finished work on unmerged branches. A role named in `reserve_for` that
+        nothing dispatches reserves headroom nobody can claim, which is what it
+        did while it read `[planner, reviewer]`; a test now refuses that."""
         roles = chan.get("reserve_for") or []
         raw = chan.get("reserve_fraction")
         if not roles or raw is None or role in roles:

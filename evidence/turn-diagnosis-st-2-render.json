@@ -1,0 +1,38 @@
+[
+  {
+    "label": "delegate",
+    "turns": 20,
+    "cost_usd": 0.856127,
+    "assistant_messages": 31,
+    "secs": 153.0,
+    "tools": {
+      "Bash": 9,
+      "Read:PROTOCOL.md": 1,
+      "Read:worker.md": 1,
+      "Read:driver_state.h": 1,
+      "Read:render.cpp": 1,
+      "Read:common.h": 1,
+      "Read:shaders.cpp": 1,
+      "Read:report.schema.json": 1,
+      "Read:check-grade.sh": 1,
+      "Read:parse.cpp": 1,
+      "Write:implement-st-2-render.json": 1
+    },
+    "prompt_chars": 3372
+  },
+  {
+    "label": "handrolled",
+    "turns": 10,
+    "cost_usd": 0.4073835,
+    "assistant_messages": 19,
+    "secs": 70.5,
+    "tools": {
+      "Bash": 5,
+      "Read:driver_state.h": 1,
+      "Read:render.cpp": 1,
+      "Read:common.h": 1,
+      "Read:shaders.cpp": 1
+    },
+    "prompt_chars": 2099
+  }
+]
