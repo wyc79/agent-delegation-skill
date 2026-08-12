@@ -572,7 +572,9 @@ class Orchestrator:
                 self._close(session)
                 self._session = session = None
                 raise Halt("needs_human", self._escalated(sub, report))
-            if result.ok and not sub.get("actual_files") and not self._touched(base, sub):
+            if (result.ok and not sub.get("actual_files")
+                    and not sub.get("inherited_checkpoint")
+                    and not self._touched(base, sub)):
                 # Only for a subtask that has never produced anything. Now that
                 # the diff base follows the tree, a later attempt that changes
                 # nothing also shows an empty diff, and halting there would be a
@@ -581,6 +583,15 @@ class Orchestrator:
                 # report still reaches the caller. The case this guard exists
                 # for is the first attempt on green checks: an agent that did
                 # nothing at all, on a tree that was passing before it started.
+                #
+                # `inherited_checkpoint` is the exemption that matters most,
+                # and it was missing. When a seat walls mid-job the partial work
+                # is committed and the replacement measures its diff from that
+                # commit -- so if the predecessor had already finished, the
+                # replacement changes nothing and the tree was green before it
+                # started. Both halves of the guard are true, and the run halted
+                # on the single outcome salvage exists to produce. Observed on a
+                # real single-seat wall, not reasoned about.
                 raise Halt("needs_human",
                            "%s changed no files, and the checks were already green "
                            "before it ran — passing tests are not evidence of work"
@@ -1631,6 +1642,19 @@ class Orchestrator:
         label = subtask.get("id") if subtask else role
         if self._checkpoint(cwd, "adg %s: salvaged before quota failover" % label):
             self.log("  salvaged %s's uncommitted work as a checkpoint" % label)
+            # Remembered on the subtask, because the next attempt has to know.
+            # Its diff is measured from this commit, so if the salvaged work was
+            # already enough, the replacement correctly changes nothing -- and
+            # the "changed no files" guard would then halt the run for the one
+            # outcome salvage exists to produce.
+            if subtask:
+                sid = subtask["id"]
+                def _mark(state):
+                    for t in state.get("subtasks", []):
+                        if t.get("id") == sid:
+                            t["inherited_checkpoint"] = True
+                self.task.mutate(_mark)
+                subtask["inherited_checkpoint"] = True
             return True
         return False
 

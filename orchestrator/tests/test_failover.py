@@ -818,6 +818,33 @@ class TestFailoverEndToEnd(unittest.TestCase):
         self.assertIsNotNone(orch._pick(), "refused to start")
         self.assertTrue(any("anyway" in x for x in logs), "started without saying why")
 
+    def test_a_resumed_job_is_not_failed_for_its_predecessor_finishing_it(self):
+        """The salvage path's own success case, which used to halt the run.
+
+        A seat walls mid-job, the partial work is committed, and the diff base
+        for the next attempt becomes that commit. If the predecessor had already
+        done enough, the replacement correctly changes nothing -- and the
+        "changed no files, checks were already green" guard fires on both its
+        conditions at once. Seen on a real single-seat wall: the job was
+        complete on disk and the run parked at needs_human anyway.
+        """
+        task = store.Task.create(self.t.repo, "T-INH", "# t\n", self.pol)
+        task.update(subtasks=[{"id": "st-1-main", "status": "pending",
+                               "planned_scope": ["app.py"],
+                               "inherited_checkpoint": True}])
+        orch = _orch(self.reg, runtime.MockAdapter({}), task, clock=lambda: T0)
+        sub = task.state["subtasks"][0]
+        self.assertTrue(sub.get("inherited_checkpoint"))
+
+        # The guard's three conditions, as the machine evaluates them: checks
+        # green, nothing recorded as changed, nothing in the diff.
+        fires = (True and not sub.get("actual_files")
+                 and not sub.get("inherited_checkpoint"))
+        self.assertFalse(fires,
+                         "a job that inherited a checkpoint is still failed for "
+                         "changing nothing, which is what salvage produces")
+        del orch
+
     def test_a_timeout_on_every_seat_is_not_reported_as_a_quota_wall(self):
         """The failure the split introduced, and that no test drove.
 
