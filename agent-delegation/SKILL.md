@@ -71,6 +71,34 @@ every band resolved to the same one.
 **Do it yourself otherwise.** A handful of edits, a question, a conversation
 still settling what is wanted — all delegate badly.
 
+### On one seat, do this instead
+
+The alternative is not "give up on parallelism" — it is the pattern that beat
+delegating in the table above, and you can run it with the tools you already
+have. Per job:
+
+1. `git worktree add ../wt/<job-id> -b <job-id>` — one checkout per job, cut
+   from the same commit.
+2. Dispatch one agent per worktree, **all in the same message so they run
+   concurrently**, each given only its own goal, its `file_scope`, and the
+   frozen contracts the other jobs are coding against. Nothing else — no plan
+   file, no shared history. `superpowers:dispatching-parallel-agents` is the
+   procedure.
+3. Merge the branches one at a time, running your checks after each, so a break
+   surfaces against the smallest diff.
+
+The contracts are the part that carries the whole thing. Agents in separate
+worktrees cannot see each other's code, so every signature or invariant two
+jobs share has to be written into **both** their prompts, verbatim. Get that
+wrong and the disagreement surfaces at merge time, which is the one place
+isolation cannot help you.
+
+**What you give up, so you can choose it knowingly:** no merge gate holding the
+work until a human looks; no per-job scope measurement, so an agent that edits
+a file outside its remit is invisible; no spend or attempt cap that binds; no
+task on disk to resume from after a crash; and no failover — if the seat goes
+out, the run is simply over. That list is the ~1.5x.
+
 ## Writing the jobs
 
 Delegate reads a decomposition from a markdown file you write, passed with
