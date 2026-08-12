@@ -2,11 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/report.schema.json",
   "title": "Agent handoff report",
-  "description": "Written by every agent before it exits, to $TASK_DIR/reports/<stage>-<role|subtask>.json. This is the only report envelope, and it is what leaves your worktree besides your commits. Absence of a valid report means the agent crashed.",
+  "description": "Written by every agent before it exits, to $TASK_DIR/reports/<stage>-<job-id>.json -- the path your prompt names. Three fields are required. `status` and `summary` are read by the program that dispatched you; `evidence` is read by the human who decides whether to land your work. Everything else is optional, and `signals` is where a stopped job puts what it knows.",
   "type": "object",
   "required": [
-    "stage",
-    "role",
     "status",
     "summary",
     "evidence"
@@ -17,13 +15,15 @@
       "enum": [
         "implement",
         "integrate"
-      ]
+      ],
+      "description": "Optional; the filename already carries it. Kept so a report that states it is still checked against the enum rather than silently accepted."
     },
     "role": {
       "enum": [
         "implementer",
         "integrator"
-      ]
+      ],
+      "description": "Optional; the filename already carries it. Same reason as `stage`."
     },
     "subtask": {
       "type": "string",
