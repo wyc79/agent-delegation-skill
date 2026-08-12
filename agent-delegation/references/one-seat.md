@@ -52,6 +52,19 @@ concurrently. Each gets its own goal, its write scope, and the frozen contracts
 — nothing else. No plan file, no session history, no summary of what its
 siblings are doing.
 
+> **This is the step that actually fails.** Measured: an agent that had read
+> this file built three correct dispatches — right worktree, right scope, right
+> contracts — and issued them in three separate messages. One dispatch per
+> message runs them **sequentially**, so it paid the whole setup cost of
+> isolation and collected none of the speed: four times the wall clock of the
+> same work done in one context, and the slowest arm measured.
+>
+> Nothing goes visibly wrong when you get this wrong. The worktrees are still
+> isolated, the merges are still clean, the result is still correct — it is
+> simply slower than not having bothered. If you are about to send a dispatch,
+> and the next one is going in a later message, stop: you want them in *this*
+> message or you want to do the work yourself.
+
 ```text
 You are implementing one file of <the thing>. Other agents are implementing
 the others right now, in worktrees you cannot see. You cannot talk to them.
