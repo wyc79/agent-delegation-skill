@@ -110,13 +110,24 @@ jobs are not actually independent and you should not be running them in
 parallel.
 
 **Budget for writing them.** Measured on the same task twice: handed the
-contracts, this pattern cost X; made to derive them, it cost roughly double, and
-the extra was not setup — it was one agent merging work that looked right,
-scoring below the bar on the two cases that turned on a single interpolation
-rule, and having to bisect its way back to the cause. The contracts are not
-paperwork you do before the real work. They *are* the part of the work that
-cannot be parallelised, and skipping them moves the cost to the far end where it
-is dearer.
+contracts, this pattern cost X; made to derive them mid-flight, it cost roughly
+double, and the extra was not setup — it was one agent merging work that looked
+right, failing the two cases that turned on a single interpolation rule, and
+bisecting its way back to the cause. The contracts are not paperwork you do
+before the real work. They *are* the part of the work that cannot be
+parallelised, and skipping them moves the cost to the far end where it is dearer.
+
+**Planning first is what produces them.** An agent that wrote a plan before
+dispatching had the contracts in hand as a matter of course — its per-task
+Interfaces blocks named the buffer layout, the ownership rules for borrowed
+attribute data, and which coordinate space crossed each boundary. That is the
+step to keep if you keep only one.
+
+**What a plan will not do is guess your scope.** The same plan quietly narrowed
+the job — two clipping planes instead of six — because nothing said how much was
+wanted, and then implemented what it had planned, correctly, and passed every
+check. If the size of the work is not written down somewhere, planning will
+choose a size for you and nothing downstream will flag it.
 
 ## What you give up
 

@@ -97,7 +97,24 @@ Delegate reads a decomposition from a markdown file you write, passed with
 | `file_scope` | its write boundary. **Measured, not enforced**: files touched outside it are recorded and reported back, never reverted. |
 | `tier` | which capability band runs it (below). Omit and it draws the ordinary worker. |
 | `depends_on` | job ids that must finish first. Ordering only. |
-| `reads`, `frozen_interfaces`, `hotspots`, `acceptance` | carried into the agent's prompt and the record. |
+| `acceptance` | what counts as done. Read the warning below before leaving it out. |
+| `reads`, `frozen_interfaces`, `hotspots` | carried into the agent's prompt and the record. |
+
+**`goal` says what to build; `acceptance` says what counts as built, and an
+agent will settle the difference itself.** Measured: given "implement
+`clip_triangle`" and no acceptance criteria, an agent planned a defensible
+smaller version — two of the six clipping planes, which the project's own stub
+comment says is usually enough — implemented exactly that, and **passed the
+full test suite**. A second agent given the same job *with* the requirement
+written down built all six.
+
+Neither was wrong and neither was careless. The narrower one was never told
+where the line was, so it drew one, and every signal available said it had
+succeeded.
+
+So: if a job could be satisfied by something smaller than you have in mind,
+your checks will not tell you — they pass. Write the boundary into
+`acceptance`, or accept whichever reading the agent picks.
 
 **Disjoint `file_scope` is what buys parallelism.** Two jobs whose scopes
 overlap are serialized, and a job left unscoped claims everything — which
