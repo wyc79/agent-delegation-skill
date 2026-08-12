@@ -2831,6 +2831,62 @@ class TestTheSeams(unittest.TestCase):
                              "the prompt names a command the agent is told not "
                              "to run, which invites it to go and read it")
 
+    # --- seam 3: the skill's instructions have to survive contact with init -
+    def test_every_reference_the_skill_points_at_exists(self):
+        """A skill that names a file it does not ship sends an agent hunting.
+
+        Driven from SKILL.md's own links, so adding a reference without writing
+        it -- or renaming one and missing a pointer -- fails here rather than
+        mid-run in somebody else's session.
+        """
+        skill_dir = os.path.join(REPO_ROOT, "agent-delegation")
+        text = _slurp(os.path.join(skill_dir, "SKILL.md"))
+        named = set(re.findall(r"`(references/[a-z0-9_.-]+\.md)`", text))
+        self.assertTrue(named, "SKILL.md points at no reference at all -- if "
+                               "that is deliberate, this test should go")
+        for rel in sorted(named):
+            path = os.path.join(skill_dir, rel)
+            self.assertTrue(os.path.exists(path), "SKILL.md names %s, which is "
+                                                  "not in the skill" % rel)
+            self.assertTrue(len(_slurp(path).strip()) > 200,
+                            "%s is named as depth and is nearly empty" % rel)
+
+    def test_init_says_the_thing_the_skill_tells_an_agent_to_look_for(self):
+        """The skill's first instruction is "run `delegate init`, and if every
+        tier resolves to one provider, do X". That only works if `init` says so
+        in words an agent can act on.
+
+        The two are written in different files by different people at different
+        times, which is exactly the seam that rots: reword the output and the
+        instruction silently stops being followable, with nothing failing.
+        """
+        import contextlib
+        import io
+        one = os.path.join(self.t.dir, "one.yaml")
+        with open(one, "w", encoding="utf-8") as fh:
+            fh.write(ONE_SEAT)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_init(argparse.Namespace(repo=self.t.repo, registry=one))
+        out = buf.getvalue()
+
+        # The verdict, not just the raw table: an agent should not have to
+        # derive "these are all the same seat" from three rows.
+        self.assertIn("Every tier resolves to", out,
+                      "init no longer states the single-provider case in words:\n" + out)
+        # And the skill has to be keyed on something init actually emits.
+        skill = _slurp(os.path.join(REPO_ROOT, "agent-delegation", "SKILL.md"))
+        self.assertIn("every tier resolves to one", skill.lower(),
+                      "the skill no longer names the condition init reports")
+        # The two-seat case must read as clearly different, or the agent cannot
+        # tell them apart.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_init(argparse.Namespace(repo=self.t.repo, registry=REGISTRY))
+        two = buf.getvalue()
+        self.assertNotIn("Every tier resolves to", two)
+        self.assertIn("seats serve these tiers", two)
+
     # --- seam 2: the config declares it, so it must actually run ----------
     def test_every_declared_command_tier_actually_executes(self):
         """Driven from `verify.COMMAND_TIERS`, the same list the machine runs.
