@@ -62,8 +62,9 @@ still settling what is wanted — all delegate badly.
 
 The alternative is not "give up on parallelism" — it is the pattern that beats
 delegating on a single seat, and you can run it with tools you already have:
-a git worktree per job, all the agents dispatched in one message so they run
-concurrently, then merge one at a time with your checks between.
+a git worktree per job, every prompt drafted before any is sent so the agents
+go out in one message and run concurrently, then merge one at a time with your
+checks between.
 
 **→ `references/one-seat.md`** has it in full: the exact git commands, the
 prompt shape, why `superpowers:subagent-driven-development`'s "never dispatch
