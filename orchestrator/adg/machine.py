@@ -1268,12 +1268,19 @@ class Orchestrator:
             hit = sorted({c.channel for c in free} & cooled)
             if hit:
                 reopen = cooldown.earliest_reopen(entries, hit)
+                # Named by what the caller actually asked for. `_pick(tier=...)`
+                # passes no role, so this read "every channel enrolled for role
+                # None" -- which tells a reader nothing about which of their
+                # jobs is stuck, and reads like a bug in the program rather than
+                # a seat being out.
+                asked = ("tier %s" % tier if tier else
+                         "role %r" % role if role else "this job")
                 raise routing.AllChannelsCooled(
                     role, hit, reopen,
-                    "every channel enrolled for role %r is in a quota cooldown "
+                    "every seat that can serve %s is in a quota cooldown "
                     "(%s); the first reopens at %s. `delegate channels` shows "
                     "them, `delegate channels --clear <name>` overrides one."
-                    % (role, ", ".join(hit), _stamp(reopen)))
+                    % (asked, ", ".join(hit), _stamp(reopen)))
         raise routing.NoModelAvailable(
             "no runnable model for role %r%s: %s" % (
                 role,
