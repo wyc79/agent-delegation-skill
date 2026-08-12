@@ -333,6 +333,20 @@ class Orchestrator:
         worktree or any spend: a briefing that does not exist is a prompt telling
         N agents to read a file that is not there, and the failure would arrive
         as N confused agents rather than one clear message.
+
+        **Existing in the repo is not the question, and asking it that way gets
+        the likely case backwards** -- the same trap `runtime.conventions`
+        documents from the other side. Every job runs in a `git worktree`, which
+        checks out TRACKED FILES ONLY. An untracked briefing file sits in the
+        caller's checkout, passes an existence check run from there, and is
+        absent from every worktree this dispatches into. It is not the exotic
+        case: the caller who writes a conventions file *for this run* is the one
+        most likely not to have committed it, and the prompt would name a path
+        that resolves for them and for nobody they dispatch.
+
+        So untracked is refused exactly like missing, because from inside the
+        worktree the two are the same file. It is a one-command fix and it costs
+        a message rather than N agents hunting for a file that is not there.
         """
         text = self.task.read_text("plan.md", "")
         for raw in re.findall(r"```ya?ml\s*\n(.*?)```", text, re.S):
@@ -344,16 +358,35 @@ class Orchestrator:
                 continue
             paths = data["briefing"]
             paths = [paths] if isinstance(paths, str) else list(paths or [])
-            missing = [p for p in paths
-                       if not os.path.exists(os.path.join(self.repo, p))]
+            missing, untracked = [], []
+            for p in paths:
+                if not os.path.exists(os.path.join(self.repo, p)):
+                    missing.append(p)
+                elif not self._tracked(p):
+                    untracked.append(p)
             if missing:
                 raise Halt("needs_human",
                            "plan.md names briefing file(s) that do not exist in "
                            "%s: %s. Every job would be told to read them before "
                            "starting."
                            % (self.repo, ", ".join(missing)))
+            if untracked:
+                raise Halt("needs_human",
+                           "plan.md names briefing file(s) that git does not "
+                           "track: %s. Every job runs in a worktree, which checks "
+                           "out tracked files only, so they are in your checkout "
+                           "and in none of theirs — every job would be told to "
+                           "read a file it cannot see. Commit them (git add %s), "
+                           "then re-run."
+                           % (", ".join(untracked), " ".join(untracked)))
             return paths
         return []
+
+    def _tracked(self, rel):
+        """Is this path in the index, and so present in every worktree?"""
+        p = subprocess.run(["git", "ls-files", "--error-unmatch", rel],
+                           cwd=self.repo, capture_output=True, text=True)
+        return p.returncode == 0
 
     def _read_plan_subtasks(self):
         """Parse the fenced YAML block the caller wrote. A plan we cannot parse
@@ -444,15 +477,21 @@ class Orchestrator:
         return wave or self._ready(subtasks)[:1]
 
     def _stage_implement(self):
+        # First, and ahead of the worktree, because its own docstring promises
+        # "before any worktree or any spend" and it was running second. Nothing
+        # was dispatched either way -- but a typo'd path parked the task with a
+        # checkout and a branch already cut, and `_reap_worktrees` runs only on
+        # `done`, so the stray survived every later run. Validation that costs
+        # nothing has to actually cost nothing. It reads plan.md and the repo,
+        # so it needs no setup from below.
+        briefing = self._read_plan_briefing()
         # Establishes base_commit. Without it every diff below is taken against
         # HEAD *inside* a worktree that has already committed its checkpoint,
         # which reads as "nothing changed" and silently voids scope checking.
         self._ensure_worktree()
         state = self.task.state
-        # Before any worktree is dispatched into, so a bad path costs one
-        # message rather than N agents. Re-read on resume: the plan on disk is
-        # the source of truth and may have been corrected between runs.
-        briefing = self._read_plan_briefing()
+        # Re-read on resume: the plan on disk is the source of truth and may
+        # have been corrected between runs.
         if briefing != ((state.get("plan") or {}).get("briefing") or []):
             state = self.task.update(plan=dict(state.get("plan") or {},
                                                briefing=briefing))

@@ -431,7 +431,7 @@ keeping it moving when one empties.
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 178 tests, no tokens spent
+python3 orchestrator/tests/test_orchestrator.py  # 198 tests, no tokens spent
 python3 orchestrator/tests/test_failover.py      # 101 more, same
 ```
 

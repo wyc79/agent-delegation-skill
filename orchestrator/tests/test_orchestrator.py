@@ -4216,6 +4216,45 @@ briefing: [docs/conventions.md]
         self.assertIn("docs/nope.md", str(cm.exception))
         self.assertEqual(adapter.calls, [], "an agent was started anyway")
 
+    def test_an_untracked_briefing_file_is_refused(self):
+        """The case an existence check calls a pass, and the likely one: the
+        caller writes the conventions file for this run and has not committed
+        it. It resolves from their checkout and from no worktree, so every job
+        would be told to read a file it cannot see."""
+        _spit(os.path.join(self.t.repo, "docs/loose.md"), "# uncommitted\n")
+        plan = self.PLAN.replace("docs/conventions.md", "docs/loose.md")
+        task = _task(self.t.repo, "T-BR4", "# t\n", self.pol, plan=plan)
+        adapter = runtime.MockAdapter()
+        orch = Orchestrator(task, self.reg, adapter, lambda k, t: True,
+                            log=lambda *_: None)
+        self.assertTrue(os.path.exists(os.path.join(self.t.repo, "docs/loose.md")),
+                        "the file IS in the caller's checkout — that is the trap")
+        with self.assertRaises(Halt) as cm:
+            orch._read_plan_briefing()
+        self.assertIn("docs/loose.md", str(cm.exception))
+        self.assertIn("track", str(cm.exception),
+                      "the message must say WHY, or the caller sees a file that "
+                      "is plainly right there and reads this as a bug")
+        self.assertEqual(adapter.calls, [], "an agent was started anyway")
+
+    def test_a_bad_briefing_path_leaves_no_worktree_behind(self):
+        """`_read_plan_briefing` promises "before any worktree or any spend".
+        The spend half always held; the worktree half did not, and only `done`
+        reaps them — so a typo left a checkout and a branch on disk forever."""
+        plan = self.PLAN.replace("docs/conventions.md", "docs/nope.md")
+        task = _task(self.t.repo, "T-BR5", "# t\n", self.pol, plan=plan)
+        adapter = runtime.MockAdapter()
+        status = Orchestrator(task, self.reg, adapter, lambda k, t: True,
+                              log=lambda *_: None).run()
+        self.assertEqual(status, "needs_human")
+        self.assertEqual(adapter.calls, [])
+        def out(*args):
+            return subprocess.run(["git"] + list(args), cwd=self.t.repo,
+                                  capture_output=True, text=True).stdout
+        self.assertNotIn(".adg-worktrees", out("worktree", "list"),
+                         "a checkout was cut for a plan that never dispatched")
+        self.assertNotIn("adg/T-BR5", out("branch", "--list"))
+
     def test_a_plan_without_briefing_is_unchanged(self):
         plan = "# Plan\n\n## Subtasks\n```yaml\n- id: st-1-alpha\n  goal: g\n  file_scope: [\"a.py\"]\n```\n"
         task = _task(self.t.repo, "T-BR3", "# t\n", self.pol, plan=plan)

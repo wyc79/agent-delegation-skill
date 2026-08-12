@@ -149,7 +149,13 @@ A separate block from the job list, paths relative to the repo. Every job's
 prompt lists them as required reading before it starts; the paths are validated
 before anything is dispatched, so a wrong one costs you a message rather than N
 confused agents. Paths, not contents — the file is the source of truth, the
-agent is already in a checkout that has it, and a pasted copy goes stale.
+agent is in a checkout that has it, and a pasted copy goes stale.
+
+**They must be committed, and that is checked.** The same worktree rule applies
+here as to `CLAUDE.md`: a briefing file you have written but not committed is in
+your checkout and in none of theirs, so every job would be told to read a file
+it cannot see. Untracked is refused exactly like missing — `git add` it and
+re-run.
 
 **Disjoint `file_scope` is what buys parallelism.** Two jobs whose scopes
 overlap are serialized, and a job left unscoped claims everything — which
