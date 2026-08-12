@@ -100,21 +100,21 @@ Delegate reads a decomposition from a markdown file you write, passed with
 | `acceptance` | what counts as done. Read the warning below before leaving it out. |
 | `reads`, `frozen_interfaces`, `hotspots` | carried into the agent's prompt and the record. |
 
-**`goal` says what to build; `acceptance` says what counts as built, and an
-agent will settle the difference itself.** Measured: given "implement
-`clip_triangle`" and no acceptance criteria, an agent planned a defensible
-smaller version — two of the six clipping planes, which the project's own stub
-comment says is usually enough — implemented exactly that, and **passed the
-full test suite**. A second agent given the same job *with* the requirement
-written down built all six.
+**How big the job is, is part of the brief — and if you leave it out an agent
+will decide it for you.** Measured on the same task twice. Told to "implement
+`clip_triangle`", one agent planned a defensible smaller version — two of the
+six clipping planes, which the project's own stub comment calls usually enough
+— built exactly that, and **passed the whole test suite**. The run that spelled
+out "the six clip-space faces" got all six.
 
-Neither was wrong and neither was careless. The narrower one was never told
-where the line was, so it drew one, and every signal available said it had
-succeeded.
+Neither agent was careless. The first was never told where the line was, so it
+drew one, and every signal available said it had succeeded.
 
-So: if a job could be satisfied by something smaller than you have in mind,
-your checks will not tell you — they pass. Write the boundary into
-`acceptance`, or accept whichever reading the agent picks.
+So: if a job could be satisfied by something smaller than you have in mind, the
+checks will not tell you — they pass, and a scope report only covers files, not
+how much of the file's job got done. Say how much you want, in `goal` where it
+defines the work and in `acceptance` where it is the bar, or take whichever
+reading the agent picks.
 
 **Disjoint `file_scope` is what buys parallelism.** Two jobs whose scopes
 overlap are serialized, and a job left unscoped claims everything — which
