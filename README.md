@@ -60,10 +60,11 @@ and a caller that already has planning and review skills does not need worse
 copies of them behind a subprocess boundary. So they were removed rather than
 defended.
 
-Those ratios describe **the protocol**, not what is here now. Cutting it took
-the run from $13.07 to about $3 — see Status, where the wrapper is measured
-against two further controls and does not come out ahead of either on a single
-provider.
+Those ratios describe **the protocol**, not what is here now, and they come from
+an earlier round whose raw records are not in this repository — which is why
+Experiments does not list them beside the runs you can open. They are here
+because they are the reason the roles went, and that is the only claim they are
+being asked to carry.
 
 What does not improve with model releases is the seat that empties at 3pm while
 another sits idle. That gets *worse*, because stronger models are metered
@@ -484,13 +485,18 @@ file is not safe for simultaneous writers in the strict sense.
 
 Every design decision below was forced by a run, not argued into place. The task
 throughout is the same: four stages of a software rasterizer, graded by the
-course's own script over 26 reference images, pass only at 31/31. Full records
-and caveats in [`evidence/RESULTS.md`](evidence/RESULTS.md).
+course's own script over 26 reference images, pass only at 31/31. Full records and caveats in
+[`evidence/RESULTS.md`](evidence/RESULTS.md).
+
+Two earlier arms are deliberately absent. They measured the **role protocol**
+against a plain warm session — a question about a product this no longer is —
+and their raw records are not in this repository. Their one surviving
+conclusion, that the roles were not worth their cost, is in *Why this is a
+wrapper and not a workflow* above. Everything below is a run whose data you can
+open.
 
 | # | What it tested | Result | What changed here |
 |---|---|---|---|
-| **A** | the old role protocol: planner → 4 implementers → reviewer, 2 seats | 31/31, $13.07, 31.5 min | the planner and reviewer were deleted |
-| **C** | one warm Claude session, its own subagents | 31/31 *(two passes)*, $3.10, 6.8 min | the control A was retired against |
 | **B** | the wrapper: 4 caller-written jobs, 2 seats | 31/31, ≈$3.0, 9.6 min | first run of the product as it now is |
 | **D** | the same structure **hand-rolled, no `delegate`**, 1 seat | 31/31, **$2.92, 3.5 min** | the skill now ships this recipe |
 | **F** | the wrapper on **1 seat**, same jobs as D | 31/31, $4.41 | the ~1.8–2.1× per-agent overhead |
@@ -498,11 +504,6 @@ and caveats in [`evidence/RESULTS.md`](evidence/RESULTS.md).
 | **E2** | a wall mid-job, twice, 2 seats | 31/31 across two provider changes | the failover claim is earned |
 | **E3** | a wall mid-job on a **single** seat | salvaged, parked, resumed from the checkpoint | found a bug that failed the recovery |
 | **G/H** | inlining the protocol to save turns | **no change** — 30 turns either way | progressive disclosure kept |
-
-**Why there is no planner and no reviewer.** A and C scored the same. The
-protocol cost 4.2× the money for it. A claim whose baseline improves with every
-model release is not worth defending, so the roles went rather than being
-defended — and everything below is what remains once you stop paying for them.
 
 **Why the skill tells you not to use this on one seat.** D and F are the same
 jobs, provider and model; only `delegate` differs. Per job it ran 1.77× and

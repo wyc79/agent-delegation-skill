@@ -15,9 +15,9 @@ diffed against reference images, 31 points, pass only at 31/31.
 
 | | What it is | delegate? | Providers |
 |---|---|---|---|
-| **A** | the role protocol: planner → 4 implementers → reviewer | yes | 2 |
+| **A** ‡ | the role protocol: planner → 4 implementers → reviewer | yes | 2 |
 | **B** | the wrapper: 4 jobs the caller decomposed | yes | 2 |
-| **C** | one warm Claude session dispatching its own subagents | no | 1 |
+| **C** ‡ | one warm Claude session dispatching its own subagents | no | 1 |
 | **D** | 4 cold Claude agents, isolated worktrees, hand-rolled | **no** | 1 |
 | **E1** | B, with a quota wall injected on a single-seat band | yes | 2 |
 | **E2** | B, with a quota wall injected mid-job on a two-seat band | yes | 2 |
@@ -38,7 +38,11 @@ lands near C.
 
 ## Result
 
-| | A | B | C | D | E2 | F |
+Columns **A** and **C** are quoted from the earlier round; their raw records are
+not in this repository, so they cannot be re-derived from anything here. Every
+other column can — the scripts and their output are beside this file.
+
+| | A ‡ | B | C ‡ | D | E2 | F |
 |---|---|---|---|---|---|---|
 | Score | 31/31 | 31/31 | 31/31 | **31/31** | **31/31** | **31/31** |
 | Wall clock | 31.5 min | 9.6 min | 6.8 min | **3.5 min** | 4.8 min | — ⚠⚠⚠ |
@@ -48,6 +52,8 @@ lands near C.
 | Agent calls | 6 | 4 | 10 turns | 4 | 6 (2 walled) | 4 |
 | Attempts/job | 1 | 1 | — (2 passes) | 1 | 1 | 1 |
 | Scope violations | 0 | 0 | — | 0 | 0 | 0 |
+
+‡ quoted from the earlier round; not reproducible from this repository.
 
 ⚠ **B's cost is an upper bound that cannot be corrected retrospectively.** It
 was recorded while cached input was priced as fresh input (see *Two defects*
