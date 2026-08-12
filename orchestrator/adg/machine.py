@@ -338,6 +338,25 @@ class Orchestrator:
             except yamlite.YamlError:
                 continue
             if isinstance(data, list) and data and isinstance(data[0], dict) and "id" in data[0]:
+                # Validated against the schema this repo ships, which until now
+                # was documented as the field list and enforced by nothing. A
+                # typo'd key does not raise here -- it produces a job whose
+                # scope is empty, which means "everything". Refusing the plan is
+                # the same trade `yamlite` makes: a config that silently parses
+                # to the wrong shape is worse than one that will not load.
+                bad = []
+                for s in data:
+                    try:
+                        schema.validate_subtask(s)
+                    except schema.Invalid as e:
+                        bad.append("%s: %s" % (s.get("id", "<no id>"), e))
+                if bad:
+                    raise Halt("needs_human",
+                               "plan.md has %d job block(s) this cannot run: %s. "
+                               "Fix them and re-run; the field list is %s."
+                               % (len(bad), "; ".join(bad[:4]),
+                                  os.path.join(schema.schemas_dir(),
+                                               "subtask.schema.json")))
                 out = []
                 for s in data:
                     out.append({
@@ -574,6 +593,7 @@ class Orchestrator:
                 raise Halt("needs_human", self._escalated(sub, report))
             if (result.ok and not sub.get("actual_files")
                     and not sub.get("inherited_checkpoint")
+                    and not self.dry_run
                     and not self._touched(base, sub)):
                 # Only for a subtask that has never produced anything. Now that
                 # the diff base follows the tree, a later attempt that changes
@@ -583,6 +603,13 @@ class Orchestrator:
                 # report still reaches the caller. The case this guard exists
                 # for is the first attempt on green checks: an agent that did
                 # nothing at all, on a tree that was passing before it started.
+                #
+                # `dry_run` is exempt because a dry run dispatches nobody, so
+                # it cannot change a file by construction -- and the guard fired
+                # on its first job, halting before `integrate`. Both READMEs say
+                # `--dry-run` "walks the whole state machine", and it is the
+                # first thing a newcomer is told to try, so their first command
+                # ended in a halt whose text appears in no document.
                 #
                 # `inherited_checkpoint` is the exemption that matters most,
                 # and it was missing. When a seat walls mid-job the partial work

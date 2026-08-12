@@ -114,7 +114,21 @@ So the per-agent overhead is **~1.8-2.1x**, and the arm-level 1.51x understates
 it. A single pair would have supported anything from 0.9x to 2.3x, which is
 exactly what happened -- twice, in both directions, to me.
 
-What the 1.5x buys is everything the script leaves out because it is a
+**And the protocol layer explains only about half of it.** The turn diffs in
+this directory show 10 extra tool calls on `st-2-render` and 8 on
+`st-4-raster`; four and five of those are protocol (reading it, the role card,
+the report schema, writing the report). The remainder is `Bash` 9-vs-5 and
+9-vs-6 plus a handful more source reads, and nothing here explains it. The
+prompt is ~1.5x longer (3372 chars against 2099), which is a plausible cause and
+is not evidence. Anywhere this write-up or the READMEs said "four turns" as if
+it were the whole account, it was not.
+
+One figure erring against itself, stated so nobody has to find it: these runs
+predate the fix that stopped naming the `slow` commands in the prompt, and
+`st-2-render`'s delegate arm spent a turn on `Read: check-grade.sh` as a result.
+The published 1.77x and 2.10x are therefore slightly pessimistic.
+
+What that overhead buys is everything the script leaves out because it is a
 throwaway: a merge gate that stops and hands a human graded evidence, per-job
 scope measurement, `max_cost_usd` and `max_attempts_per_subtask` that bind, a
 task on disk that survives a crash, and the grader running at the gate. Whether

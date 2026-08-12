@@ -11,10 +11,10 @@ spend real turns on it. Below that, write the code.
 
 Measured on a four-job task, all arms scoring identically: this pattern cost
 **$2.92 in 3.5 minutes** against **$4.41** for the same jobs through `delegate`
-on one seat. Per agent, `delegate` runs about **1.8-2.1x** the cost, and the
-overhead is four turns each — reading the protocol, the role card and the report
-schema, then writing the report back. On one seat you are paying that for a gate
-and a record. Sometimes worth it. Often not.
+on one seat. Per agent, `delegate` runs about **1.8-2.1x** the cost — eight to
+ten extra turns, of which four or five are the protocol and its report. The rest
+is not accounted for. On one seat you are paying that for a gate and a record.
+Sometimes worth it. Often not.
 
 ## Why this is not the thing superpowers warns you off
 

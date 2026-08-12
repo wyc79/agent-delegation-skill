@@ -2887,6 +2887,59 @@ class TestTheSeams(unittest.TestCase):
         self.assertNotIn("Every tier resolves to", two)
         self.assertIn("seats serve these tiers", two)
 
+    def test_a_dry_run_reaches_the_end_the_docs_promise(self):
+        """Both READMEs say `--dry-run` "walks the whole state machine", and it
+        is the first thing a newcomer is told to try.
+
+        It did not. A dry run dispatches nobody, so it changes no file by
+        construction -- which tripped the "changed no files, and the checks were
+        already green" guard on its first job and halted before `integrate`. The
+        newcomer's first command ended in a halt whose text appears in no
+        document.
+        """
+        task = _task(self.t.repo, "T-DRY", "# t\n\nAdd subtract\n",
+                     self.reg["policy"]["limits"])
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter({}),
+                              lambda k, t: True, log=logs.append,
+                              dry_run=True).run()
+        self.assertEqual(status, "done",
+                         "a dry run still cannot walk the machine:\n"
+                         + "\n".join(logs))
+
+    def test_a_plan_block_that_cannot_run_is_refused_by_name(self):
+        """The schema was shipped, called "the field list", and enforced by
+        nothing. `files_scope:` for `file_scope:` produced a job with an EMPTY
+        scope -- which `scope_violations` reads as `**`, so it silently claimed
+        every file and collapsed its wave to one agent. That is the exact
+        failure SKILL.md calls the commonest way to get no parallelism."""
+        bad = ('# p\n\n```yaml\n- id: st-1\n  goal: g\n'
+               '  files_scope: ["a.py"]\n```\n')
+        task = _task(self.t.repo, "T-BAD", "# t\n\nx\n",
+                     self.reg["policy"]["limits"], plan=bad)
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter({}),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "needs_human")
+        joined = "\n".join(logs)
+        self.assertIn("file_scope", joined, "the halt does not name the field")
+        self.assertIn("st-1", joined, "the halt does not name the job")
+
+    def test_an_id_less_command_with_several_tasks_says_which(self):
+        """`Task.open` refuses to guess between two tasks, which is right. But
+        every command that takes `--id` is documented WITHOUT it, so a project's
+        second run turned the documented merge-gate workflow into a traceback.
+        """
+        for n in ("T-001", "T-002"):
+            _task(self.t.repo, n, "# t\n\nx\n", self.reg["policy"]["limits"])
+        args = ["--repo", self.t.repo, "show", "--brief"]
+        with self.assertRaises(SystemExit) as cm:
+            cli.main(args)
+        msg = str(cm.exception)
+        self.assertIn("--id", msg, "the error does not say what to pass")
+        for n in ("T-001", "T-002"):
+            self.assertIn(n, msg, "the error does not list %s" % n)
+
     # --- seam 2: the config declares it, so it must actually run ----------
     def test_every_declared_command_tier_actually_executes(self):
         """Driven from `verify.COMMAND_TIERS`, the same list the machine runs.

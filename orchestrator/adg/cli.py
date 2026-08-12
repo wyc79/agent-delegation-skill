@@ -614,4 +614,19 @@ def main(argv=None):
             sys.exit("refusing to run: %s" % e)
         print("warning: the workflow could not be loaded (%s). Reporting "
               "commands still work; `run` and `resume` will not." % e)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except store.StoreError as e:
+        # `Task.open` refuses to guess between two tasks, which is right -- but
+        # every command that takes `--id` is documented WITHOUT it, because with
+        # one task the short form is the whole point. So a project's second run
+        # turned the documented workflow into a traceback. Say which ids exist,
+        # in the same spirit as the `--stage` typo check above: this is only
+        # ever a missing flag.
+        tasks = []
+        try:
+            tasks = [t.state["id"] for t in store.Task.list(_repo(args.repo))]
+        except Exception:                      # noqa: BLE001 -- best effort
+            pass
+        hint = ("  --id one of: %s" % ", ".join(tasks)) if tasks else ""
+        sys.exit("%s\n%s" % (e, hint) if hint else str(e))

@@ -98,6 +98,20 @@ def validate(data, schema):
 def validate_report(data):
     return validate(data, load("report.schema.json"))
 
+
+def validate_subtask(data):
+    """Check one job block from plan.md against the schema this repo ships.
+
+    It was shipped, documented as "the field list", and enforced by nothing. A
+    caller who wrote `files_scope:` for `file_scope:` got a job with an EMPTY
+    write scope -- which `scope_violations` reads as `**`, so the job silently
+    claims every file in the repository and its wave collapses to one agent.
+    That is the exact failure SKILL.md calls "the single most common way to get
+    no parallelism while thinking you asked for it", and the schema that would
+    have caught it was sitting in the same directory.
+    """
+    return validate(data, load("subtask.schema.json"))
+
 # No `validate_verdict`. It loaded `verdict.schema.json`, which went with the
 # reviewer that wrote verdicts -- so the function survived its own schema and
 # would have raised FileNotFoundError for anything that called it.

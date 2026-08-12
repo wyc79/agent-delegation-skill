@@ -49,10 +49,11 @@ agents, disjoint scopes, merge — as a short script with no `delegate` in it. O
 one seat it wins on cost and wall clock both.
 
 Run head to head on one provider, same model, same jobs, `delegate` costs
-**~1.8-2.1x** the hand-rolled equivalent. The overhead is four extra turns per
-agent, every time: reading the protocol, the role card and the report schema,
-then writing the report back. Three of those are what let another provider pick
-the job up mid-flight; the fourth is the only way a stuck job can tell you why.
+**~1.8-2.1x** the hand-rolled equivalent — eight to ten extra turns per agent.
+Four or five of those are the protocol: reading it, reading the role card and
+the report schema, then writing the report back. The report is the only channel
+a stuck job has, and the checkpoints are what a failover resumes from. The other
+half of the extra turns is unexplained.
 
 So on a single seat you are paying about double for a merge gate carrying graded
 evidence, per-job scope measurement, caps that bind — and one thing that is easy

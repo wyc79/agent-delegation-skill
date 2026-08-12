@@ -246,7 +246,9 @@ orchestrator/
 ├── delegate              the entry point
 ├── adg/                  the runtime: state machine, router, quota, cooldowns,
 │                         adapters, verification, prompts  (see its README)
-├── tests/                two suites, no tokens spent
+├── tests/                two suites that spend nothing, plus
+│                         test_skill_behaviour.py which launches a real agent
+│                         CLI and does cost money — run that one deliberately
 └── workflows/default/    the contract DISPATCHED agents follow — what a
                           worktree is, what the scope boundary means, what to
                           write on the way out. Orchestrator-internal, not
@@ -500,7 +502,7 @@ keeping it moving when one empties.
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 173 tests, no tokens spent
+python3 orchestrator/tests/test_orchestrator.py  # 176 tests, no tokens spent
 python3 orchestrator/tests/test_failover.py      # 101 more, same
 ```
 
@@ -537,11 +539,17 @@ same two jobs come in at **1.77x and 2.10x**; the arm-level 1.51x is diluted by
 run-to-run noise wide enough to have produced one pair where `delegate` looked
 *cheaper*, which did not reproduce.
 
-Where the overhead goes is stable across both jobs: **four turns of protocol
-layer, every time** — reading `PROTOCOL.md`, the role card and the report
-schema, then writing the report. That is not waste to be trimmed. Three of those
-four are what makes a job resumable on another provider, and the fourth is the
-only way a stuck job can tell you why it stopped.
+Where it goes is only **half** accounted for. Both jobs show four to five
+turns of protocol layer — reading `PROTOCOL.md`, the role card and the report
+schema, then writing the report — against eight to ten extra turns in total. The
+rest is more `Bash` calls and more source files read, and this repository does
+not know why. The prompt is ~1.5x longer, which is a plausible cause and is not
+evidence.
+
+What the protocol half buys is real: the report is the only channel a stuck job
+has, and the checkpoint commits are what a failover resumes from. What the other
+half buys is unknown, and calling all of it "the feature list" would be a nicer
+story than the data tells.
 
 What that overhead buys is everything the script leaves out because it is a
 throwaway: a merge gate that hands a human graded evidence before anything
