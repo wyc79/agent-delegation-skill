@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import time
 
-from . import prompts, quota
+from . import quota
 from .store import git
 
 
@@ -357,18 +357,18 @@ class HerdrAdapter(LocalAdapter):
         tail = re.sub(r"[^a-z0-9]+", "", os.path.basename(task_dir.rstrip("/")).lower())[-6:]
         return re.sub(r"[^a-z0-9-]+", "-", "%s-%s" % (role.lower(), tail or "task"))[:32]
 
-    # A pane renders the agent on the terminal's alternate screen, so reading it
-    # back yields TUI chrome rather than the reply -- these run as subprocesses.
-    # Everything else communicates through report files, where a pane costs
-    # nothing and buys the human a window into the run.
+    # Every role runs in a pane, because every role this program dispatches
+    # communicates through report files on disk. There used to be an exception
+    # list -- `classifier`, `intake`, `reporter`, one-shot questions whose whole
+    # answer was a line of text this program parsed back -- and a pane renders
+    # on the terminal's alternate screen, so reading one back yields TUI chrome
+    # rather than the reply. Those roles went with the protocol.
     #
-    # One definition, in prompts, because the same set decides something else:
-    # these roles are not given AGENT_DELEGATION_ROLE. Two copies of a set that
-    # answers two questions drift, and the drift is silent in both directions.
-    TEXT_REPLY_ROLES = prompts.TEXT_REPLY_ROLES
-
+    # The constraint outlives them: a role whose answer must be READ BACK cannot
+    # run in a pane. Anything added here that is not report-file-shaped needs
+    # `LocalAdapter.start_agent` directly.
     def start_agent(self, role, kind, cwd, env):
-        if not self.panes or role in self.TEXT_REPLY_ROLES:
+        if not self.panes:
             return LocalAdapter.start_agent(self, role, kind, cwd, env)
         pane = self._cli(["pane", "split", "--current", "--direction", "right",
                           "--cwd", cwd, "--no-focus"], check=False)

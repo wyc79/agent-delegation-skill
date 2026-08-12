@@ -21,11 +21,12 @@ task directory on disk; none of them sees your context and you never see theirs.
 
 ## Before anything: is there more than one seat?
 
-Run `delegate init` and read the role assignments. **If every tier resolves to
-one provider, stop — do not delegate.** The whole value here is placing work
-across seats that empty at different times. On one seat you are paying for
-subprocess indirection and isolation you could get from your own subagents,
-more slowly and with no shared prompt cache.
+Run `delegate init` and read the tier table. **If every tier resolves to one
+provider, stop — do not delegate.** `init` says which case you are in, in as
+many words. The whole value here is placing work across seats that empty at
+different times. On one seat you are paying for subprocess indirection and
+isolation you could get from your own subagents, more slowly and with no shared
+prompt cache.
 
 Measured, on a task with four independent jobs and no quota pressure: against
 the same work done by parallel subagents in one warm context, delegating cost
@@ -96,7 +97,7 @@ concurrently on another.
 ## Running it
 
 ```bash
-delegate init                                  # seats, tiers, providers
+delegate init                                  # which seat serves which tier
 delegate run "<label>" --plan jobs.md          # dispatch
 delegate status                                # one line per task
 delegate show --brief                          # the merge-gate brief
@@ -122,16 +123,23 @@ retry it on a dearer model or rewrite your plan; that decision is yours, and
 worktree and its commits are left in place for whatever you decide.
 
 **Nothing reviewed the work.** The merge-gate brief says so plainly. What you
-get is: which files each job touched, which fell outside its declared scope, the
-output of the checks you configured, and what each seat cost. Judging the result
-against what you asked for is the step after this one.
+get is a row per job — the files it touched, and which of them fell outside the
+`file_scope` you gave it — plus the output of your checks and what each seat
+cost. Judging the result against what you asked for is the step after this one:
+with your own review skills, or by running a quality pass over the patch.
+`delegate` runs none of its own, and one it ran would be a worse version of
+yours behind a subprocess boundary.
 
 **The patch is the deliverable.** Attended mode writes `integrate.patch` and
-commits nothing to your branch.
+commits nothing to your branch. `--mode autonomous` pushes the task branch to
+`origin` instead and stops there — it opens no pull request, because proposing
+work that nothing reviewed is your call, not the dispatcher's.
 
 ## Checks
 
-Optional `.adg.yaml` in the repository being worked on:
+Optional `.adg.yaml` in the repository being worked on. These are the checks
+**you** decide are ground truth; nothing here has an opinion about what a
+passing change looks like:
 
 ```yaml
 fast: ["make build"]          # after every attempt on a job

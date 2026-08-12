@@ -4,10 +4,10 @@ Deterministic control flow. LLMs choose among edges the graph already offers,
 through validated outputs -- they never invent a transition. Every run is
 replayable from task.json.
 
-Scope: the full pipeline, including parallel subtasks in separate worktrees, the
-Integrator, and an independent Test Author. The ladder walks rungs 0, 2, 3 and 4
- -- rung 1, "a different model at the same tier", is not built: the router
-escalates by raising a capability floor, which has no same-tier expression.
+Scope: place the caller's jobs on seats, run each in its own worktree, retry a
+job against the caller's checks while its attempt budget allows, hop seats when
+a provider walls, and merge what comes back. Nothing here decides what the work
+is or whether it was done well.
 """
 
 import os
@@ -17,24 +17,23 @@ import threading
 import time
 
 from . import (brief, cooldown, limits as lim, prompts, quota,
-               router as routing, schema, verify, winnow, workflow as wf,
-               yamlite)
+               router as routing, schema, verify, workflow as wf, yamlite)
 from .store import git
 
-# Statuses the machine can actually be resumed at -- `cli.cmd_resume` validates
-# `--stage` against this list. "verify" is deliberately absent: checks run inside
-# `implement` and `review` rather than as a stage of their own, so there is no
-# `_stage_verify`. Listing it let a resume pass validation and then park with
-# "no handler for stage 'verify'", which is the exact outcome that validation was
-# added to prevent.
-# The whole graph. `delegate` places work on seats and integrates what comes
-# back. Deciding WHAT the work is, and whether it was done well, belongs to the
-# caller -- which has already made both judgements before invoking this. The
-# role protocol that used to live here (intake, classify, brainstorm, plan,
-# review) was measured against a caller doing the same job in one warm context
-# and lost on every axis but isolation: 4x the money, 4x the wall clock, 4x the
-# tokens, for an identical 31/31. What no model release makes redundant is the
-# seat that empties at 3pm, so that is what is left.
+# The whole graph, and the statuses a run can be resumed at -- `cli.cmd_resume`
+# validates `--stage` against this list. `delegate` places work on seats and
+# integrates what comes back. Deciding WHAT the work is, and whether it was done
+# well, belongs to the caller, which has already made both judgements before
+# invoking this. The role protocol that used to live here (intake, classify,
+# brainstorm, plan, review) was measured against a caller doing the same job in
+# one warm context and lost on every axis but isolation: 4x the money, 4x the
+# wall clock, 4x the tokens, for an identical 31/31. What no model release makes
+# redundant is the seat that empties at 3pm, so that is what is left.
+#
+# "verify" is deliberately not a stage: checks run inside `implement` and
+# `integrate` rather than beside them, so there is no `_stage_verify`. Listing
+# it here let a resume pass validation and then park with "no handler for stage
+# 'verify'", which is the exact outcome the validation exists to prevent.
 STAGES = ["implement", "integrate", "done"]
 TERMINAL = {"done", "abandoned", "needs_human"}
 
@@ -51,10 +50,6 @@ TERMINAL = {"done", "abandoned", "needs_human"}
 # patch.
 IDENTITY = ["-c", "user.email=orchestrator@agent-delegation", "-c", "user.name=adg"]
 
-# Transcript filenames are sequenced, and a wave writes them from several
-# threads at once. Lost with the classifier prompt block that happened to sit
-# above it -- which is exactly the kind of thing a smoke test catches and a
-# reading does not.
 def _stamp(epoch):
     """A reopen time a human can act on, in their own zone."""
     if not epoch:
@@ -62,6 +57,9 @@ def _stamp(epoch):
     return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(float(epoch)))
 
 
+# Transcript filenames are sequenced under a lock: a wave writes them from
+# several threads at once, and two agents sharing a filename is one agent's
+# prompt and output gone.
 _LOG_SEQ = [0]
 _LOG_LOCK = threading.Lock()
 
@@ -92,13 +90,12 @@ class AwaitingApproval(Exception):
     then flows into the next stage's prompt, which is strictly more than y/N
     ever carried.
 
-    `resume_status` is where the run continues once approved, and it is not
-    always the stage that asked: the design and plan gates sit at the END of
-    their stage, so re-entering it would re-run the planner and re-author the
-    tests for a question that has already been answered. The merge gate is
-    mid-stage -- `_land()` follows it -- so that one does re-enter, and
-    `_stage_integrate` consumes the recorded decision before building a brief
-    it no longer needs.
+    `resume_status` is where the run continues once approved, and it need not be
+    the stage that asked: a gate sitting at the END of its stage would re-run
+    that stage on re-entry, paying again for work already done. The merge gate
+    is mid-stage -- `_land()` follows it -- so that one does re-enter, and
+    `_stage_integrate` consumes the recorded decision before building a brief it
+    no longer needs.
     """
 
     def __init__(self, kind, brief, resume_status):
@@ -231,35 +228,6 @@ class Orchestrator:
             return "needs_human"
 
     # --------------------------------------------------------------- stages
-    CRITERIA_PROMPT = """Turn this request into acceptance criteria.
-
-Reply with exactly this markdown and nothing else:
-
-## Acceptance criteria
-
-- **AC-1** — <one checkable statement>
-- **AC-2** — ...
-
-## Non-goals
-
-- <something a reasonable reader might assume is included, and is not>
-
-## Open questions
-
-- <question> — *default:* <what you will assume if nobody answers>
-
-Rules: each criterion is one observable claim someone could verify, not a
-paragraph. Infer nothing grand — if the request is small, two criteria is a
-complete answer. Omit the open-questions section entirely when the request
-admits only one sensible reading.
-
---- REQUEST ---
-%(request)s
-
---- REPOSITORY ---
-%(facts)s
-"""
-
     def _reseed(self, planned):
         """Subtasks from a new plan, keeping what a surviving id already owns.
 
@@ -358,8 +326,10 @@ admits only one sensible reading.
         return False
 
     def _read_plan_subtasks(self):
-        """Parse the fenced YAML block the planner wrote. A plan we cannot
-        parse is a protocol failure, not something to guess around."""
+        """Parse the fenced YAML block the caller wrote. A plan we cannot parse
+        is refused rather than guessed around: the caller owns the
+        decomposition, so a block this cannot read is a question for the caller
+        and not something to interpret generously."""
         text = self.task.read_text("plan.md", "")
         blocks = re.findall(r"```ya?ml\s*\n(.*?)```", text, re.S)
         for raw in blocks:
@@ -424,8 +394,9 @@ admits only one sensible reading.
         self._ensure_worktree()
         state = self.task.state
         if not state.get("subtasks"):
-            # Resuming into implement with a plan already on disk: re-read it
-            # rather than re-running (and re-paying for) the planner.
+            # Resuming into implement with a plan already on disk, or entering
+            # it for the first time with one the caller supplied through
+            # `--plan`: both are the same situation, and both read it here.
             recovered = self._read_plan_subtasks()
             if recovered:
                 state = self.task.update(subtasks=self._reseed(recovered))
@@ -447,7 +418,7 @@ admits only one sensible reading.
         if not wave:
             # Nothing is ready and nothing is running: every pending subtask is
             # waiting on a dependency that will never complete -- a cycle, or a
-            # `depends_on` naming an id the plan never defines. The planner
+            # `depends_on` naming an id the plan never defines. The caller
             # writes those ids, so this is an ordinary bad plan, and indexing
             # the empty wave below turned it into `IndexError: list index out of
             # range` and a crash.log. Say which subtask waits on what instead:
@@ -515,9 +486,9 @@ admits only one sensible reading.
         """Bring a reused subtask worktree up to the integration branch.
 
         A subtask's own checkout is a snapshot of the moment it was cut. Coming
-        back for a rework, it is missing everything its siblings landed in the
-        meantime -- so the checks ran against an incomplete tree and a reviewer
-        finding citing a sibling's file pointed at a file the agent could not
+        back for another attempt, it is missing everything its siblings landed
+        in the meantime -- so the checks ran against an incomplete tree, and a
+        failure citing a sibling's file pointed at a file the agent could not
         see. Where the branch is already merged this is a fast-forward and
         cannot conflict; where it is not (an interrupted subtask carrying
         salvage commits) a real merge is attempted and abandoned cleanly if it
@@ -586,7 +557,7 @@ admits only one sensible reading.
                 self.log("  %s: agent reported %s" % (sub["id"], claimed))
             if claimed == "blocked":
                 # The agent's own account is that nothing further is possible.
-                # That is rung 4 by definition, not a routing decision.
+                # Nothing here is better placed to disagree with it.
                 raise Halt("needs_human", "%s reported blocked: %s" % (
                     sub["id"], (report or {}).get("summary", "")[:200]))
             if claimed == "escalate":
@@ -603,13 +574,13 @@ admits only one sensible reading.
                 raise Halt("needs_human", self._escalated(sub, report))
             if result.ok and not sub.get("actual_files") and not self._touched(base, sub):
                 # Only for a subtask that has never produced anything. Now that
-                # the diff base follows the tree, a rework round that changes
-                # nothing also shows an empty diff -- and halting the run there
-                # would be a new failure mode invented as a side effect: an
-                # implementer that ignores its findings is what the reviewer and
-                # `max_review_loops` are for, and they end the run with a verdict
-                # rather than a park. The case this guard exists for is the
-                # first attempt on green checks, and that is unchanged.
+                # the diff base follows the tree, a later attempt that changes
+                # nothing also shows an empty diff, and halting there would be a
+                # new failure mode invented as a side effect -- a job whose
+                # second attempt is a no-op has already been paid for and its
+                # report still reaches the caller. The case this guard exists
+                # for is the first attempt on green checks: an agent that did
+                # nothing at all, on a tree that was passing before it started.
                 raise Halt("needs_human",
                            "%s changed no files, and the checks were already green "
                            "before it ran — passing tests are not evidence of work"
@@ -798,14 +769,11 @@ admits only one sensible reading.
         from the task base gave every wave a checkout of the repository as it
         was before the task started, which broke two promises at once:
         `references/parallelism.md` says a subtask worktree is "cut from the
-        task's integration branch", and `roles/implementer.md` tells the agent
-        that `depends_on` "tells you what already exists". Neither held -- a
-        second wave could not see the first wave's merged output, so a subtask
-        that depended on one already finished began by importing a file that was
-        not there. The test author's failing tests were invisible the same way:
-        they are committed into the integration worktree during `plan`, and a
-        wave cut from the base never contained them, so the checks an
-        implementer ran were green because the requirement was absent.
+        task's integration branch", and a job's `depends_on` is what tells its
+        agent that the work it builds on already exists. Neither held while this
+        cut from the base -- a second wave could not see the first wave's merged
+        output, so a job that depended on one already finished began by
+        importing a file that was not there.
 
         Falls back to the base when the branch does not exist yet, which is the
         first worktree of the task and the one case where they are the same
@@ -1043,25 +1011,6 @@ admits only one sensible reading.
         if violations and violations[0]:
             self.log("  scope: %d file(s) outside declared scope" % len(violations[0]))
 
-    def _winnow(self, base, result):
-        """Deterministic chaff scan, if code-winnow is installed. Free enough to
-        run even when LLM review is skipped, which is exactly when the extra
-        evidence is worth most."""
-        if (self.vcfg.get("winnow") or "auto") == "never":
-            return None
-        configured = self.vcfg.get("winnow_scan")
-        scan_py = winnow.find(self.repo, configured)
-        if not scan_py:
-            return {"ran": False,
-                    "why": winnow.misconfigured(configured) or "code-winnow not installed"}
-        summary = winnow.run(self.task, scan_py, base,
-                             self.task.state["repo"].get("base_commit", "HEAD"),
-                             result.run_id)
-        if summary and summary.get("ran"):
-            self.log("  chaff scan: %d note(s), %d notable"
-                     % (summary["total"], len(summary["notable"])))
-        return summary
-
     def _human_note(self):
         """The last thing a human said at a gate, formatted for a prompt.
 
@@ -1070,12 +1019,9 @@ admits only one sensible reading.
         slightly different, and the agent that builds it has to be told, or the
         note is a record of an instruction nobody followed.
 
-        It carries forward rather than being consumed by its first reader. A
-        qualification on the plan applies to every subtask under that plan, not
-        only the first one dispatched; and the reviewer needs it too, or it
-        flags the retained endpoint as scope creep and rejects work that is
-        doing exactly what the human asked for. Superseded by the next
-        approval, never cleared on read.
+        It carries forward rather than being consumed by its first reader: a
+        qualification applies to every job dispatched under it, not only the
+        next one. Superseded by the next approval, never cleared on read.
         """
         gn = self.task.state.get("gate_note") or {}
         note = (gn.get("note") or "").strip()
@@ -1110,26 +1056,24 @@ admits only one sensible reading.
         files = sorted({f for s in state["subtasks"] for f in s.get("actual_files", [])})
         base = self._ensure_worktree()
         result = verify.run(self.task, self.repo, base, "fast")
-        # The chaff scan used to run inside `review`, but it is not a review: no
-        # model reads it and nothing routes on it. It is a deterministic pass
-        # over the diff whose output the merge brief prints, so it belongs on
-        # the path that still exists. Left in `review` it would have gone with
-        # the reviewer, and the brief would have quietly lost a section that
-        # still had everything it needed to produce.
-        self.task.update(winnow=self._winnow(base, result))
-        # Said plainly, every time. `delegate` runs no reviewer: it places the
-        # work the caller decomposed and integrates what comes back, and the
-        # only judgement in the record is the caller's own plus the checks
-        # below. A brief that did not say so would let a human read "complete,
-        # checks pass" as "something looked at this".
+        # Said plainly, every time. `delegate` runs no reviewer and no quality
+        # pass of any kind: it places the work the caller decomposed and
+        # integrates what comes back, and the only judgement in the record is
+        # the caller's own plus the checks below. A brief that did not say so
+        # would let a human read "complete, checks pass" as "something looked at
+        # this".
+        #
+        # A code-winnow chaff scan used to run here and print into this brief.
+        # It came out with the rest of the judgement: choosing which quality
+        # pass runs over the change is the caller's, and a caller that wants one
+        # runs it over the patch this produces -- or dispatches it THROUGH here
+        # as jobs of its own, which is the relationship that makes this a
+        # wrapper rather than a competitor.
         note = ("**Nothing reviewed this.** `delegate` dispatched the subtasks "
                 "you supplied and merged what came back; the automated checks "
                 "below, and the scope column above, are the whole of the "
                 "evidence. Judging the work against what you asked for is "
                 "yours, and this is the point to do it.")
-        chaff = winnow.as_text(self.task.state.get("winnow"))
-        if chaff:
-            note += "\n\n" + chaff
         text, problems = brief.write(
             self.task, "merge",
             "Land this change? It is complete and its checks pass. Nothing has been "
@@ -1156,8 +1100,13 @@ admits only one sensible reading.
         self._reap_worktrees()
 
     def _land(self):
-        """attended: write the diff as a patch for the human to apply. The
-        orchestrator has no path that commits to the user's branch."""
+        """Where a run ends: a patch file, or a pushed branch.
+
+        Neither commits to the user's branch and neither merges. The two modes
+        differ only in whether the work leaves this machine -- attended hands
+        back a diff to apply, autonomous puts the branch on the remote so
+        somebody else can fetch it.
+        """
         state = self.task.state
         wt = state.get("worktree")
         if not wt or self.dry_run:
@@ -1176,39 +1125,31 @@ admits only one sensible reading.
             self.log("integrate: patch ready at %s" % patch)
             self.log("           apply with: git apply %s" % patch)
         else:
-            self._push_and_open_pr(branch)
+            self._push(branch)
 
-    def _push_and_open_pr(self, branch):
-        """Autonomous mode ends at an opened PR. There is deliberately no merge
-        path here -- the credential may even be branch-restricted."""
-        import shutil as _shutil
+    def _push(self, branch):
+        """Autonomous mode ends at a pushed branch, and stops there.
+
+        It used to run `gh pr create` as well, with the merge brief as the body.
+        Opening a pull request is an outward-facing act on the caller's account
+        -- it notifies reviewers, it is the thing a team reacts to -- and this
+        program is a dispatcher that does not know whether the work is ready to
+        be shown to anyone. Nothing here reviewed it. Deciding that a branch is
+        worth proposing belongs to whoever wrote the jobs, and it is one command
+        once the branch is on the remote.
+
+        The push itself stays: without it the work never leaves this machine,
+        which is the whole difference between the two modes. There is still no
+        merge path, and the credential may even be branch-restricted.
+        """
         push = subprocess.run(["git", "push", "-u", "origin", branch],
                               cwd=self.repo, capture_output=True, text=True)
         if push.returncode != 0:
             raise Halt("needs_human", "could not push %s: %s"
                        % (branch, push.stderr.strip()[:200]))
         self.log("integrate: pushed %s" % branch)
-        if _shutil.which("gh") is None:
-            self.log("           gh not installed — open the PR yourself")
-            return
-        body = self.task.read_text("brief.md", "")
-        pr = subprocess.run(
-            ["gh", "pr", "create", "--head", branch, "--title",
-             "%s: %s" % (self.task.state["id"], self._title()), "--body", body],
-            cwd=self.repo, capture_output=True, text=True)
-        if pr.returncode != 0:
-            self.log("           gh pr create failed: %s" % pr.stderr.strip()[:200])
-            return
-        url = (pr.stdout or "").strip().splitlines()[-1:] or [""]
-        self.log("integrate: opened %s" % url[0])
-        self.task.update(pull_request=url[0])
-
-    def _title(self):
-        for line in self.task.read_text("task.md", "").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and not line.startswith(">"):
-                return line[:70]
-        return "delegated change"
+        self.log("           open a pull request from it when you have judged "
+                 "the work: gh pr create --head %s" % branch)
 
     # ---------------------------------------------------------------- infra
     def _top_tier(self):
@@ -1611,14 +1552,14 @@ admits only one sensible reading.
         return session, report, choice
 
     def _replacement(self, role, choice, cooled):
-        """The same rung on another seat.
+        """The same strength on another seat.
 
-        A quota hop must not walk back down the escalation ladder. If this
-        subtask had already escalated to a stronger model, re-selecting on plain
-        role requirements would quietly hand the work to a weaker one and log it
-        as an ordinary failover -- the run would look like it was still climbing
-        while it was descending. Ask for at least the current model's reasoning
-        first; only drop below it when no seat can hold the rung, and say so."""
+        A quota hop must not quietly downgrade the job. The caller asked for a
+        band, and re-selecting on plain profile requirements would hand the work
+        to whatever scores best among what is left -- which can be weaker than
+        what was running -- while the log called it an ordinary failover. Ask
+        for at least the current model's reasoning first; only drop below it
+        when no seat can hold that floor, and say so when it happens."""
         floor = int(choice.spec.get("reasoning", 0) or 0)
         try:
             return self._pick(role, exclude=tuple(cooled), min_reasoning=floor)
@@ -1639,8 +1580,10 @@ admits only one sensible reading.
         dies on the first attempt leaves nothing committed at all. Without this
         the handover note below would be asserting something usually false.
 
-        Guarded on the worktree: planner and brainstorm run with `cwd=self.repo`,
-        and this program has no path that commits to the user's own branch."""
+        Guarded on the worktree. Every stage now dispatches inside one, so the
+        guard should never fire -- and it stays because this program has no path
+        that commits to the user's own branch, and a salvage commit is the one
+        place a bug would create one silently."""
         if os.path.abspath(cwd) == os.path.abspath(self.repo):
             return False
         label = subtask.get("id") if subtask else role
@@ -1747,7 +1690,7 @@ admits only one sensible reading.
             # And the id must fill the name, not merely appear in it. The
             # contract is `<stage>-<id>.json` (PROTOCOL.md step 3); a substring
             # test hands st-1 the report of a sibling named st-11, and the
-            # planner -- not this code -- chooses the ids. The stage token is
+            # caller -- not this code -- chooses the ids. The stage token is
             # not pinned to a word list, only forbidden from containing the
             # separator, so `implement-st-alpha.json` can never be claimed by
             # a subtask named plain `alpha`.

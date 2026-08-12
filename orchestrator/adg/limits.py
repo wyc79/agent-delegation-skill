@@ -6,11 +6,16 @@ these -- every counter is incremented by the orchestrator from observed events,
 so a limit cannot be negotiated away in a prompt.
 """
 
+# Every limit here is checked before the action that would consume it, and
+# every one of them is consumed by something. `max_review_loops` and
+# `max_replans` were required here long after the loops they bounded were
+# removed: a run refused to start without two numbers nothing counted, and the
+# budget line reported "review loops 0/2" for machinery that no longer existed.
+# A limit that cannot bind is not a limit, and requiring one is worse than not
+# having it -- it reads as a bound on a deployment that has none.
 REQUIRED = (
     "max_cost_usd",
     "max_attempts_per_subtask",
-    "max_review_loops",
-    "max_replans",
     "max_parallel_agents",
 )
 
@@ -97,24 +102,6 @@ class Budget:
                 "subtask %s has used all %d attempts" % (subtask, cap),
                 "escalate")
 
-    def check_review_loop(self):
-        used = int(self.spent.get("review_loops", 0))
-        cap = int(self.limits["max_review_loops"])
-        if used >= cap:
-            raise LimitBreach(
-                "max_review_loops",
-                "%d review loops already run" % used,
-                "replan")
-
-    def check_replan(self):
-        used = int(self.spent.get("replans", 0))
-        cap = int(self.limits["max_replans"])
-        if used >= cap:
-            raise LimitBreach(
-                "max_replans",
-                "already replanned %d time(s)" % used,
-                "park")
-
     # No `check_parallel` here. `max_parallel_agents` is not a
     # check-before-the-action limit like the others: nothing queues, so there is
     # nothing to raise about. `machine._wave` reads the same
@@ -144,14 +131,6 @@ class Budget:
             a[subtask] = int(a.get(subtask, 0)) + 1
         self._bump(f)
 
-    def used_review_loop(self):
-        self._bump(lambda s: s.__setitem__("review_loops", int(s.get("review_loops", 0)) + 1))
-
-    def used_replan(self):
-        self._bump(lambda s: s.__setitem__("replans", int(s.get("replans", 0)) + 1))
-
     def summary(self):
-        return "$%.2f/$%.2f · review loops %d/%d · replans %d/%d" % (
-            float(self.spent.get("usd", 0.0)), float(self.limits["max_cost_usd"]),
-            int(self.spent.get("review_loops", 0)), int(self.limits["max_review_loops"]),
-            int(self.spent.get("replans", 0)), int(self.limits["max_replans"]))
+        return "$%.2f/$%.2f" % (float(self.spent.get("usd", 0.0)),
+                                float(self.limits["max_cost_usd"]))

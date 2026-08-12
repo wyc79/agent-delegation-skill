@@ -382,15 +382,32 @@ class TestShadowPrice(unittest.TestCase):
 
 
 class TestReserve(unittest.TestCase):
-    """claude-seat reserves 30% for planner/reviewer in registry.default.yaml."""
+    """claude-seat reserves 30% for the integrator in registry.default.yaml.
+
+    It reserved for `planner` and `reviewer` until those roles stopped being
+    dispatched, at which point every role that DOES run was the non-reserved
+    one and the reservation withheld the seat on behalf of nobody. The
+    integrator is the honest claimant: it is dispatched last, after the wave
+    that drew the seat down has already been paid for.
+    """
 
     def setUp(self):
         self.reg = router.load_registry(REGISTRY)
         self.r = router.Router(self.reg)
 
     def test_a_reserved_role_keeps_the_seat_at_any_draw(self):
-        got = self.r.candidates("reviewer", utilization={"claude-seat": 0.95})
+        got = self.r.candidates("integrator", utilization={"claude-seat": 0.95})
         self.assertIn("claude-seat", {c.channel for c in got})
+
+    def test_the_reserved_role_is_one_the_machine_actually_dispatches(self):
+        """The defect that made the reservation inert. A role named here that
+        no stage dispatches reserves headroom nobody can claim."""
+        from adg import workflow as wf
+        dispatched = {spec.get("role") for spec in wf.Workflow.load().stages.values()}
+        for chan in self.reg["channels"].values():
+            for role in (chan.get("reserve_for") or []):
+                self.assertIn(role, dispatched,
+                              "%r is reserved for and never dispatched" % role)
 
     def test_a_non_reserved_role_is_filtered_past_the_floor(self):
         got = self.r.candidates("implementer",
@@ -408,8 +425,8 @@ class TestReserve(unittest.TestCase):
         held = self.r.candidates("implementer", utilization={"claude-seat": 0.8},
                                  cooldowns={"cursor-seat"}, ignore_reserve=True)
         # By channel and flag, not by count: claude-seat exposes more than one
-        # model the implementer may use (balanced-coder to work with, opus as
-        # its escalation rung), and how many that is is not what this asserts.
+        # model an unbanded job may use, and how many that is is not what this
+        # asserts.
         self.assertTrue(held, "the withheld seat was not offered at all")
         self.assertEqual({c.channel for c in held}, {"claude-seat"})
         self.assertTrue(all(c.demoted for c in held),
@@ -689,10 +706,6 @@ class TestFailoverEndToEnd(unittest.TestCase):
         """An implementer that hits a quota wall on its first channel only."""
         state = {"seen": []}
 
-        def planner(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
-                fh.write(PLAN_MD)
-
         def implementer(env, cwd):
             state["seen"].append(cwd)
             if quota_first and len(state["seen"]) == 1:
@@ -705,15 +718,14 @@ class TestFailoverEndToEnd(unittest.TestCase):
                 "evidence": {"tests": "green"}})
             return None
 
-        return state, {"planner": planner, "implementer": implementer,
-                       "test-author": lambda e, c: None,
-                       "classifier": lambda e, c: {"output": "VERDICT: SIMPLE -- small"},
-                       "reviewer": lambda e, c: None}
+        return state, {"implementer": implementer}
 
-    def _run(self, script, clock=None):
+    def _run(self, script, clock=None, plan=None):
         task = store.Task.create(self.t.repo, "T-001",
                                  "# t\n\n- **AC-1** — subtract exists\n", self.pol)
-        task.write_text("plan.md", PLAN_MD)
+        # Where `--plan` lands it. The caller supplies the decomposition, so
+        # every one of these runs starts from a plan already on disk.
+        task.write_text("plan.md", plan or PLAN_MD)
         logs = []
         clock = clock or (lambda: T0)
         adapter = runtime.MockAdapter(script, now=clock)
@@ -793,71 +805,6 @@ class TestFailoverEndToEnd(unittest.TestCase):
                      clock=lambda: T0, logs=logs)
         self.assertIsNotNone(orch._pick(), "refused to start")
         self.assertTrue(any("anyway" in x for x in logs), "started without saying why")
-
-    def test_the_two_skill_searches_do_not_diverge(self):
-        """`companions` and `winnow` both answer "is this skill installed", and
-        they had different answers. `winnow` searched project-local trees and
-        `plugins/marketplaces`; `companions` searched neither, so a superpowers
-        install `winnow.find()` could see reported "not installed" there — and
-        `_stage_brainstorm` silently dropped to the generic prompt.
-
-        Neither module has to own the list. What must not happen is the two
-        drifting apart again without anything noticing.
-        """
-        from adg import companions, winnow
-        home = {r for r in companions.ROOTS if r.startswith("~")}
-        for entry in winnow.SEARCH:
-            if not entry.startswith("~"):
-                continue
-            root = entry.split(os.sep + "code-winnow")[0]
-            self.assertIn(root, home, "winnow searches %s and companions does not" % root)
-        for root in winnow.PLUGIN_ROOTS:
-            self.assertIn(root, home,
-                          "winnow searches the plugin root %s and companions does not" % root)
-        self.assertTrue(companions.PROJECT_ROOTS,
-                        "companions cannot see a project-local install at all")
-
-    def test_both_searches_find_a_plain_skill_in_a_skills_directory(self):
-        """The list check above compares strings; this one compares answers.
-
-        `winnow.SEARCH` reads `<root>/.claude/skills/code-winnow/...`, so a plain
-        skill dropped into a skills directory is the layout both modules are
-        pointed at. `companions.KNOWN` carried fragments that began with
-        `skills/` while every root already ended in one, so that layout probed
-        `.claude/skills/skills/brainstorming/SKILL.md` and could not match: only
-        plugin-nested installs were ever detected. The two modules answered
-        differently about the same tree, which is exactly what the sibling test
-        above claims to prevent and cannot see.
-        """
-        import shutil
-        import tempfile
-        from adg import companions, winnow
-        repo = tempfile.mkdtemp(prefix="skills-")
-        for rel in ("brainstorming/SKILL.md", "karpathy-guidelines/SKILL.md",
-                    "code-winnow/scripts/scan.py"):
-            path = os.path.join(repo, ".claude", "skills", rel)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as fh:
-                fh.write("x")
-        # A home install of either companion would answer for this repo, and the
-        # machine running the suite may well have one.
-        saved = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
-        os.environ["HOME"] = os.environ["USERPROFILE"] = tempfile.mkdtemp(prefix="nohome-")
-        try:
-            found = companions.detect(repo)
-            self.assertTrue(winnow.find(repo), "winnow cannot see the flat layout")
-            self.assertEqual(found, {"karpathy-guidelines": True, "superpowers": True},
-                             "winnow found this tree and companions did not: %s" % found)
-            self.assertEqual(companions.detect(tempfile.mkdtemp(prefix="bare-")),
-                             {"karpathy-guidelines": False, "superpowers": False},
-                             "an empty tree reports skills as installed")
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-            shutil.rmtree(repo, ignore_errors=True)
 
     def test_a_timeout_on_every_seat_is_not_reported_as_a_quota_wall(self):
         """The failure the split introduced, and that no test drove.
@@ -1025,10 +972,8 @@ class TestFailoverEndToEnd(unittest.TestCase):
         first, other = _seats(self.reg)[:2]
         cost_table = text.split("## Who did the work")[1].split("##")[0]
         # The implementer rows only. Scanning the whole table for the refused
-        # seat's name is not the same question: that seat also serves other
-        # roles -- the classifier runs there, because only it exposes
-        # `fast-cheap` -- and a row for a call that really happened is exactly
-        # what the table is for.
+        # seat's name is not the same question: a row for a call that really
+        # happened on that seat is exactly what the table is for.
         rows = [r for r in cost_table.splitlines() if "implementer" in r]
         self.assertEqual(len(rows), 1,
                          "the refused seat was billed a row of its own: %s" % rows)
@@ -1051,15 +996,9 @@ class TestFailoverEndToEnd(unittest.TestCase):
             "- id: st-1-a\n  goal: Add a\n  file_scope: [\"a.py\"]\n  acceptance: [AC-1]\n"
             "- id: st-2-b\n  goal: Add b\n  file_scope: [\"b.py\"]\n  acceptance: [AC-1]\n")
 
-        def planner(env, cwd):
-            with open(os.path.join(env["AGENT_DELEGATION_TASK_DIR"], "plan.md"), "w") as fh:
-                fh.write(plan)
-
         _, script = self._script(quota_first=True)
-        script = dict(script, planner=planner,
-                      implementer=lambda e, c: blocked(QUOTA_MSG),
-                      classifier=lambda e, c: {"output": "VERDICT: COMPLEX -- two parts"})
-        task, status, logs = self._run(script)
+        script = dict(script, implementer=lambda e, c: blocked(QUOTA_MSG))
+        task, status, logs = self._run(script, plan=plan)
         self.assertEqual(status, "needs_human", "\n".join(logs))
         self.assertEqual((task.state.get("park") or {}).get("reason"),
                          "quota_all_exhausted",
@@ -1099,16 +1038,16 @@ class TestFailoverEndToEnd(unittest.TestCase):
                          "the replacement inherited a dirty tree")
 
     def test_salvage_never_commits_into_the_users_checkout(self):
-        # planner and brainstorm run with cwd=self.repo. This program has no
-        # path that commits to the user's own branch, and failover must not
-        # become one.
+        # Handed the real checkout rather than a worktree. This program has no
+        # path that commits to the user's own branch, and failover -- the one
+        # place it commits on its own account -- must not become one.
         before = store.git(["rev-parse", "HEAD"], self.t.repo)
         with open(os.path.join(self.t.repo, "stray.py"), "w") as fh:
             fh.write("# uncommitted, in the real checkout\n")
         task = store.Task.create(self.t.repo, "T-002", "# t\n", self.pol)
         orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, x: True,
                             log=lambda *_: None, clock=lambda: T0)
-        self.assertFalse(orch._salvage(self.t.repo, "planner", None))
+        self.assertFalse(orch._salvage(self.t.repo, "implementer", None))
         self.assertEqual(store.git(["rev-parse", "HEAD"], self.t.repo), before)
         self.assertIn("stray.py", store.git(["status", "--porcelain"], self.t.repo))
 

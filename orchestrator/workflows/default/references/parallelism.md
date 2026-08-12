@@ -28,9 +28,10 @@ stay inside your scope so the merge is mechanical.
    push, never switch branches, never `git checkout` another agent's branch.
 4. **Do not reformat, rename, or reorganize** files that are only incidentally in
    your path. A whole-file reformat turns a one-line merge into a manual one.
-5. **Treat frozen interfaces as contracts.** If the plan froze a signature or
-   signal for another subtask to call, changing it is a major deviation even if
-   the file is inside your scope.
+5. **Treat frozen interfaces as contracts.** If your job block froze a signature
+   or signal for another job to call, changing it breaks work you cannot see —
+   report it rather than doing it quietly, even when the file is inside your
+   scope.
 
 ## Hotspots
 
@@ -47,5 +48,6 @@ conflict no merge tool can resolve.
 
 If you are asked to resolve one, you are acting as Integrator — read
 `roles/integrator.md`. The short version: resolve by authority (the plan first,
-then logged deviations), preserve both intents when they are compatible, never
-silently drop a side, and verify the *combination* rather than the pieces.
+then whichever side explained itself), preserve both intents when they are
+compatible, never silently drop a side, and verify the *combination* rather than
+the pieces.
