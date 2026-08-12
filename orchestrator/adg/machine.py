@@ -1068,9 +1068,13 @@ class Orchestrator:
         # It belongs here rather than beside `implement`: a slow check is the
         # one that only means something once every job's work is merged, and
         # running it per attempt would pay for it once per job to learn nothing.
-        result = verify.combine(
-            verify.run(self.task, self.repo, base, "fast"),
-            verify.run(self.task, self.repo, base, "slow"))
+        # Every tier the config surface declares, not a hand-written pair. The
+        # list lives in `verify.COMMAND_TIERS` so that adding a tier to the
+        # config wires it here by construction rather than by somebody
+        # remembering -- which is exactly what did not happen for `slow`.
+        result = verify.combine(*[
+            verify.run(self.task, self.repo, base, tier)
+            for tier in verify.COMMAND_TIERS])
         if not result.ok:
             self.log("  verify: %s — the brief says so and the gate still asks"
                      % result.summary())

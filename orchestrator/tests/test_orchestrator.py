@@ -10,6 +10,7 @@ Run: python3 orchestrator/tests/test_orchestrator.py
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2725,6 +2726,129 @@ class TestResourceHygiene(unittest.TestCase):
 
     def tearDown(self):
         self.t.close()
+
+class TestTheSeams(unittest.TestCase):
+    """Tests for the gap between what this program says and what it does.
+
+    Four defects shipped here and survived a green suite of 270: `slow` checks
+    that were parsed and never run, `frozen_interfaces` stored and never
+    composed into a prompt, cached tokens priced as fresh ones, a reset-time
+    regex that only matched lowercase. None was code doing the wrong thing.
+    Each was code doing the right thing to something that never arrived, or
+    arriving somewhere nothing read.
+
+    Unit tests cannot see that shape, because each half passes on its own. The
+    two below check the join: what the documentation promises reaches the agent,
+    and what the config declares actually executes. Both are driven from the
+    source of the claim rather than from a copy of it, so a new field or a new
+    tier is covered the day it is written.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo,
+                       capture_output=True)
+        self.t.close()
+
+    # --- seam 1: the docs promise it, so the prompt must carry it ----------
+    def test_every_field_the_skill_says_reaches_the_prompt_reaches_the_prompt(self):
+        """Driven from SKILL.md, not from a list copied out of it.
+
+        `frozen_interfaces` was in that table as "carried into the agent's
+        prompt" while `compose` never mentioned it -- and for a job whose four
+        agents coordinate only through frozen contracts, that is the difference
+        between working software and four agents disagreeing at merge time.
+        Adding a field to the table without wiring it now fails here.
+        """
+        skill = _slurp(os.path.join(REPO_ROOT, "agent-delegation", "SKILL.md"))
+        rows = [ln for ln in skill.splitlines()
+                if ln.startswith("|") and "carried into the agent's prompt" in ln]
+        self.assertTrue(rows, "SKILL.md no longer claims any field reaches the "
+                              "prompt -- if the promise moved, move this test")
+        fields = re.findall(r"`([a-z_]+)`", rows[0])
+        self.assertTrue(fields, "could not read any field name out of: %s" % rows[0])
+
+        # A distinctive value per field, so a match cannot come from prose.
+        sentinels = {f: "SENTINEL-%s-9f3a" % f.replace("_", "-") for f in fields}
+        sub = {"id": "st-1", "goal": "do the thing",
+               "planned_scope": ["src/only.py"]}
+        for field, value in sentinels.items():
+            # Every one of these is a list in the schema.
+            sub[field] = [value]
+
+        task = _task(self.t.repo, "T-SEAM1", "# t\n\nx\n",
+                     self.reg["policy"]["limits"])
+        text = prompts.compose("implementer", task, subtask=sub)
+        missing = [f for f, v in sentinels.items() if v not in text]
+        self.assertEqual(missing, [],
+                         "SKILL.md promises these reach the agent's prompt and "
+                         "they do not: %s\n\n%s" % (", ".join(missing), text))
+
+    def test_the_prompt_leaks_no_model_or_routing_detail(self):
+        """The other half of the same seam, and the one that fails silently.
+
+        `prompts` opens with "Deliberately absent: any model name, any routing
+        logic, any provider detail" -- a claim nothing checked. It matters
+        because a dispatched agent that learns which model it is, or which seat
+        it landed on, can reason about it; the protocol's whole premise is that
+        an agent does one job and never sees the routing.
+        """
+        task = _task(self.t.repo, "T-SEAM2", "# t\n\nx\n",
+                     self.reg["policy"]["limits"])
+        text = prompts.compose("implementer", task,
+                               subtask={"id": "st-1", "goal": "g",
+                                        "planned_scope": ["a.py"], "tier": "t3"})
+        leaked = [m for m in self.reg["models"] if m in text]
+        leaked += [c for c in self.reg["channels"] if c in text]
+        # `tier` is the caller's routing decision and deliberately not shown:
+        # the agent cannot act on it, and telling it invites the agent to.
+        leaked += [t for t in ("t1", "t2", "t3") if re.search(r"\b%s\b" % t, text)]
+        self.assertEqual(leaked, [],
+                         "routing detail reached a dispatched agent: %s" % leaked)
+
+    # --- seam 2: the config declares it, so it must actually run ----------
+    def test_every_declared_command_tier_actually_executes(self):
+        """Driven from `verify.COMMAND_TIERS`, the same list the machine runs.
+
+        `slow` was in the config surface, in the README, and in the merge
+        brief -- and no call site ever passed it. The gate asked a human to land
+        a change whose only real check had never been executed. A tier added to
+        that surface and not wired now fails here rather than becoming
+        decoration.
+        """
+        self.assertIn("slow", verify.COMMAND_TIERS, "the defect's own tier is gone")
+        marks = {tier: "RAN-%s-7c21" % tier for tier in verify.COMMAND_TIERS}
+        lines = []
+        for tier, mark in marks.items():
+            lines.append("%s:\n  - \"echo %s\"" % (tier, mark))
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+
+        script, _ = TestEndToEnd._script(self)[0], None
+        task = _task(self.t.repo, "T-SEAM3", "# t\n\nAdd subtract\n",
+                     self.reg["policy"]["limits"])
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+
+        # The verify records are the evidence: a tier that ran left its output.
+        records = "".join(_slurp(os.path.join(task.path, "verify", f))
+                          for f in os.listdir(os.path.join(task.path, "verify")))
+        never_ran = [t for t, mark in marks.items() if mark not in records]
+        self.assertEqual(never_ran, [],
+                         "declared in the config surface and executed by "
+                         "nothing: %s" % ", ".join(never_ran))
+        # And it reached the human, not just the disk.
+        brief_text = task.read_text("brief.md", "")
+        self.assertNotIn("Not run", brief_text,
+                         "a tier ran and the brief still calls it skipped")
+
 
 class TestSlowChecks(unittest.TestCase):
     """`slow` runs at the integrate stage, which is what it was always for.

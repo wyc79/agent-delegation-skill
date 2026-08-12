@@ -19,12 +19,18 @@ from . import yamlite
 
 CONFIG_NAMES = (".adg.yaml", ".adg.yml", ".delegate.yaml")
 
-DEFAULT = {
-    "fast": [],
-    "slow": [],
-    "hotspots": [],
-    "ignore": [],
-}
+# The config keys that hold COMMANDS, declared once because two things read it:
+# the machine, which must run every tier named here, and a test, which asserts
+# it did. `slow` sat in this surface for the life of the project without a
+# single call site passing it -- parsed, documented, printed in the merge brief
+# as "not run", executed never. A tier added here and not wired now fails the
+# suite instead of quietly becoming decoration.
+#
+# Order matters: it is the order a stage boundary runs them in, cheapest first,
+# so a compile break surfaces before a twenty-minute integration suite.
+COMMAND_TIERS = ("fast", "slow")
+
+DEFAULT = dict({tier: [] for tier in COMMAND_TIERS}, hotspots=[], ignore=[])
 
 # Build output and caches are not authored changes. Counting them produces
 # phantom scope violations and inflates churn signals.
