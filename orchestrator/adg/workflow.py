@@ -66,6 +66,20 @@ def default_dir():
     return os.path.join(orchestrator, DEFAULT_DIR)
 
 
+# The role each stage dispatches under. `machine` imports these rather than
+# spelling the names again, so the manifest is validated against the string the
+# machine will actually ask `card()` for -- not against a second copy of it.
+#
+# A manifest cannot repoint these, and until this existed it could appear to.
+# `role:` was read only into the role -> card map, so renaming a stage's role
+# left `card(<the machine's name>)` returning None -- which `card` documents as
+# legitimate, meaning "this workflow supplies no card". The agent was then
+# dispatched with its card silently missing, and nothing anywhere said so. That
+# is the failure mode this project names twice in `registry.default.yaml`: a key
+# that reads like control and moves nothing.
+STAGE_ROLES = {"implement": "implementer", "integrate": "integrator"}
+
+
 class Workflow:
     """A loaded manifest. Every accessor answers for a stage or a role, so the
     caller never reaches into the dict and no key name leaks into `machine`."""
@@ -88,6 +102,18 @@ class Workflow:
                     "%s: stage %r must be a mapping, got %r. A stage with "
                     "nothing to say still needs a body -- `%s: {}`."
                     % (path, stage, spec, stage))
+            # The machine dispatches a fixed role per stage. A manifest may
+            # point that role at a different card; it may not rename the role,
+            # because nothing downstream would follow the new name.
+            want = STAGE_ROLES.get(stage)
+            got = spec.get("role")
+            if want and got is not None and got != want:
+                raise WorkflowError(
+                    "%s: stage %r declares role %r, but the machine dispatches "
+                    "it as %r and asks for that role's card. Renaming it here "
+                    "moves nothing and would leave the agent with no card. Use "
+                    "`role: %s` and point `card:` wherever you like."
+                    % (path, stage, got, want, want))
         self.stages = stages
         # Resolved at load, not on first use. `card()` is reached from
         # `prompts.compose`, which runs stages into a task and after real

@@ -1,6 +1,6 @@
 ---
 name: agent-delegation
-description: Use when you have already decided what the work is and want it run by several agents at once across more than one provider — dispatching a decomposition you wrote with the `delegate` CLI, answering the merge gate, checking what a run produced, or reading back why one stopped. It runs jobs; it does not plan, review or judge them, and nothing here is about how the work should be done.
+description: Use when jobs you have already decomposed should run as parallel agents across more than one provider — dispatching them with the `delegate` CLI, surviving a quota wall or rate limit mid-job by failing over to another seat, running each job in its own git worktree, answering the merge gate, or reading back what a run produced and why one stopped. Trigger on delegate, multi-provider, quota exhausted, rate limited, seat, failover, parallel agents, parallel worktrees, jobs.md, merge gate. It runs jobs; it does not plan, review or judge them, and nothing here is about how the work should be done.
 ---
 
 # Agent delegation
@@ -25,6 +25,10 @@ Run `delegate init` and read the tier table. **If every tier resolves to one
 provider, think hard before delegating.** `init` says which case you are in, in
 as many words. The whole value here is placing work across seats that empty at
 different times.
+
+**If `delegate` is not on PATH, go straight to `references/one-seat.md`.** It is
+the pattern below by hand — git worktrees and your own agents — and it needs
+nothing from this repository. Same if `init` runs but enrolls a single provider.
 
 **On one seat, prefer your own parallel agents.** Measured head to head on the
 same jobs and the same model, dispatching through `delegate` costs meaningfully
@@ -141,6 +145,22 @@ Mixing tiers within one batch is normal and is where this earns its cost: the
 hard job draws the strong model on one provider while the easy ones run
 concurrently on another.
 
+**The band is a preference under failover too, and that is the sharp edge.**
+When a seat walls mid-job, the replacement is asked for at least the walled
+model's reasoning score. If no seat left can hold that floor, the floor is
+dropped and the job continues on whatever is best remaining — **weaker than what
+you asked for.** It is the right call for finishing the work and the wrong one
+to discover later, so know where it shows: the run log says *"no seat left at X's
+strength — continuing on Y, which is weaker."* The merge brief does not. It
+reports spend per model, so a `t3` job that ran on the workhorse is inferable
+from the rows, but nothing states the band was abandoned.
+
+The case that bites is a band only one seat can serve — `t3` where a single
+provider exposes the strong model. Wall that seat and there is no equal
+replacement by construction, so the demotion is not an edge case, it is the
+default outcome. If a job is `t3` because a cheaper model gets it *silently*
+wrong, check the log before you trust the result.
+
 ## Running it
 
 ```bash
@@ -165,9 +185,11 @@ quota, declined and crashed all exit 1. Read the status.
 
 **A job that stopped hands you everything it knew** — its `signals` carry the
 type, the detail, the evidence and what it already tried. Nothing here will
-retry it on a dearer model or rewrite your plan; that decision is yours, and
-`superpowers:subagent-driven-development` has the procedure for making it. The
-worktree and its commits are left in place for whatever you decide.
+retry it on a dearer model or rewrite your plan; that decision is yours —
+`superpowers:subagent-driven-development` has a procedure for it if you have
+that skill, and your own judgement about retrying, re-scoping or dropping the
+job serves if you do not. The worktree and its commits are left in place for
+whatever you decide.
 
 **Nothing reviewed the work.** The merge-gate brief says so plainly. What you
 get is a row per job — the files it touched, and which of them fell outside the

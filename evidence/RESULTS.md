@@ -320,16 +320,42 @@ run `delegate init`, and if every tier resolves to one provider, do not
 delegate. This round puts a number on what you would be giving up if you
 ignored that, and it is not small.
 
-**Caveats.** Arms B and E2 were recorded before a pricing correction: cached
-input was being charged at the fresh-input rate, roughly ten times over, which
-is why B's cost above is a recomputation rather than a measurement and is marked
-as one. Figures for D and F are unaffected -- their costs are billed by the
-provider, not derived. n=1 per arm. No arm hit a *real* quota wall — E's was injected. B's
-cost is a recomputation. The task is unusually favourable to parallel
+**The score measures output, not work — and every cost comparison here rests on
+it.** "All arms scored 31/31" is doing heavy lifting above: it is what licenses
+reading the cost column as the price of the same outcome. It does not mean the
+arms did the same amount of work.
+
+The grader diffs 26 rendered images against references. Anything that does not
+change a pixel is invisible to it **by construction, not by weakness** — and at
+least one requirement in `jobs.md` is exactly that. `st-3-clip` asks for all six
+clip-space faces; the x and y faces are redundant against any rasterizer that
+clamps its bounding box to the image, which every arm's `raster.cpp` does. Only
+near and far are load-bearing, because `w <= 0` breaks the perspective divide
+and produces coordinates no clamp can rescue.
+
+So an arm that clipped against two faces renders identically to one that clipped
+against six, and scores identically. One did: arm N, which wrote its own plan
+and scoped the job to near and far explicitly — reasonably, on the merits. Its
+clip agent ran 151s where O's six-face agent ran 313s.
+
+The consequence for this document: **between-arm cost comparisons carry an
+unmeasured variable** — how much work each arm did beyond what the images
+require. It is bounded (all arms shipped four working stages against the same
+contracts) and it is not zero. Where an arm wrote its own decomposition rather
+than being handed `jobs.md`, treat its cost as a lower bound on the cost of the
+full job.
+
+**Other caveats.** Arms B and E2 were recorded before a pricing correction:
+cached input was being charged at the fresh-input rate, roughly ten times over,
+which is why B's cost above is a recomputation rather than a measurement and is
+marked as one. Figures for D and F are unaffected -- their costs are billed by the
+provider, not derived. n=1 per arm. No arm hit a *real* quota wall — E's was
+injected. The task is unusually favourable to parallel
 decomposition (four pre-split files, disjoint by construction). And B's
 `jobs.md` is downstream of arm A's $2.93 planner: the frozen contracts I handed
 the four agents, including the FI-7 subtlety, were written by that planner. No
-arm here paid for producing its own decomposition.
+arm here paid for producing its own decomposition, except N, which paid ~$2.32
+and ~5.9 min for it.
 
 ## What is here
 

@@ -398,6 +398,25 @@ judgement:
   `delegate` as jobs, so N readers over one diff land on N seats instead of
   queueing on one provider's quota.
 
+  **That direction has been run, and it works.** Winnow's five judgment passes
+  (S, A, B, D, E) went out as one plan: two waves, five agents, both providers,
+  every check green, $7.18 of a $15 cap, stopping at the merge gate as attended
+  mode should. Tiers came from winnow's own band guidance verbatim — *keep S and
+  E at your own tier, tier down the volume passes* — so S and E drew
+  `opus-class-strong` on the Claude seat while A, B and D ran `fast-cheap` and
+  `balanced-coder` on the other provider, concurrently.
+
+  The output tracked the bands it was given: the two `t3` passes wrote 11–12 KB
+  of findings each, the three tiered-down passes about 1 KB, 107 `file:line`
+  citations between them. Pass E did not read statically — it built an
+  instrumented copy of the tree with branch counters, ran all 26 grading scenes
+  through it, and reported measured counts.
+
+  It is also the one workload here that is not N writers of disjoint code. It is
+  N readers of a single diff, disjoint because each writes only its own findings
+  file — which is what makes it worth reporting: the scope rule holds for a
+  reason it was not designed around.
+
   `delegate` used to run winnow's scanner itself at the merge gate. That was
   backwards: it made a quality pass a property of the dispatcher, chose one
   package on the caller's behalf, and put a judgement in the brief that the

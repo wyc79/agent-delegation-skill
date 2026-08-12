@@ -229,8 +229,19 @@ def _tier_table(choices, adapter):
             continue
         usable = "" if adapter.can_run(c.agent_kind) else \
             "  [%s is not installed — this band falls back]" % c.agent_kind
-        out.append((tier, "%-18s via %-12s (%s)%s"
-                    % (c.model, c.channel, c.adapter, usable)))
+        # `adapter.name` is what will actually run this band; `c.adapter` is only
+        # what its channel declares. ONE adapter serves the whole run
+        # (`_make_adapter`), chosen by `_default_adapter` from whether any
+        # channel asks for herdr -- so on a registry that declares different
+        # adapters per seat, exactly one of them wins and the rest are ignored.
+        # Printing the declared value per row showed a per-seat control that
+        # nothing per-seat reads, and hid the herdr-unavailable fallback too:
+        # `runtime.get("herdr")` returns a LocalAdapter when herdr is missing,
+        # which the old column still called herdr.
+        mixed = "" if c.adapter == adapter.name else \
+            "  [declares %s; one adapter serves the whole run]" % c.adapter
+        out.append((tier, "%-18s via %-12s (%s)%s%s"
+                    % (c.model, c.channel, adapter.name, mixed, usable)))
     return out
 
 

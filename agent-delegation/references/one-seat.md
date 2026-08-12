@@ -143,7 +143,7 @@ diff:
 ```bash
 git checkout -b integration "$base"
 while read -r job scope; do
-  [ "$(git rev-list --count "$base..$job")" -gt 0 ] || { echo "EMPTY: $job"; break; }
+  [ "$(git rev-list --count "$base..$job")" -gt 0 ] || { echo "!! EMPTY: $job — nothing was committed"; continue; }
   stray=$(git diff --name-only "$base" "$job" | grep -vxF "$(echo "$scope" | tr ' ' '\n')")
   [ -z "$stray" ] || echo "OUT OF SCOPE in $job: $stray"      # report, do not stop
   git merge --no-edit "$job" && <your check> || break
@@ -159,6 +159,12 @@ did commit, on the strength of one line in its brief. The check costs a
 `rev-list` and removes the case where you find out at the end. The branch is the
 evidence that work happened — not the agent's report, and not the merge's exit
 code.
+
+It `continue`s rather than breaking, unlike the failed-check case below it: one
+agent producing nothing does not make the others' work unmergeable, and stopping
+the loop would strand three good branches over one bad one. Which makes the
+printed line the only thing standing between you and a quiet hole in the
+integration — if you are running this loop unattended, make it exit non-zero.
 
 **`diff --name-only` closes the scope rule.** Step 1 proved the scopes were
 disjoint *as declared*; this is the only thing that tells you they were disjoint
@@ -190,10 +196,10 @@ jobs are not actually independent and you should not be running them in
 parallel.
 
 **Budget for writing them.** Measured on the same task twice: handed the
-contracts, this pattern cost X; made to derive them mid-flight, it cost roughly
-double, and the extra was not setup — it was one agent merging work that looked
-right, failing the two cases that turned on a single interpolation rule, and
-bisecting its way back to the cause. The contracts are not paperwork you do
+contracts, this pattern cost what it cost; made to derive them mid-flight, it
+cost roughly double, and the extra was not setup — it was one agent merging work
+that looked right, failing the two cases that turned on a single interpolation
+rule, and bisecting its way back to the cause. The contracts are not paperwork you do
 before the real work. They *are* the part of the work that cannot be
 parallelised, and skipping them moves the cost to the far end where it is dearer.
 

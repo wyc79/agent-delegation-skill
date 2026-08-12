@@ -3732,6 +3732,35 @@ stages:
         with self.assertRaises(wf.WorkflowError):
             self._manifest("name: empty\n")
 
+    def test_a_stage_may_not_rename_the_role_the_machine_dispatches(self):
+        """The machine asks `card(<its own name for the stage>)`, so renaming a
+        stage's role did not repoint anything -- it made the lookup miss, and
+        `card` returns None for a miss because "this workflow supplies no card"
+        is legitimate. The agent went out with its card silently absent.
+
+        Refused at load, with both names in the message, so the manifest author
+        sees which one the machine will ask for."""
+        with self.assertRaises(wf.WorkflowError) as cm:
+            self._manifest("""name: renamed
+stages:
+  implement: {role: coder, card: roles/worker.md}
+""")
+        msg = str(cm.exception)
+        self.assertIn("coder", msg)
+        self.assertIn("implementer", msg, "the message must name what to use instead")
+
+    def test_the_machine_and_the_manifest_agree_on_role_names(self):
+        """The validation above is only worth having if the names it enforces
+        are the ones actually dispatched. `machine` imports them rather than
+        spelling them twice; this fails if anyone re-hardcodes a literal."""
+        import inspect
+        from adg import machine
+        src = inspect.getsource(machine)
+        for stage, role in wf.STAGE_ROLES.items():
+            self.assertNotIn('_invoke(\n                "%s"' % role, src)
+            self.assertIn('STAGE_ROLES["%s"]' % stage, src,
+                          "machine no longer reads STAGE_ROLES for %r" % stage)
+
     def test_two_stages_may_not_give_one_role_different_cards(self):
         """`brainstorm` and `plan` both dispatch the planner, and the lookup
         answered with the first match — so a second declaration was silently

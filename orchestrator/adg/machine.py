@@ -565,7 +565,7 @@ class Orchestrator:
             self.log("implement %s: attempt %d (%s%s)" % (
                 sub["id"], attempts, role_choice.model, "" if session is None else ", continued"))
             session, report, role_choice = self._invoke(
-                "implementer", role_choice, cwd=base, subtask=sub,
+                wf.STAGE_ROLES["implement"], role_choice, cwd=base, subtask=sub,
                 session=session, failure=failure,
                 extra=self._with_note(None))
             self.budget.used_attempt(sub["id"])
@@ -988,7 +988,7 @@ class Orchestrator:
                        % (sub["id"], e))
         self.log("  integrator: %s" % choice.model)
         self._run_once(
-            "integrator", choice, cwd=cwd, subtask=sub,
+            wf.STAGE_ROLES["integrate"], choice, cwd=cwd, subtask=sub,
             extra="A merge conflict is in the working tree. Resolve it, then "
                   "`git add -A && git commit`. Conflict output:\n\n%s"
                   % conflict_text[-2000:])
