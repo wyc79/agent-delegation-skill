@@ -54,23 +54,28 @@ its siblings are doing.
 
 Do it in that order deliberately, because the obvious order fails:
 
-> **This is the step that actually fails, and knowing the rule does not save
-> you.** Measured: an agent read this file, then four tool calls later built
-> three correct dispatches — right worktree, right scope, right contracts — and
-> sent them in three separate messages. One dispatch per message runs them
-> **sequentially**. It paid the entire setup cost of isolation and collected
-> none of the speed: four times the wall clock of the same work done by one
-> agent in one context, and the slowest arrangement measured.
+> **This is the step that slips, and knowing the rule does not save you.**
+> Measured: an agent read this file, then four tool calls later built three
+> correct dispatches — right worktree, right scope, right contracts — and sent
+> them in three separate messages, 36 and 33 seconds apart.
 >
-> It failed because composing a prompt and sending it is one motion, and three
-> jobs is that motion three times. Nothing warns you. The worktrees are still
-> isolated, the merges still clean, the result still correct — only slower than
-> not having bothered. That is why the fix is an order of operations and not a
-> rule to remember: draft all N prompts as text first, so that when you dispatch
-> there is nothing left to compose and N calls go out together. **If you are
-> sending a dispatch and the next one is going in a later message, stop.** Send
-> them together, or do the work yourself — those are the two arrangements that
-> beat this one.
+> It got away with it, because in that harness a dispatch returns immediately
+> and its agent runs in the background, so the three overlapped anyway. What the
+> stagger cost was the stagger: the first agent had **finished** before the
+> third was sent, peak concurrency was two of three, and the parallel phase ran
+> about 69 seconds past the slowest job — a third again on top of it.
+>
+> That is the forgiving case. Where a dispatch blocks until its agent returns,
+> those same three messages serialize completely, and you have paid the whole
+> setup cost of isolation for none of the speed. Whether you are in a harness
+> that saves you is not something to be relying on.
+>
+> It slips because composing a prompt and sending it is one motion, and three
+> jobs is that motion three times. Nothing warns you. That is why the fix is an
+> order of operations and not a rule to remember: draft all N prompts as text
+> first, so that when you dispatch there is nothing left to compose and N calls
+> go out together. **If you are sending a dispatch and the next one is going in
+> a later message, stop.**
 
 ```text
 You are implementing one file of <the thing>. Other agents are implementing
@@ -100,17 +105,16 @@ for job in st-1-alpha st-2-beta st-3-gamma; do
 done
 ```
 
-That first line is not ceremony. Measured: of three agents told in their prompt
-to commit — with the exact `git add … && git commit -m …` line written out for
-them — **one finished, reported success, and left the work uncommitted.** The
-dispatcher happened to run `git status` in that worktree and committed on its
-behalf.
+That first line is insurance against a failure with no symptoms. An agent that
+reports success without committing leaves its branch sitting at `base`, and
+merging that branch **succeeds** — a merge with nothing to merge is a clean
+no-op. The untouched stub still compiles, so your build check passes too. Green
+integration, missing feature, nothing anywhere reporting a problem.
 
-Had it not, the merge would have **succeeded**, because merging a branch with
-no commits is a clean no-op. The stub still compiles, so the build check passes
-too. You would have got a green integration and a missing feature, with nothing
-anywhere reporting a problem. Never take "done" from an agent as evidence a
-commit exists — the branch is the evidence.
+On the measured run all three agents did commit, on the strength of one line in
+their brief. The check costs a `rev-list` and removes the case where you find
+out at the end. What it buys is the habit behind it: the branch is the evidence
+that work happened — not the agent's report, and not the merge's exit code.
 
 ## The frozen contracts are the whole thing
 
