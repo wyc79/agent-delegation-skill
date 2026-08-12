@@ -2953,6 +2953,27 @@ class TestTheSeams(unittest.TestCase):
         for job in jobs:
             schema.validate_subtask(job)
 
+    def test_a_job_id_need_not_look_like_a_numbered_stage(self):
+        """The id pattern demanded `st-<number>-`, which fitted the shape of
+        this repository's own first task and nothing else.
+
+        Found by trying to dispatch five named review passes over one diff:
+        `a-earns-place` and `e-fragility` have no numbers to give, and the
+        schema refused the plan. Nothing downstream needs the prefix or the
+        digit -- `_collect_report` matches `<stage>-<id>.json` by suffix and
+        the branch is `adg/<task>/<id>` -- so the pattern was asserting a
+        convention as a requirement.
+        """
+        for good in ("st-1-buffers", "st-12-render", "a-earns-place",
+                     "e-fragility", "winnow-pass-a"):
+            schema.validate_subtask({"id": good, "goal": "g",
+                                     "file_scope": ["x.py"]})
+        # Still refused: anything that would make a branch or filename ambiguous.
+        for bad in ("St-1", "st_1", "1-first", "has space", "trailing-", "-lead"):
+            with self.assertRaises(schema.Invalid, msg="%r was accepted" % bad):
+                schema.validate_subtask({"id": bad, "goal": "g",
+                                         "file_scope": ["x.py"]})
+
     # --- seam 2: the config declares it, so it must actually run ----------
     def test_every_declared_command_tier_actually_executes(self):
         """Driven from `verify.COMMAND_TIERS`, the same list the machine runs.

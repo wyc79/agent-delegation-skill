@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/subtask.schema.json",
   "title": "Job block",
-  "description": "Schema for each entry in the fenced YAML block of plan.md. Written by the CALLER — nothing here decomposes work — and read by the orchestrator (for wave scheduling and scope accounting) and by the agent that runs the job (as its whole assignment).",
+  "description": "Schema for each entry in the fenced YAML block of plan.md. Written by the CALLER \u2014 nothing here decomposes work \u2014 and read by the orchestrator (for wave scheduling and scope accounting) and by the agent that runs the job (as its whole assignment).",
   "type": "object",
   "required": [
     "id",
@@ -13,8 +13,8 @@
   "properties": {
     "id": {
       "type": "string",
-      "pattern": "^st-[0-9]+(-[a-z0-9-]+)?$",
-      "description": "e.g. st-2-combat-hooks. Stable for the life of the task."
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+      "description": "Names the job, its branch and its worktree, and the report file it must write. Lowercase, digits and hyphens; unique within the task. `st-2-clip` is the convention for numbered pipeline stages and is not required -- the pattern used to demand `st-<number>-`, which fitted work shaped like this repository's own first task and nothing else. Five named review passes over one diff have no numbers to give."
     },
     "goal": {
       "type": "string",
@@ -40,7 +40,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Job ids that must complete first. Ordering only — parallel safety comes from file_scope. Empty means it can start immediately."
+      "description": "Job ids that must complete first. Ordering only \u2014 parallel safety comes from file_scope. Empty means it can start immediately."
     },
     "hotspots": {
       "type": "array",
