@@ -72,6 +72,17 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
     card = wf.card(role)
     if card:
         lines += ["Then read your role card:", "  %s" % card]
+    # The caller's standing conventions, by PATH and never inlined. Two reasons
+    # it is a path: the file is the source of truth and a pasted copy goes stale
+    # against it, and the agent is already in a checkout where it can just read
+    # it. This is the only channel a caller has for a convention the repo's
+    # agent-config files do not already carry -- nothing else about the session
+    # that dispatched this job crosses the process boundary.
+    briefing = (task.state.get("plan") or {}).get("briefing") or []
+    if briefing:
+        lines += ["", "Required reading before you start work — the caller's "
+                      "conventions for this repository:"]
+        lines += ["  %s" % b for b in briefing]
     lines += [
         "",
         "Task directory (already exists; all task artifacts go here, never in the repo):",

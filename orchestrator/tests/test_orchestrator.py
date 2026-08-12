@@ -2631,6 +2631,31 @@ class TestCostBreakdown(unittest.TestCase):
         out = "\n".join(brief._cost_section(self.STATE))
         self.assertIn("which is unexpected", out)
 
+    def test_no_panes_under_herdr_is_not_reported_as_a_pane_run(self):
+        """`--no-panes` builds HerdrAdapter(panes=False), whose `.name` is still
+        "herdr". Inferring the pane flag from that name put "cost cannot be
+        measured in a pane" over rows the CLI had costed perfectly well -- so
+        the brief's one statement about whether to trust its own money column
+        said the opposite of the truth. Found by running a two-provider job with
+        the flag, not by this suite, which is why the flag is now recorded.
+        """
+        state = dict(self.STATE, delegation_history=[
+            {"role": "implementer", "model": "opus-class-strong",
+             "channel": "claude-seat", "adapter": "herdr", "panes": False,
+             "usd": 1.86}])
+        out = "\n".join(brief._cost_section(state))
+        self.assertNotIn("in a terminal pane", out)
+        self.assertNotIn("cannot be measured in a pane", out)
+        self.assertIn("1.86", out, "a costed row must still report its cost")
+
+    def test_a_record_without_the_flag_still_infers_the_old_way(self):
+        """Task files written before `panes` was recorded are still readable;
+        a stored run must not change meaning because the writer learned a key."""
+        state = dict(self.STATE, delegation_history=[
+            {"role": "implementer", "model": "balanced-coder",
+             "channel": "claude-seat", "adapter": "herdr", "usd": None}])
+        self.assertIn("in a terminal pane", "\n".join(brief._cost_section(state)))
+
     def test_pane_only_run_makes_no_unexpected_claim(self):
         state = dict(self.STATE, delegation_history=[
             {"role": "implementer", "model": "balanced-coder", "channel": "claude-seat",
@@ -3949,3 +3974,293 @@ stages:
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestPerJobRequiredChecks(unittest.TestCase):
+    """`required_checks`: the only thing that can fail an attempt for a reason
+    specific to one job.
+
+    The project-wide `fast` commands run against a tree where this job's
+    siblings are still stubs, which on work that only functions assembled bounds
+    them to "does it compile" -- so a job could finish, pass, and be wrong in a
+    way nothing had looked for. And when a `slow` command did catch it at the
+    stage boundary, the failure was a property of the batch: `1/2 checks passed,
+    sh check-grade.sh` names no job, and finding which of four caused it means
+    reading the diff.
+    """
+
+    PLAN = """# Plan
+
+## Subtasks
+```yaml
+- id: st-1-plain
+  goal: write alpha
+  file_scope: ["alpha.py"]
+- id: st-2-probed
+  goal: write beta
+  file_scope: ["beta.py"]
+  required_checks: ["python3 -c 'import sys; sys.exit(3)'"]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def _run(self):
+        def implementer(env, cwd):
+            td = env["AGENT_DELEGATION_TASK_DIR"]
+            name = "st-1-plain" if "st-1-plain" in _tree_name(cwd) else "st-2-probed"
+            fname = "alpha.py" if name == "st-1-plain" else "beta.py"
+            with open(os.path.join(cwd, fname), "w") as fh:
+                fh.write("X = 1\n")
+            _report(td, "implement-%s.json" % name, {
+                "stage": "implement", "role": "implementer", "subtask_id": name,
+                "status": "complete", "summary": "done", "files_changed": [fname],
+                "signals": []})
+            return "ok"
+        pol = dict(self.reg["policy"]["limits"],
+                   escalation_ceiling=self.reg["policy"]["escalation_ceiling"],
+                   max_attempts_per_subtask=1, max_parallel_agents=2)
+        task = _task(self.t.repo, "T-RC", "# t\n\nTwo jobs\n", pol, plan=self.PLAN)
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter({"implementer": implementer}),
+                              lambda k, t: True, log=logs.append).run()
+        return task, status, logs
+
+    def test_a_failing_required_check_fails_its_job_and_not_its_sibling(self):
+        task, status, logs = self._run()
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        self.assertNotEqual(by_id["st-2-probed"]["status"], "complete",
+                            "a job whose own check failed was marked complete:\n"
+                            + "\n".join(logs))
+        self.assertEqual(by_id["st-1-plain"]["status"], "complete",
+                         "the sibling declared no checks and must be unaffected:\n"
+                         + "\n".join(logs))
+        self.assertNotEqual(status, "done")
+
+    def test_the_brief_names_the_command_and_whose_it_was(self):
+        """Attribution is the point. `- Failed: \\`cmd\\`` alone puts a job's
+        failure on the batch, which is what the caller then has to un-guess."""
+        task, _, _ = self._run()
+        cmd = "python3 -c 'import sys; sys.exit(3)'"
+        result = verify.run(task, self.t.repo, self.t.repo, "fast",
+                            required=[cmd], job="st-2-probed")
+        self.assertFalse(result.ok)
+        text = brief.render(task, "merge", "Land it?", verify=result)
+        self.assertIn(cmd, text, "the brief does not name the failing command")
+        self.assertIn("st-2-probed", text, "the failure is not attributed to its job")
+
+    def test_a_job_declaring_no_checks_reads_as_that_and_not_as_a_pass(self):
+        """Absence of evidence rendered identically to evidence of passing: both
+        were a blank cell. A caller weighing whether to land the change is
+        entitled to know which jobs offered nothing of their own."""
+        task, _, _ = self._run()
+        def mark(state):
+            for s in state["subtasks"]:
+                s["actual_files"] = ["alpha.py"] if s["id"] == "st-1-plain" else ["beta.py"]
+                if s["id"] == "st-2-probed":
+                    s["own_checks"] = {"declared": 1, "passed": 1, "failed": []}
+        task.mutate(mark)
+        text = brief.render(task, "merge", "Land it?")
+        self.assertIn("Own checks", text)
+        self.assertIn("none declared", text, "st-1-plain declared none and must say so")
+        self.assertIn("1/1 passed", text)
+
+    def test_the_column_is_absent_when_no_job_uses_the_field(self):
+        """Omitted everywhere is the previous behaviour, and a column of
+        "none declared" on every row is noise that says nothing."""
+        task, _, _ = self._run()
+        def mark(state):
+            for s in state["subtasks"]:
+                s["actual_files"] = ["alpha.py"]
+                s.pop("own_checks", None)
+        task.mutate(mark)
+        self.assertNotIn("Own checks", brief.render(task, "merge", "Land it?"))
+
+    def test_the_commands_never_reach_the_agents_prompt(self):
+        """Measured, in this repository's own evidence: naming check commands in
+        a prompt buys a turn spent reading them. `prompts.compose` must not learn
+        this key."""
+        task, _, _ = self._run()
+        sub = {"id": "st-2-probed", "goal": "write beta",
+               "required_checks": ["python3 -c 'import sys; sys.exit(3)'"]}
+        text = prompts.compose("implementer", task, subtask=sub)
+        self.assertNotIn("sys.exit(3)", text)
+        self.assertNotIn("required_checks", text)
+
+
+class TestCallerConventionsReachTheAgents(unittest.TestCase):
+    """A dispatched agent inherits the repository and nothing from the session
+    that dispatched it -- and the repository half only travels if git tracks it.
+
+    `git worktree add` checks out TRACKED FILES ONLY. An untracked `CLAUDE.md`
+    is read by the caller's own session, sits in the caller's checkout, and is
+    absent from every worktree this program dispatches into. An audit that only
+    asked whether the file exists would run in the main repo, find it, and
+    report a pass for exactly the case that silently drops it.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def test_a_seat_with_no_config_file_is_flagged(self):
+        out = "\n".join(cli._conventions_audit(self.t.repo, self.reg))
+        self.assertIn("run without repo conventions", out)
+        self.assertIn("CLAUDE.md", out, "the audit must name the file it looked for")
+
+    def test_an_untracked_config_file_is_flagged_not_passed(self):
+        """The case that motivates the feature. Existence is not the question."""
+        _spit(os.path.join(self.t.repo, "CLAUDE.md"), "# always TDD\n")
+        out = "\n".join(cli._conventions_audit(self.t.repo, self.reg))
+        self.assertIn("NOT tracked", out)
+        self.assertIn("worktrees check out tracked files only", out)
+
+    def test_a_tracked_config_file_passes(self):
+        _spit(os.path.join(self.t.repo, "CLAUDE.md"), "# always TDD\n")
+        sh(["git", "add", "CLAUDE.md"], self.t.repo)
+        sh(["git", "commit", "-qm", "conventions"], self.t.repo)
+        out = cli._conventions_audit(self.t.repo, self.reg)
+        # Per seat, not over the whole report: this registry enrols a cursor
+        # seat too, and satisfying one provider's config says nothing about the
+        # other's. A blanket assertion here would have passed only while the
+        # fixture had one seat, which is not the case delegate exists for.
+        claude = [ln for ln in out if "(claude)" in ln][0]
+        self.assertIn("CLAUDE.md", claude)
+        self.assertNotIn("NOT tracked", claude)
+        self.assertNotIn("run without repo conventions", claude)
+        cursor = [ln for ln in out if "(cursor)" in ln][0]
+        self.assertIn("run without repo conventions", cursor,
+                      "the other seat has no rules file and must still be flagged")
+
+    def test_the_worktree_really_does_drop_an_untracked_file(self):
+        """The premise itself, asserted rather than assumed -- everything above
+        is only worth having if this is true of git."""
+        _spit(os.path.join(self.t.repo, "CLAUDE.md"), "# always TDD\n")
+        wt = os.path.join(self.t.dir, "wt")
+        sh(["git", "worktree", "add", "-q", wt, "-b", "probe", "HEAD"], self.t.repo)
+        self.assertTrue(os.path.exists(os.path.join(self.t.repo, "CLAUDE.md")))
+        self.assertFalse(os.path.exists(os.path.join(wt, "CLAUDE.md")),
+                         "an untracked file reached the worktree; the audit's "
+                         "whole premise is wrong")
+
+
+class TestBriefingReachesEveryPrompt(unittest.TestCase):
+
+    PLAN = """# Plan
+
+```yaml
+briefing: [docs/conventions.md]
+```
+
+## Subtasks
+```yaml
+- id: st-1-alpha
+  goal: write alpha
+  file_scope: ["alpha.py"]
+```
+"""
+
+    def setUp(self):
+        self.t = TempRepo()
+        os.makedirs(os.path.join(self.t.repo, "docs"), exist_ok=True)
+        _spit(os.path.join(self.t.repo, "docs/conventions.md"), "# house style\n")
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "docs"], self.t.repo)
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo, capture_output=True)
+        self.t.close()
+
+    def test_the_path_is_named_in_the_prompt_and_the_contents_are_not(self):
+        task = _task(self.t.repo, "T-BR", "# t\n", self.pol, plan=self.PLAN)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        self.assertEqual(orch._read_plan_briefing(), ["docs/conventions.md"])
+        task.update(plan={"briefing": ["docs/conventions.md"]})
+        text = prompts.compose("implementer", task,
+                               subtask={"id": "st-1-alpha", "goal": "write alpha"})
+        self.assertIn("docs/conventions.md", text)
+        self.assertIn("Required reading", text)
+        self.assertNotIn("house style", text,
+                         "the file's CONTENTS were inlined; a pasted copy goes "
+                         "stale against the file that is the source of truth")
+
+    def test_a_briefing_path_that_does_not_exist_fails_before_dispatch(self):
+        """One clear message beats N agents told to read a file that is not
+        there -- and it must cost nothing, so it is checked before any worktree.
+        """
+        plan = self.PLAN.replace("docs/conventions.md", "docs/nope.md")
+        task = _task(self.t.repo, "T-BR2", "# t\n", self.pol, plan=plan)
+        adapter = runtime.MockAdapter()
+        orch = Orchestrator(task, self.reg, adapter, lambda k, t: True,
+                            log=lambda *_: None)
+        with self.assertRaises(Halt) as cm:
+            orch._read_plan_briefing()
+        self.assertIn("docs/nope.md", str(cm.exception))
+        self.assertEqual(adapter.calls, [], "an agent was started anyway")
+
+    def test_a_plan_without_briefing_is_unchanged(self):
+        plan = "# Plan\n\n## Subtasks\n```yaml\n- id: st-1-alpha\n  goal: g\n  file_scope: [\"a.py\"]\n```\n"
+        task = _task(self.t.repo, "T-BR3", "# t\n", self.pol, plan=plan)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(), lambda k, t: True,
+                            log=lambda *_: None)
+        self.assertEqual(orch._read_plan_briefing(), [])
+        text = prompts.compose("implementer", task, subtask={"id": "s", "goal": "g"})
+        self.assertNotIn("Required reading", text)
+
+
+class TestGateStageChecks(unittest.TestCase):
+    """`gate:` runs once over the assembled change and reports. It does not
+    reject: this program has one gate and a human answers it."""
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def test_a_failing_gate_check_is_reported_and_does_not_fail_the_run(self):
+        _spit(os.path.join(self.t.repo, ".adg.yaml"),
+              'fast:\n  - "python3 -c \'print(1)\'"\n'
+              'gate:\n  - "python3 -c \'import sys; sys.exit(2)\'"\n')
+        task = _task(self.t.repo, "T-GATE", "# t\n", self.reg["policy"]["limits"])
+        results = [verify.run(task, self.t.repo, self.t.repo, tier)
+                   for tier in verify.COMMAND_TIERS]
+        combined = verify.combine(*results)
+        gate_steps = [s for s in combined.steps if s.get("tier") == "gate"]
+        self.assertTrue(gate_steps, "the gate tier did not run")
+        self.assertFalse(gate_steps[0]["ok"])
+
+        text = brief.render(task, "merge", "Land it?", verify=combined)
+        self.assertIn("sys.exit(2)", text, "the brief does not name the gate command")
+        self.assertIn("gate-stage check", text)
+        self.assertIn("did not reject", text)
+
+    def test_gate_is_wired_by_the_tier_list_rather_than_by_hand(self):
+        """`slow` sat in the config surface unexecuted for the life of the
+        project because a call site named its tiers by hand. The stage boundary
+        iterates COMMAND_TIERS so a tier added to the surface runs by
+        construction."""
+        import inspect
+        from adg import machine as m
+        src = inspect.getsource(m)
+        self.assertIn("for tier in verify.COMMAND_TIERS", src)
+        self.assertIn("gate", verify.COMMAND_TIERS)

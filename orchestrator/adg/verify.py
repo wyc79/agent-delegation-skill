@@ -28,7 +28,14 @@ CONFIG_NAMES = (".adg.yaml", ".adg.yml", ".delegate.yaml")
 #
 # Order matters: it is the order a stage boundary runs them in, cheapest first,
 # so a compile break surfaces before a twenty-minute integration suite.
-COMMAND_TIERS = ("fast", "slow")
+# `gate` runs ONCE against the integration result, just before the merge brief
+# is written -- the only point where the assembled change exists and nothing has
+# been handed over yet. It is where a convention that could not reach the agents
+# gets checked on the way out: a linter, a house-style script, a winnow pass.
+# Its exit code does NOT reject. This program has one gate and a human answers
+# it; a check that auto-rejected would be this program judging the work, which
+# is the whole thing it does not do.
+COMMAND_TIERS = ("fast", "slow", "gate")
 
 DEFAULT = dict({tier: [] for tier in COMMAND_TIERS}, hotspots=[], ignore=[])
 
@@ -86,13 +93,27 @@ def _run_id(tier):
     return "v-%s-%s-%03d" % (tier, time.strftime("%Y%m%d-%H%M%S", time.gmtime()), n)
 
 
-def run(task, repo, cwd, tier="fast", timeout=900):
-    """Run one tier of checks and persist the output under verify/<run-id>."""
+def run(task, repo, cwd, tier="fast", timeout=900, required=(), job=None):
+    """Run one tier of checks and persist the output under verify/<run-id>.
+
+    `required` is one job's own `required_checks`, run in that job's worktree
+    AFTER the project-global commands for this tier. Cheapest-first is the same
+    reason the tiers are ordered: a compile break should surface before a job's
+    own probe, which is usually the more expensive of the two and is meaningless
+    against a tree that does not build.
+
+    They are steps like any other -- one failure fails the attempt -- and carry
+    `required: True` and the job id, so a failure can be attributed to a job
+    instead of to the batch. Nothing here tells the AGENT what the commands are:
+    naming check commands in a prompt measurably costs a turn, because the agent
+    goes and reads them.
+    """
     cfg = load_project_config(repo)
-    commands = cfg.get(tier) or []
+    commands = [(c, False) for c in (cfg.get(tier) or [])]
+    commands += [(c, True) for c in (required or [])]
     run_id = _run_id(tier)
     steps = []
-    for cmd in commands:
+    for cmd, is_required in commands:
         started = time.time()
         try:
             p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
@@ -100,11 +121,17 @@ def run(task, repo, cwd, tier="fast", timeout=900):
             out, code = (p.stdout or "") + (p.stderr or ""), p.returncode
         except subprocess.TimeoutExpired:
             out, code = "timed out after %ds" % timeout, 124
-        steps.append({
-            "cmd": cmd, "ok": code == 0, "exit": code,
+        step = {
+            "cmd": cmd, "ok": code == 0, "exit": code, "tier": tier,
             "seconds": round(time.time() - started, 1),
             "output": out[-4000:],  # tail is where failures live
-        })
+        }
+        if is_required:
+            # Only on the job's own checks. A project-global command runs for
+            # every job, and stamping one job's id on it would attribute a
+            # shared failure to whichever job happened to run it.
+            step["required"], step["job"] = True, job
+        steps.append(step)
     skipped = [] if tier == "slow" else list(cfg.get("slow") or [])
     result = Result(run_id, all(s["ok"] for s in steps) if steps else True, steps, skipped)
     task.write_text(os.path.join("verify", run_id + ".json"),

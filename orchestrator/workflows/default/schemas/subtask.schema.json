@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/wyc79/agent-delegation-skill/schemas/subtask.schema.json",
   "title": "Job block",
-  "description": "Schema for each entry in the fenced YAML block of plan.md. Written by the CALLER \u2014 nothing here decomposes work \u2014 and read by the orchestrator (for wave scheduling and scope accounting) and by the agent that runs the job (as its whole assignment).",
+  "description": "Schema for each entry in the fenced YAML block of plan.md. Written by the CALLER — nothing here decomposes work — and read by the orchestrator (for wave scheduling and scope accounting) and by the agent that runs the job (as its whole assignment).",
   "type": "object",
   "required": [
     "id",
@@ -26,7 +26,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Write scope: globs this job may modify. MEASURED, not enforced \u2014 files touched outside it are recorded and reported back, never reverted. It is also what buys parallelism: two jobs with overlapping scopes are serialized, and an unscoped job claims everything."
+      "description": "Write scope: globs this job may modify. MEASURED, not enforced — files touched outside it are recorded and reported back, never reverted. It is also what buys parallelism: two jobs with overlapping scopes are serialized, and an unscoped job claims everything."
     },
     "reads": {
       "type": "array",
@@ -40,7 +40,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Job ids that must complete first. Ordering only \u2014 parallel safety comes from file_scope. Empty means it can start immediately."
+      "description": "Job ids that must complete first. Ordering only — parallel safety comes from file_scope. Empty means it can start immediately."
     },
     "hotspots": {
       "type": "array",
@@ -68,6 +68,14 @@
         "type": "string"
       },
       "description": "What this job has to satisfy, in the caller's own words. Carried into its prompt verbatim. It used to require this protocol's `AC-<n>` ids, which only meant something while an intake stage minted them here."
+    },
+    "required_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      },
+      "description": "Shell commands that are this job's own pass/fail, run by the runtime in this job's worktree after every attempt, immediately after the project-wide `fast` checks from .adg.yaml. All must exit 0 or the attempt counts as failed, and the failure is recorded against THIS job rather than the batch. For what only this job can assert: a project-wide check runs against a tree where the other jobs are still stubs, so it is often limited to compiling. The commands are never shown to the agent -- naming a check command in a prompt costs a turn spent reading it -- so a job that should also self-check before finishing must say so in its `goal`. Omit for the previous behaviour."
     },
     "tier": {
       "type": "string",

@@ -145,6 +145,51 @@ def cmd_channels(args):
           "`delegate channels --clear <name>` if a seat is actually available.")
 
 
+def _conventions_audit(repo, reg):
+    """Which seats will run without this repository's standing conventions.
+
+    A dispatched agent inherits the repo's agent-config file and NOTHING from
+    the session that dispatched it. Whatever discipline the caller is following
+    right now -- a skill it invoked, a convention it holds in context -- does
+    not cross the subprocess boundary, so a seat with no config file on its side
+    produces work that is correct and foreign.
+
+    Reported, never blocking. Which conventions a repository should carry is not
+    this program's business; knowing that half your seats cannot see them is.
+    """
+    kinds = {}
+    for name, chan in (reg.get("channels") or {}).items():
+        if any(reg["models"].get(m, {}).get("enrolled") for m in (chan.get("exposes") or [])):
+            kinds.setdefault(chan.get("agent_kind", "claude"), []).append(name)
+    if not kinds:
+        return []
+    out = ["", "repo conventions each seat will see:"]
+    gaps = False
+    for kind in sorted(kinds):
+        seats = ", ".join(sorted(kinds[kind]))
+        rel, tracked = runtime.conventions(repo, kind)
+        if rel and tracked:
+            note = "%s" % rel
+        elif rel:
+            # The case an existence check calls a pass. `init` runs in the main
+            # checkout, where the file is right there; every job runs in a
+            # worktree, which has only tracked files.
+            note = ("%s is NOT tracked by git — worktrees check out tracked "
+                    "files only, so jobs here run without it" % rel)
+            gaps = True
+        else:
+            note = ("no %s in this repo — jobs routed here run without repo "
+                    "conventions" % " or ".join(runtime.AGENT_CONFIG.get(kind, ["config"])))
+            gaps = True
+        print_kind = "%s (%s)" % (seats, kind)
+        out.append("  %-28s %s" % (print_kind, note))
+    if gaps:
+        out += ["", "Nothing here is blocked by that. A convention an agent cannot read "
+                    "is one it will not follow — put it in the repo, name it in the "
+                    "plan's `briefing:`, or check for it at the gate."]
+    return out
+
+
 def cmd_init(args):
     repo = _repo(args.repo)
     reg = routing.load_registry(args.registry)
@@ -175,6 +220,9 @@ def cmd_init(args):
     unused = [m for m, s in reg["models"].items() if not s.get("enrolled")]
     if unused:
         print("\npresent but deliberately not enrolled: %s" % ", ".join(unused))
+
+    for line in _conventions_audit(repo, reg):
+        print(line)
 
     # The one question the caller is told to answer here, answered rather than
     # left to be read out of the table. Delegating onto a single seat buys

@@ -103,6 +103,8 @@ Delegate reads a decomposition from a markdown file you write, passed with
 | `tier` | which capability band runs it (below). Omit and it draws the ordinary worker. |
 | `depends_on` | job ids that must finish first. Ordering only. |
 | `acceptance` | what counts as done. Read the warning below before leaving it out. |
+| `required_checks` | shell commands that are **this job's** pass/fail, run in its worktree after every attempt. All must exit 0. Omit and nothing changes. |
+| `briefing` | not a job field — a separate block at the top of the plan. Paths every agent must read first. See below. |
 | `reads`, `frozen_interfaces`, `hotspots` | carried into the agent's prompt and the record. |
 
 **How big the job is, is part of the brief — and if you leave it out an agent
@@ -120,6 +122,34 @@ checks will not tell you — they pass, and a scope report only covers files, no
 how much of the file's job got done. Say how much you want, in `goal` where it
 defines the work and in `acceptance` where it is the bar, or take whichever
 reading the agent picks.
+
+**An agent inherits the repository and nothing from you.** It starts in a fresh
+process, in a worktree, and reads whatever agent-config file its own CLI looks
+for — `CLAUDE.md`, `AGENTS.md`, `.cursor/rules`. Everything on your side of the
+boundary stays there: the skill you are following, the convention you just
+agreed, the reason you are doing it this way. Work comes back correct and
+foreign.
+
+**And the config file only travels if git tracks it.** A worktree checks out
+tracked files only, so an untracked or ignored `CLAUDE.md` is read by *your*
+session, sits in your checkout, and is absent from every job's. `delegate init`
+audits this per seat and says which ones are running blind — it is the one case
+where looking in the repo and looking in the worktree give different answers.
+
+So a discipline you want followed has three places it can live, and none of them
+is your session: **committed** to the repo where the agents' own CLIs read it,
+named in the plan's **`briefing:`** so every prompt points at it, or checked at
+the **`gate:`** on the way out. Otherwise it does not happen.
+
+```yaml
+briefing: [docs/conventions.md, docs/testing.md]
+```
+
+A separate block from the job list, paths relative to the repo. Every job's
+prompt lists them as required reading before it starts; the paths are validated
+before anything is dispatched, so a wrong one costs you a message rather than N
+confused agents. Paths, not contents — the file is the source of truth, the
+agent is already in a checkout that has it, and a pasted copy goes stale.
 
 **Disjoint `file_scope` is what buys parallelism.** Two jobs whose scopes
 overlap are serialized, and a job left unscoped claims everything — which
@@ -213,9 +243,33 @@ passing change looks like:
 ```yaml
 fast: ["make build"]          # after every attempt on a job
 slow: ["make test-all"]       # at stage boundaries
+gate: ["make lint"]           # once over the assembled change, before the brief
 ignore: ["build/*", "*.o"]    # generated paths, excluded from scope accounting
 hotspots: ["schema.sql"]      # files no two jobs may hold at once
 ```
+
+**`gate:` is the last place a convention can be enforced.** It runs once against
+the integration result, after every job is merged and before the brief is
+written — so it is where a house style the agents could not read gets checked on
+the way out. A non-zero exit **does not reject**: it is reported in the brief,
+named as gate-stage, and you decide. Nothing here judges the work.
+
+**These run for every job, which bounds what they can be.** A project-wide check
+executes against a tree where this job's siblings are still stubs, so on work
+that only functions assembled it is usually limited to "does it compile" — which
+means a job can finish, pass, and be wrong in a way nothing looked for.
+
+`required_checks` on a job is the other half: its own commands, run in its own
+worktree after every attempt, straight after the `fast` ones. All must exit 0 or
+the attempt failed, and the failure is recorded **against that job** rather than
+against the batch. Use it for what only this job can assert — a probe over the
+one function it owns, a fixture only its files satisfy.
+
+Two things to know. The commands are never shown to the agent, deliberately:
+naming a check in a prompt buys a turn spent reading it, so if the job should
+also self-check before finishing, say that in `goal`. And a job that declares
+none is reported as *"none declared"* in the merge brief, not as a pass — the
+distinction is the point.
 
 A check that always exits 0 is a check that always passes — make sure yours can
 fail. `ignore` matters more than it looks: without it, agents are charged with

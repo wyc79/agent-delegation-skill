@@ -89,16 +89,35 @@ def _by_job(state, limit=8):
     subs = [s for s in (state.get("subtasks") or []) if s.get("actual_files")]
     if not subs:
         return []
-    rows = ["| Job | Files | Outside its scope |", "|---|---|---|"]
+    # The own-checks column appears only when some job declared one. On a plan
+    # that uses none it would be a column of "none declared" saying nothing.
+    any_own = any((s.get("own_checks") or {}).get("declared") for s in subs)
+    head = "| Job | Files | Outside its scope |"
+    rows = [head + (" Own checks |" if any_own else ""),
+            "|---|---|---|" + ("---|" if any_own else "")]
     for sub in subs[:limit]:
         files = sub.get("actual_files") or []
         out = set(sub.get("scope_violations") or [])
         shown = ", ".join("`%s`" % f for f in files[:6])
         if len(files) > 6:
             shown += " (+%d more)" % (len(files) - 6)
-        rows.append("| %s | %s | %s |" % (
+        row = "| %s | %s | %s |" % (
             sub.get("id", "?"), shown,
-            ", ".join("**`%s`**" % f for f in sorted(out)) if out else "—"))
+            ", ".join("**`%s`**" % f for f in sorted(out)) if out else "—")
+        if any_own:
+            # "none declared" is not a pass, and must not read as one beside a
+            # job that ran three. A job with no checks of its own has only the
+            # project-wide commands standing behind it.
+            oc = sub.get("own_checks") or {}
+            n = oc.get("declared") or 0
+            if not n:
+                cell = "none declared"
+            elif oc.get("failed"):
+                cell = "**failed: %s**" % ", ".join("`%s`" % c for c in oc["failed"])
+            else:
+                cell = "%d/%d passed" % (oc.get("passed") or 0, n)
+            row += " %s |" % cell
+        rows.append(row)
     if len(subs) > limit:
         rows.append("| … | %d more jobs | |" % (len(subs) - limit))
     flagged = sorted({f for s in subs for f in (s.get("scope_violations") or [])})
@@ -125,7 +144,12 @@ def _cost_section(state):
             # it as a run that "reported no cost" appends a warning that the real
             # total is higher, which is the opposite of true.
             continue
-        in_pane = (h.get("adapter") == "herdr")
+        # `panes` when the record has it. The old inference from the adapter
+        # name is kept only for task files written before it existed: a
+        # `--no-panes` run is HerdrAdapter(panes=False), still named "herdr",
+        # so inferring put the "cost is unreliable here" caveat on exactly the
+        # rows whose cost the CLI did report.
+        in_pane = bool(h["panes"]) if "panes" in h else (h.get("adapter") == "herdr")
         key = (h.get("model") or "unknown", h.get("channel") or "unknown", in_pane)
         row = rows.setdefault(key, {"steps": [], "usd": 0.0, "silent": 0, "est": False})
         row["steps"].append(h.get("role") or h.get("stage") or "step")
@@ -210,7 +234,22 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
             md.append("- Not run: %s. These were skipped deliberately, so they are "
                       "not evidence of anything." % "; ".join(verify.skipped))
         for f in verify.failures()[:3]:
-            md.append("- Failed: `%s`" % f["cmd"])
+            # A job's own check names its job. Without this a failure is a
+            # property of the batch -- "1/2 checks passed, sh check-grade.sh" --
+            # and finding which of four jobs caused it means reading the diff.
+            if f.get("required") and f.get("job"):
+                owner = " (%s's own check)" % f["job"]
+            elif f.get("tier") == "gate":
+                # Named as gate-stage because it means something different from
+                # the others: it ran once over the assembled change, after every
+                # job was done, and it did NOT reject anything. It is here to be
+                # weighed, which is a different question from "did the work
+                # build" and should not read as the same kind of red.
+                owner = " (gate-stage check — it did not reject the change; " \
+                        "this is for you to weigh)"
+            else:
+                owner = ""
+            md.append("- Failed: `%s`%s" % (f["cmd"], owner))
             # The last lines, not just the command. A slow check is often the
             # only thing that can say whether the change works, and "Failed:
             # `sh check-grade.sh`" tells a human that something is wrong while

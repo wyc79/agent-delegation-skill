@@ -114,6 +114,39 @@ class Session:
         self.name, self.cwd, self.handle = name, cwd, handle
 
 
+# Where each agent CLI looks for a repository's standing conventions. One entry
+# per `agent_kind` the LAUNCH tables below can start; first match wins.
+AGENT_CONFIG = {
+    "claude": ["CLAUDE.md", ".claude/CLAUDE.md"],
+    "cursor": [".cursor/rules", ".cursorrules"],
+    "codex": ["AGENTS.md"],
+    "gemini": ["GEMINI.md"],
+}
+
+
+def conventions(repo, kind):
+    """Does a job dispatched on `kind` actually see this repo's conventions?
+
+    Returns (path_or_None, reaches_the_worktree).
+
+    **Existence in the repo is not the question, and answering it that way gets
+    the dangerous case backwards.** Every job runs in a `git worktree`, which
+    checks out TRACKED FILES ONLY -- so an untracked or ignored `CLAUDE.md`
+    sits in the main checkout, is read by the caller's own session, and is
+    absent from every worktree this program dispatches into. An audit run from
+    the main repo sees the file and reports it present; the agents never get it.
+    Keeping CLAUDE.md out of git is a common habit, so this is the likely case
+    rather than the exotic one.
+    """
+    for rel in AGENT_CONFIG.get(kind, []):
+        if not os.path.exists(os.path.join(repo, rel)):
+            continue
+        p = subprocess.run(["git", "ls-files", "--error-unmatch", rel],
+                           cwd=repo, capture_output=True, text=True)
+        return rel, p.returncode == 0
+    return None, False
+
+
 class Adapter:
     """Nine operations. Everything else is orchestrator-side."""
 

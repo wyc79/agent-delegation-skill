@@ -325,6 +325,36 @@ class Orchestrator:
             return True
         return False
 
+    def _read_plan_briefing(self):
+        """`briefing:` — repo-relative paths every job must read before starting.
+
+        A separate mapping block from the job list, so a plan written before this
+        existed parses exactly as it did. Paths are validated HERE, before any
+        worktree or any spend: a briefing that does not exist is a prompt telling
+        N agents to read a file that is not there, and the failure would arrive
+        as N confused agents rather than one clear message.
+        """
+        text = self.task.read_text("plan.md", "")
+        for raw in re.findall(r"```ya?ml\s*\n(.*?)```", text, re.S):
+            try:
+                data = yamlite.load(raw)
+            except yamlite.YamlError:
+                continue
+            if not isinstance(data, dict) or "briefing" not in data:
+                continue
+            paths = data["briefing"]
+            paths = [paths] if isinstance(paths, str) else list(paths or [])
+            missing = [p for p in paths
+                       if not os.path.exists(os.path.join(self.repo, p))]
+            if missing:
+                raise Halt("needs_human",
+                           "plan.md names briefing file(s) that do not exist in "
+                           "%s: %s. Every job would be told to read them before "
+                           "starting."
+                           % (self.repo, ", ".join(missing)))
+            return paths
+        return []
+
     def _read_plan_subtasks(self):
         """Parse the fenced YAML block the caller wrote. A plan we cannot parse
         is refused rather than guessed around: the caller owns the
@@ -373,6 +403,13 @@ class Orchestrator:
                         # record so a run shows what was asked for.
                         "tier": s.get("tier"),
                         "estimated_loc": s.get("estimated_loc"),
+                        # This job's own checks, run by the runtime after every
+                        # attempt. Deliberately NOT carried into the prompt --
+                        # `prompts.compose` never reads this key -- because a
+                        # prompt that names a check command buys a turn spent
+                        # reading it. Absent means the list is empty, which is
+                        # the behaviour every plan written before this had.
+                        "required_checks": s.get("required_checks") or [],
                     })
                 return out
         return []
@@ -412,6 +449,13 @@ class Orchestrator:
         # which reads as "nothing changed" and silently voids scope checking.
         self._ensure_worktree()
         state = self.task.state
+        # Before any worktree is dispatched into, so a bad path costs one
+        # message rather than N agents. Re-read on resume: the plan on disk is
+        # the source of truth and may have been corrected between runs.
+        briefing = self._read_plan_briefing()
+        if briefing != ((state.get("plan") or {}).get("briefing") or []):
+            state = self.task.update(plan=dict(state.get("plan") or {},
+                                               briefing=briefing))
         if not state.get("subtasks"):
             # Resuming into implement with a plan already on disk, or entering
             # it for the first time with one the caller supplied through
@@ -569,7 +613,27 @@ class Orchestrator:
                 session=session, failure=failure,
                 extra=self._with_note(None))
             self.budget.used_attempt(sub["id"])
-            result = verify.run(self.task, self.repo, base, "fast")
+            # This job's own checks run here and only here: `base` is its
+            # worktree, and the attempt is the thing they are a verdict on. Not
+            # at the integration check below, where the tree is the merge of
+            # several jobs and a per-job command would be answering about work
+            # its job did not do.
+            result = verify.run(self.task, self.repo, base, "fast",
+                                required=sub.get("required_checks") or (),
+                                job=sub["id"])
+            # Persisted per job so the brief can distinguish three states that
+            # otherwise look identical in a row of the scope table: passed its
+            # own checks, failed them, and never declared any. Only the first
+            # two are evidence, and a caller weighing whether to land the change
+            # is entitled to know which jobs offered none.
+            own = [s for s in result.steps if s.get("required")]
+            def _own(state, _id=sub["id"], _own=own):
+                for s in state["subtasks"]:
+                    if s["id"] == _id:
+                        s["own_checks"] = {"declared": len(sub.get("required_checks") or []),
+                                           "passed": sum(1 for s2 in _own if s2["ok"]),
+                                           "failed": [s2["cmd"] for s2 in _own if not s2["ok"]]}
+            self.task.mutate(_own)
             self.log("  verify: %s" % result.summary())
             claimed = (report or {}).get("status")
             if claimed and claimed != "complete":
@@ -1554,7 +1618,14 @@ class Orchestrator:
                 "stage": self.task.state["status"], "role": role,
                 "subtask": subtask.get("id") if subtask else None,
                 "model": choice.model, "channel": choice.channel,
-                "adapter": self.adapter.name, "outcome": reason,
+                "adapter": self.adapter.name,
+                # Whether panes were ACTUALLY on, not inferred from the
+                # adapter name. `--no-panes` runs HerdrAdapter(panes=False),
+                # whose `.name` is still "herdr" -- so the brief inferred
+                # "in a terminal pane" and printed the pane caveat about
+                # unreliable cost over rows whose cost was reported fine.
+                "panes": bool(getattr(self.adapter, "panes", False)),
+                "outcome": reason,
                 # A wall still costs wall-clock, and that time is exactly what
                 # the failover path exists to shorten -- so it has to be on the
                 # record even though the call bought nothing.
@@ -1601,7 +1672,14 @@ class Orchestrator:
             "stage": self.task.state["status"], "role": role,
             "subtask": subtask.get("id") if subtask else None,
             "model": choice.model, "channel": choice.channel,
-            "adapter": self.adapter.name, "outcome": outcome,
+            "adapter": self.adapter.name,
+                # Whether panes were ACTUALLY on, not inferred from the
+                # adapter name. `--no-panes` runs HerdrAdapter(panes=False),
+                # whose `.name` is still "herdr" -- so the brief inferred
+                # "in a terminal pane" and printed the pane caveat about
+                # unreliable cost over rows whose cost was reported fine.
+                "panes": bool(getattr(self.adapter, "panes", False)),
+                "outcome": outcome,
             "usd": res.get("cost_usd"),
             "usd_estimated": bool(res.get("cost_estimated")) or None,
             # Tokens and elapsed time are kept beside the money, not derived
