@@ -517,11 +517,17 @@ everything else in the table, including the warm single session. So isolation is
 not what this costs.
 
 The two middle columns isolate what does: same provider, same model, same four
-jobs, only `delegate` added. Per job it ran **2.25x, 1.63x, 2.18x and 0.86x** the
-hand-rolled cost — **1.51x overall, and 1.50x on wall clock**. Read the spread
-before taking 1.5x as a constant: on one of the four jobs `delegate` was cheaper
-*and* faster, and the variance between individual agent runs is wider than the
-effect. n=1 per job.
+jobs, only `delegate` added — **1.51x overall**. Run back to back under
+controlled conditions, with every turn attributed to the tool that made it, the
+same two jobs come in at **1.77x and 2.10x**; the arm-level 1.51x is diluted by
+run-to-run noise wide enough to have produced one pair where `delegate` looked
+*cheaper*, which did not reproduce.
+
+Where the overhead goes is stable across both jobs: **four turns of protocol
+layer, every time** — reading `PROTOCOL.md`, the role card and the report
+schema, then writing the report. That is not waste to be trimmed. Three of those
+four are what makes a job resumable on another provider, and the fourth is the
+only way a stuck job can tell you why it stopped.
 
 What that ~1.5x buys is everything the script leaves out because it is a
 throwaway: a merge gate that hands a human graded evidence before anything

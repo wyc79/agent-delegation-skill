@@ -46,10 +46,14 @@ as a short script with no `delegate` in it, on one provider. It beat delegating
 on both axes.
 
 Run head to head on one provider, same model, same jobs, `delegate` costs
-**~1.5x** the hand-rolled equivalent in both money and wall clock. What you get
-for it is a merge gate carrying graded evidence, per-job scope measurement, cost
-and attempt caps that bind, and a task on disk you can resume after a crash. On
-a single seat that is the whole of the trade, and you should make it on purpose.
+**~1.8-2.1x** the hand-rolled equivalent. The overhead is four extra turns per
+agent, every time: reading the protocol, the role card and the report schema,
+then writing the report back. Three of those are what let another provider pick
+the job up mid-flight; the fourth is the only way a stuck job can tell you why.
+
+So on a single seat you are paying about double for a merge gate carrying graded
+evidence, per-job scope measurement, caps that bind, a resumable task on disk —
+and a failover you have no second seat to use. Make that trade on purpose.
 
 Also on a single seat: **`tier` stops meaning anything.** Nothing here pins a
 model, so a band only picks a different model when your seats expose different
