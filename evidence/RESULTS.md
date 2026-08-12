@@ -45,8 +45,8 @@ other column can — the scripts and their output are beside this file.
 | | A ‡ | B | C ‡ | D | E2 | F |
 |---|---|---|---|---|---|---|
 | Score | 31/31 | 31/31 | 31/31 | **31/31** | **31/31** | **31/31** |
-| Wall clock | 31.5 min | 9.6 min | 6.8 min | **3.5 min** | 4.8 min | — ⚠⚠⚠ |
-| Cost | $13.07 | $4.60 ⚠ | $3.10 | **$2.92** | $0.80 ⚠⚠ | $4.41 |
+| Wall clock | 31.5 min | 9.6 min | 6.8 min | **3.5 min** | 4.8 min | 9.6 min |
+| Cost | $13.07 | $4.60 ⚠ | $3.10 | **$2.92** | $0.80 ⚠⚠ | $5.03 |
 | Tokens in | 6,735,113 | 2,627,303 | 1,524,925 | 1,941,825 | 1,761,233 | 2,672,000 |
 | Tokens out | 131,359 | 51,198 | 44,834 | 32,255 | 29,559 | 51,381 |
 | Agent calls | 6 | 4 | 10 turns | 4 | 6 (2 walled) | 4 |
@@ -63,13 +63,18 @@ per-job cursor costs — the same jobs, same prompts, same seat, correct pricing
 — B's true total is **≈ $3.0**. The split was never stored, so this is a
 recomputation, not a measurement.
 
-⚠⚠⚠ **F has no wall-clock figure.** One of its four jobs blocked ~15 minutes on
-a human approval prompt from the agent CLI, so the run's wall clock is
-meaningless. That job (`st-2-render`) was re-run alone afterwards and its clean
-pair is used below; F's $4.41 is the sum of three original jobs plus the rerun.
-The other three jobs' self-timed durations are unaffected — start times
-reconstruct exactly from `elapsed_ms` plus completion, and all three finished
-before the prompt.
+**F was run twice.** The first attempt lost a job to a ~15-minute human
+approval prompt from the agent CLI, so it had no usable wall clock; the figures
+above are the clean rerun. The two runs cost $4.41 and $5.03 for identical work
+— a ~14% spread on a four-job plan, which is the same run-to-run noise that
+produced the 0.86x anomaly further down.
+
+**A third of F's wall-clock gap is a config default.** 576s against D's 210s is
+2.74x, worse than the 1.82x of summed agent time, because
+`max_parallel_agents: 3` runs a four-job plan as three-then-one while the
+hand-rolled control ran all four at once. `max(117, 224, 381) + 178 = 559s`
+against 576s measured; all four concurrently would have been 381s. That ~195s is
+a tuning choice, not overhead.
 
 ⚠⚠ **E2's $0.80 excludes real work that was thrown away.** Two Claude agents
 ran ~88s each before the injected wall; a killed CLI reports no usage, so that
@@ -116,8 +121,10 @@ Both controlled pairs agree with each other and not with the arm totals:
 | st-2-render | 20 turns / $0.856 | 10 turns / $0.407 | 2.10 |
 | st-4-raster | 21 turns / $0.965 | 13 turns / $0.545 | 1.77 |
 
-So the per-agent overhead is **~1.8-2.1x**, and the arm-level 1.51x understates
-it. A single pair would have supported anything from 0.9x to 2.3x, which is
+So the per-agent overhead is **~1.8-2.1x**. F's clean rerun agrees at the arm
+level: 900s of summed agent time against D's 496s is 1.82x, and $5.03 against
+$2.92 is 1.72x. The earlier arm-level 1.51x understated it because one of its
+four jobs was a single-job rerun that happened to come in cheap. A single pair would have supported anything from 0.9x to 2.3x, which is
 exactly what happened -- twice, in both directions, to me.
 
 **And the protocol layer explains only about half of it.** The turn diffs in

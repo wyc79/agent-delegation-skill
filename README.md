@@ -499,11 +499,20 @@ open.
 |---|---|---|---|
 | **B** | the wrapper: 4 caller-written jobs, 2 seats | 31/31, ≈$3.0, 9.6 min | first run of the product as it now is |
 | **D** | the same structure **hand-rolled, no `delegate`**, 1 seat | 31/31, **$2.92, 3.5 min** | the skill now ships this recipe |
-| **F** | the wrapper on **1 seat**, same jobs as D | 31/31, $4.41 | the ~1.8–2.1× per-agent overhead |
+| **F** | the wrapper on **1 seat**, same jobs as D | 31/31, $5.03, 9.6 min | the per-agent overhead, and the wave-cap cost below |
 | **E1** | a wall on a band only one seat serves | did **not** park — `_replacement` re-asks for the walled model's *reasoning floor*, not its tier, and on failing it drops the floor | a known rough edge: the caller's band does not survive its seat going out, and only the run log says so |
 | **E2** | a wall mid-job, twice, 2 seats | 31/31 across two provider changes | the failover claim is earned |
 | **E3** | a wall mid-job on a **single** seat | salvaged, parked, resumed from the checkpoint | found a bug that failed the recovery |
 | **G/H** | inlining the protocol to save turns | **no change** — 30 turns either way | progressive disclosure kept |
+
+**A third of the wall-clock gap is a config default, not overhead.** F's clean
+rerun took 576s against D's 210s — 2.74×, worse than the 1.8× its per-agent
+figures suggest. The shipped `max_parallel_agents: 3` runs a four-job plan as
+**three then one**; the hand-rolled control ran all four at once. From the
+per-job times, `max(117, 224, 381) + 178 = 559s` against 576s measured, and all
+four concurrently would have been 381s. So ~195s of that gap is the cap. Whether
+`3` is the right default is open: raising it trades wall clock against
+contention on one provider's rate limits, and only the first has been measured.
 
 **Why the skill tells you not to use this on one seat.** D and F are the same
 jobs, provider and model; only `delegate` differs. Per job it ran 1.77× and
