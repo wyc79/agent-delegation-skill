@@ -146,8 +146,15 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
     if verify_cfg and verify_cfg.get("fast"):
         lines += ["", "Verification commands for this project (run these, do not invent others):"]
         lines += ["  %s" % c for c in verify_cfg["fast"]]
-        if verify_cfg.get("slow"):
-            lines.append("Slow checks (stage boundaries only): %s" % "; ".join(verify_cfg["slow"]))
+        # The `slow` commands are deliberately NOT named. They run at the
+        # integrate stage, orchestrator-side, once every job's work is merged --
+        # an agent cannot usefully run one and is told not to.
+        #
+        # Naming them anyway was worse than useless. A turn-by-turn diff against
+        # a hand-rolled agent on the same job caught this one exactly:
+        # `Read: check-grade.sh`, a whole round trip spent reading a script the
+        # prompt had just forbidden it to run. Telling an agent about a thing it
+        # cannot act on invites it to go and look.
 
     state = task.state
     lims = state.get("limits", {})

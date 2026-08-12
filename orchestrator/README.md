@@ -250,7 +250,7 @@ python3 orchestrator/tests/test_orchestrator.py
 python3 orchestrator/tests/test_failover.py
 ```
 
-270 tests, none of which spend a token: the end-to-end ones drive the real state
+271 tests, none of which spend a token: the end-to-end ones drive the real state
 machine over a real git repository with a scripted adapter, so dispatch,
 isolated worktrees, waves, verify, failover and integration are all exercised
 for real.

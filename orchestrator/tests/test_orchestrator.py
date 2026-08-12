@@ -2809,6 +2809,28 @@ class TestTheSeams(unittest.TestCase):
         self.assertEqual(leaked, [],
                          "routing detail reached a dispatched agent: %s" % leaked)
 
+    def test_the_prompt_names_no_command_the_agent_must_not_run(self):
+        """Anything in the prompt is something an agent may go and look at.
+
+        The `slow` commands run at `integrate`, orchestrator-side, once every
+        job's work is merged; a job agent is told not to run them. Naming them
+        anyway cost a whole turn -- a turn-by-turn diff against a hand-rolled
+        agent on the same job showed `Read: check-grade.sh`, a round trip spent
+        reading a script the prompt had just forbidden it to run.
+        """
+        task = _task(self.t.repo, "T-SEAM6", "# t\n\nx\n",
+                     self.reg["policy"]["limits"])
+        cfg = {"fast": ["make build"], "slow": ["sh check-grade.sh"]}
+        text = prompts.compose("implementer", task,
+                               subtask={"id": "st-1", "goal": "g",
+                                        "planned_scope": ["a.py"]},
+                               verify_cfg=cfg)
+        self.assertIn("make build", text, "the agent's own checks must be named")
+        for cmd in cfg["slow"]:
+            self.assertNotIn(cmd, text,
+                             "the prompt names a command the agent is told not "
+                             "to run, which invites it to go and read it")
+
     # --- seam 2: the config declares it, so it must actually run ----------
     def test_every_declared_command_tier_actually_executes(self):
         """Driven from `verify.COMMAND_TIERS`, the same list the machine runs.
