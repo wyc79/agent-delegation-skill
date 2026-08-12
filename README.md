@@ -391,9 +391,12 @@ cd /path/to/your/repo
 delegate init
 ```
 
-If it ends *"Every tier resolves to …"*, stop and use SDD normally — on one seat
-you are buying subprocess indirection. If it ends *"2 seats serve these tiers"*,
-continue.
+If it ends *"Every tier resolves to …"*, stop — and do **not** simply fall back
+to SDD's sequential loop. The skill ships the better single-seat answer at
+[`agent-delegation/references/one-seat.md`](agent-delegation/references/one-seat.md):
+the same worktree-per-job fan-out, run yourself, which measured cheaper and
+faster than both `delegate` and one warm session. If it ends *"2 seats serve
+these tiers"*, continue here.
 
 **2. Translate the plan into `jobs.md`.** The only real work, and a field lift:
 
@@ -502,7 +505,7 @@ keeping it moving when one empties.
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 176 tests, no tokens spent
+python3 orchestrator/tests/test_orchestrator.py  # 177 tests, no tokens spent
 python3 orchestrator/tests/test_failover.py      # 101 more, same
 ```
 

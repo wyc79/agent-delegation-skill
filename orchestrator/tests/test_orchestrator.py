@@ -2940,6 +2940,19 @@ class TestTheSeams(unittest.TestCase):
         for n in ("T-001", "T-002"):
             self.assertIn(n, msg, "the error does not list %s" % n)
 
+    def test_the_shipped_example_plan_passes_the_schema_it_teaches(self):
+        """`evidence/jobs.example.md` is offered as a worked `--plan` file and
+        the schema is now enforced at load. An example that would be refused by
+        the program it is an example for is worse than no example."""
+        import re as _re
+        text = _slurp(os.path.join(REPO_ROOT, "evidence", "jobs.example.md"))
+        blocks = _re.findall(r"```ya?ml\s*\n(.*?)```", text, _re.S)
+        self.assertTrue(blocks, "the example carries no fenced yaml block")
+        jobs = yamlite.load(blocks[0])
+        self.assertTrue(jobs, "the example's block parses to nothing")
+        for job in jobs:
+            schema.validate_subtask(job)
+
     # --- seam 2: the config declares it, so it must actually run ----------
     def test_every_declared_command_tier_actually_executes(self):
         """Driven from `verify.COMMAND_TIERS`, the same list the machine runs.
