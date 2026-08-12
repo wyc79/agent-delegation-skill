@@ -255,7 +255,7 @@ real agent CLI and costs money. It checks the half nothing else covers -- that
 an agent handed `agent-delegation/` actually follows it, on the case the skill's
 first instruction is about. Run it when the skill changes.
 
-305 tests, none of which spend a token: the end-to-end ones drive the real state
+306 tests, none of which spend a token: the end-to-end ones drive the real state
 machine over a real git repository with a scripted adapter, so dispatch,
 isolated worktrees, waves, verify, failover and integration are all exercised
 for real.

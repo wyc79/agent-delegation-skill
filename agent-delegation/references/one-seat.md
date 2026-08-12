@@ -62,23 +62,65 @@ spend anything, one before you merge.
 disjoint before you spend anything.**
 
 ```bash
+root=$(git rev-parse --show-toplevel)
 base=$(git rev-parse HEAD)
 
+# Exactly where `delegate` puts its worktrees, so the two halves interoperate:
+# beside the repo, never inside it, keyed on the git common dir so that two
+# checkouts side by side do not land on one directory.
+cd_=$(git rev-parse --path-format=absolute --git-common-dir)
+key="$(basename "$(dirname "$cd_")")-$(printf %s "$cd_" | shasum -a 256 | cut -c1-8)"
+wt="$(dirname "$root")/.adg-worktrees/$key"
+scopes="$wt/scopes"
+mkdir -p "$wt"
+
 # every job's write scope, one line each: "<job> <file> [file...]"
-cat > /tmp/scopes <<'EOF'
+cat > "$scopes" <<'EOF'
 st-1-alpha  alpha.c
 st-2-beta   beta.c beta.h
 st-3-gamma  gamma.c
 EOF
 
 awk '{for(i=2;i<=NF;i++) if($i in o){print "OVERLAP: "$i" in "o[$i]" and "$1; e=1} \
-      else o[$i]=$1} END{exit e}' /tmp/scopes || exit 1
+      else o[$i]=$1} END{exit e}' "$scopes" || exit 1
 
-while read -r job _; do git worktree add "../wt/$job" -b "$job" "$base"; done < /tmp/scopes
+while read -r job _; do git worktree add "$wt/$job" -b "$job" "$base"; done < "$scopes"
 ```
 
 If that prints `OVERLAP`, you do not have N parallel jobs — you have fewer. Merge
 the colliding ones into a single job or run them in sequence.
+
+**This is the same location `delegate` uses, deliberately.** It computes that
+`<repo-parent>/.adg-worktrees/<project-key>/` path the same way, from the same
+git common dir, so a run you started by hand does not have to be thrown away the
+day a second seat appears: the worktrees and their branches are already where
+`delegate` looks, and `git worktree add` reattaches an existing branch rather
+than refusing it. Start on one seat, enroll a second, and the work in flight is
+still on disk in the right place. (A test in this repository runs the two lines
+above and asserts they equal `store.project_key`, so the recipe cannot drift
+away from the runtime it is matching.)
+
+**Both paths are namespaced on the repository, and the two collisions are not
+equally polite.** A bare `../wt` and a fixed `/tmp/scopes` are relative to where
+you are standing rather than to the repo, so two checkouts side by side — the
+ordinary layout — resolve them to the same place.
+
+The worktree half **fails loudly**: `fatal: '../wt/st-1-alpha' already exists`.
+Survivable, though it lands partway through the loop with some worktrees made
+and some not.
+
+The scopes file is the one to care about, because **it is silent.** Step 3 reads
+it back, so a second run that started while the first was still working
+overwrites the declaration between the gate and the audit — and the first run
+then checks its branches against the second run's scopes, reporting violations
+of a boundary nobody set and passing files that were out of bounds. No error
+anywhere. Anchoring on `--show-toplevel` also makes both work from a
+subdirectory. `delegate` puts its worktrees in
+`<repo-parent>/.adg-worktrees/<project-key>/` for the same reason.
+
+The branch names are left bare on purpose: `git worktree add -b` **fails loudly**
+if `st-1-alpha` already exists, which is the right outcome for a leftover from a
+run you thought had finished.
 
 **2. Dispatch the longest job first, and send the rest without stopping to read
 anything.** Each gets its own goal, its write scope, and the frozen contracts —
@@ -147,7 +189,7 @@ while read -r job scope; do
   stray=$(git diff --name-only "$base" "$job" | grep -vxF "$(echo "$scope" | tr ' ' '\n')")
   [ -z "$stray" ] || echo "OUT OF SCOPE in $job: $stray"      # report, do not stop
   git merge --no-edit "$job" && <your check> || break
-done < /tmp/scopes
+done < "$scopes"
 ```
 
 **`rev-list` catches a failure with no symptoms.** An agent that reports success
@@ -175,8 +217,10 @@ both touched one file are also the one case where merge order changes the
 result — merge the smaller claim first so the conflict surfaces while it is still
 small.
 
-Both checks read the same `/tmp/scopes` from step 1, so the declaration you
-gated on is the declaration you audit against.
+Both checks read the same `$scopes` file from step 1, so the declaration you
+gated on is the declaration you audit against — which is also why it lives beside
+the worktrees rather than at a fixed path in `/tmp` that a second run would
+overwrite between the gate and the audit.
 
 ## The frozen contracts are the whole thing
 

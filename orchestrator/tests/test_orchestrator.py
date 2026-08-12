@@ -2769,6 +2769,41 @@ class TestTheSeams(unittest.TestCase):
     tier is covered the day it is written.
     """
 
+    ONE_SEAT = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))),
+        "agent-delegation", "references", "one-seat.md")
+
+    def test_the_one_seat_recipe_lands_where_delegate_looks(self):
+        """The hand-rolled recipe and the runtime must agree on the worktree
+        path, or a run started on one seat cannot be picked up by `delegate` the
+        day a second seat is enrolled.
+
+        The shell is EXTRACTED FROM THE DOCUMENT and executed, not retyped here.
+        A copy would agree with the runtime forever while the file a caller
+        actually follows drifted away from both -- which is this class's whole
+        subject. `project_key` is a truncated sha256 of the git common dir, so
+        the two only match if the shell hashes exactly the same bytes.
+        """
+        if shutil.which("shasum") is None:            # the doc's own command
+            self.skipTest("shasum not available")
+        with open(self.ONE_SEAT, encoding="utf-8") as fh:
+            doc = fh.read()
+        wanted = [ln.strip() for ln in doc.splitlines()
+                  if ln.strip().startswith(("root=", "cd_=", "key=", "wt="))]
+        self.assertEqual(len(wanted), 4,
+                         "one-seat.md no longer defines root/cd_/key/wt; the "
+                         "recipe changed shape and this test cannot see it")
+        out = subprocess.run(["bash", "-c", "\n".join(wanted) + '\necho "$wt"'],
+                             cwd=self.t.repo, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        runtime_path = os.path.join(
+            os.path.dirname(os.path.abspath(self.t.repo)),
+            ".adg-worktrees", store.project_key(self.t.repo))
+        self.assertEqual(os.path.realpath(out.stdout.strip()),
+                         os.path.realpath(runtime_path),
+                         "the recipe and `_subtask_worktree` disagree about "
+                         "where a job's worktree goes")
+
     def setUp(self):
         self.t = TempRepo()
         self.reg = router.load_registry(REGISTRY)
