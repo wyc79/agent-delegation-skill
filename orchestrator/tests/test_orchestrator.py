@@ -610,7 +610,13 @@ class TestClosedGaps(unittest.TestCase):
              "usage": {"input_tokens": 2, "output_tokens": 4,
                        "cache_read_input_tokens": 15953}}), "", 0)
         self.assertEqual(claude["cost_usd"], 0.09)
-        self.assertEqual(claude["usage"], {"in": 15955, "out": 4})
+        # `in` stays the total -- it is what the record and the briefs show.
+        # The split rides alongside, because the three classes are not one
+        # price and the estimator has to tell them apart.
+        self.assertEqual(claude["usage"]["in"], 15955)
+        self.assertEqual(claude["usage"]["out"], 4)
+        self.assertEqual(claude["usage"]["cache_read"], 15953)
+        self.assertEqual(claude["usage"]["fresh_in"], 2)
         self.assertEqual(claude["elapsed_ms"], 1789)
 
         cursor = rt._result(json.dumps(
@@ -618,8 +624,44 @@ class TestClosedGaps(unittest.TestCase):
              "usage": {"inputTokens": 12179, "outputTokens": 30,
                        "cacheReadTokens": 5248}}), "", 0)
         self.assertIsNone(cursor["cost_usd"], "cursor reports no cost today")
-        self.assertEqual(cursor["usage"], {"in": 17427, "out": 30})
+        self.assertEqual(cursor["usage"]["in"], 17427)
+        self.assertEqual(cursor["usage"]["out"], 30)
+        self.assertEqual(cursor["usage"]["cache_read"], 5248)
+        self.assertEqual(cursor["usage"]["fresh_in"], 12179)
         self.assertEqual(cursor["elapsed_ms"], 14298)
+
+    def test_cached_input_is_not_priced_as_fresh_input(self):
+        """The estimate's accuracy, and it was wrong in one direction.
+
+        `_tokens` handed `_bill` a single summed `in`, so a cache read was
+        charged at the fresh-input rate — ten times its real price. Any agent
+        past its first turn reads mostly cache, so the inflated figure is what
+        reached the brief, the budget cap, and every cost comparison drawn from
+        them. An estimate may be wrong; it may not be wrong in a direction
+        nobody was told about.
+        """
+        from adg import runtime as rt
+        from adg.machine import Orchestrator
+        task = _task(self.t.repo, "T-CACHE", "# t\n", self.pol)
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter(),
+                            lambda k, t: True, log=lambda *_: None)
+        choice = router.Router(self.reg).select(tier="t2")   # cost_in 3, cost_out 15
+
+        # 1M tokens read from cache, nothing fresh, no output.
+        res = rt._result(json.dumps({"result": "ok", "usage": {
+            "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 1_000_000}}), "", 0)
+        self.assertAlmostEqual(orch._bill(res, choice), 0.30, places=4,
+                               msg="a cache read is billed as fresh input")
+
+        # 1M fresh, for contrast: the full rate.
+        res = rt._result(json.dumps({"result": "ok", "usage": {
+            "inputTokens": 1_000_000, "outputTokens": 0}}), "", 0)
+        self.assertAlmostEqual(orch._bill(res, choice), 3.00, places=4)
+
+        # A CLI that reports no split is still charged at the fresh rate — an
+        # over-estimate, but the honest one when the breakdown is absent.
+        res = {"usage": {"in": 1_000_000, "out": 0}}
+        self.assertAlmostEqual(orch._bill(res, choice), 3.00, places=4)
 
     def test_the_delegation_record_keeps_tokens_and_time(self):
         task = _task(self.t.repo, "T-C5", "# t\n", self.pol)
@@ -2683,6 +2725,94 @@ class TestResourceHygiene(unittest.TestCase):
 
     def tearDown(self):
         self.t.close()
+
+class TestSlowChecks(unittest.TestCase):
+    """`slow` runs at the integrate stage, which is what it was always for.
+
+    Nothing ever passed "slow" to `verify.run`. The commands were parsed,
+    printed in the merge brief as "not run -- deliberately skipped, so they are
+    not evidence of anything", and executed zero times. On a project whose slow
+    check is the only thing that can observe whether the change works — a
+    grader, an integration suite — the gate asked a human to land a change on
+    the per-job compile check alone.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo,
+                       capture_output=True)
+        self.t.close()
+
+    def _run(self, body):
+        # The slow command is a script file, not an inline string. Quoting a
+        # shell command through YAML through the test source is three levels of
+        # escaping, and the first version of this test passed because its
+        # command died of a SyntaxError -- exit 1 was what the assertion wanted.
+        with open(os.path.join(self.t.repo, "slow-check.sh"), "w") as fh:
+            fh.write(body)
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'import app\'"\n'
+                     'slow:\n  - "sh slow-check.sh"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        script, _ = TestEndToEnd._script(self)[0], None
+        task = _task(self.t.repo, "T-SLOW", "# t\n\nAdd subtract\n",
+                     self.reg["policy"]["limits"])
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        return status, task, logs
+
+    def test_a_passing_slow_check_runs_and_is_reported_as_run(self):
+        status, task, logs = self._run("echo graded 31 of 31\n")
+        self.assertEqual(status, "done", "\n".join(logs))
+        text = task.read_text("brief.md")
+        evidence = text.split("## Evidence")[1].split("##")[0]
+        self.assertNotIn("Not run", evidence,
+                         "the slow check is still reported as skipped:\n" + evidence)
+        self.assertIn("2/2 checks passed", evidence,
+                      "the slow check did not join the count:\n" + evidence)
+        # And it really executed, rather than being counted as a pass.
+        ran = [_slurp(os.path.join(task.path, "verify", f))
+               for f in os.listdir(os.path.join(task.path, "verify"))]
+        self.assertTrue(any("graded 31 of 31" in r for r in ran),
+                        "no verify record holds the slow command's output")
+
+    def test_a_failing_slow_check_reaches_the_gate_instead_of_a_claimed_pass(self):
+        """The expensive sentence. The decision text asserted "It is complete
+        and its checks pass" unconditionally, which was only ever true because
+        the tier that could fail here never ran."""
+        status, task, logs = self._run(
+            "echo FAIL 21 Too much error. Actual: 20.67\nexit 1\n")
+        text = task.read_text("brief.md")
+        self.assertNotIn("its checks pass", text,
+                         "the gate claimed a pass over a failing check")
+        self.assertIn("did not all pass", text)
+        # The line that says WHAT failed, not just that something did.
+        self.assertIn("Actual: 20.67", text,
+                      "the failure output never reached the human:\n" + text)
+
+    def test_no_slow_config_changes_nothing(self):
+        status, task, logs = self._run_without_slow()
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertIn("1/1 checks passed", task.read_text("brief.md"))
+
+    def _run_without_slow(self):
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'import app\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+        script, _ = TestEndToEnd._script(self)[0], None
+        task = _task(self.t.repo, "T-NOSLOW", "# t\n\nAdd subtract\n",
+                     self.reg["policy"]["limits"])
+        logs = []
+        status = Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                              lambda k, t: True, log=logs.append).run()
+        return status, task, logs
+
 
 class TestEndToEnd(unittest.TestCase):
     """Milestone 1."""

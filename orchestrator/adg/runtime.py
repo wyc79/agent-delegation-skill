@@ -71,8 +71,18 @@ def classify(res, kind, now=None, text=None):
 
 
 def _tokens(usage):
-    """Normalise the two token shapes we see. Cost can then be derived from our
-    own price table when a CLI reports usage but not money."""
+    """Normalise the two token shapes we see, keeping the three input classes
+    apart. Cost can then be derived from our own price table when a CLI reports
+    usage but not money.
+
+    `in` stays the total, because it is what the record and the briefs have
+    always shown and it is the honest answer to "how much did this agent read".
+    The split rides alongside it, because the three classes are not the same
+    price: a cache read is a tenth of fresh input and a cache write is a
+    quarter more. Folding them together and pricing the sum at the fresh rate
+    over-charged every agent whose context was mostly cache -- which is every
+    agent on a long turn, and is exactly the shape of a coding run.
+    """
     if not isinstance(usage, dict):
         return None
     def pick(*names):
@@ -80,10 +90,13 @@ def _tokens(usage):
             if isinstance(usage.get(n), (int, float)):
                 return int(usage[n])
         return 0
-    got = {"in": pick("input_tokens", "inputTokens")
-                 + pick("cache_read_input_tokens", "cacheReadTokens")
-                 + pick("cache_creation_input_tokens", "cacheWriteTokens"),
-           "out": pick("output_tokens", "outputTokens")}
+    fresh = pick("input_tokens", "inputTokens")
+    cache_read = pick("cache_read_input_tokens", "cacheReadTokens")
+    cache_write = pick("cache_creation_input_tokens", "cacheWriteTokens")
+    got = {"in": fresh + cache_read + cache_write,
+           "out": pick("output_tokens", "outputTokens"),
+           "fresh_in": fresh, "cache_read": cache_read,
+           "cache_write": cache_write}
     return got if (got["in"] or got["out"]) else None
 
 

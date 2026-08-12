@@ -1055,7 +1055,25 @@ class Orchestrator:
         state = self.task.state
         files = sorted({f for s in state["subtasks"] for f in s.get("actual_files", [])})
         base = self._ensure_worktree()
-        result = verify.run(self.task, self.repo, base, "fast")
+        # Both tiers, and this is the stage boundary `slow` was always for.
+        #
+        # Nothing ever passed "slow" to `verify.run`. The commands were parsed,
+        # reported in this brief as "not run -- deliberately skipped, so they
+        # are not evidence of anything", and never executed once. On a project
+        # whose slow check is the only thing that can observe whether the change
+        # works at all -- a grader, an integration suite, an end-to-end run --
+        # that made this gate ask a human to land a change on the strength of
+        # the per-job compile check and nothing else.
+        #
+        # It belongs here rather than beside `implement`: a slow check is the
+        # one that only means something once every job's work is merged, and
+        # running it per attempt would pay for it once per job to learn nothing.
+        result = verify.combine(
+            verify.run(self.task, self.repo, base, "fast"),
+            verify.run(self.task, self.repo, base, "slow"))
+        if not result.ok:
+            self.log("  verify: %s — the brief says so and the gate still asks"
+                     % result.summary())
         # Said plainly, every time. `delegate` runs no reviewer and no quality
         # pass of any kind: it places the work the caller decomposed and
         # integrates what comes back, and the only judgement in the record is
@@ -1074,11 +1092,20 @@ class Orchestrator:
                 "below, and the scope column above, are the whole of the "
                 "evidence. Judging the work against what you asked for is "
                 "yours, and this is the point to do it.")
+        # The decision text follows the checks rather than asserting them. It
+        # read "It is complete and its checks pass" unconditionally, which was
+        # true only because the tier that could fail here never ran; now that
+        # `slow` does, a gate that still claimed a pass would be the most
+        # expensive sentence in the program.
+        headline = ("It is complete and its checks pass."
+                    if result.ok else
+                    "**Its checks did not all pass** (%s) — the failures are "
+                    "below. Nothing here judged whether that matters."
+                    % result.summary())
         text, problems = brief.write(
             self.task, "merge",
-            "Land this change? It is complete and its checks pass. Nothing has been "
-            "committed: attended mode leaves a patch file for you to apply and commit "
-            "yourself.",
+            "Land this change? %s Nothing has been committed: attended mode "
+            "leaves a patch file for you to apply and commit yourself." % headline,
             files=files, verify=result, extra="## Review\n\n" + note)
         for p in problems:
             self.log("  brief lint: %s" % p)
@@ -1617,6 +1644,21 @@ class Orchestrator:
                 # silently hides adapter bugs that only show up as leaked panes.
                 self.log("  warning: teardown failed: %s: %s" % (type(e).__name__, e))
 
+    # What each class of input token costs, as a multiple of the model's
+    # `cost_in`. A cache read is a tenth of fresh input and a cache write a
+    # quarter more than it -- the same structure every provider that sells
+    # prompt caching uses, and the reason a long coding turn is affordable at
+    # all.
+    #
+    # They were all charged at 1.0 because `_tokens` handed over one summed
+    # figure. On a run whose context is mostly cache -- which is any agent past
+    # its first turn -- that inflates the estimate by close to the cache ratio,
+    # and the inflated number is the one that reached the brief, the budget cap
+    # and every comparison anyone drew from them. An estimate is allowed to be
+    # wrong; it is not allowed to be wrong in a direction nobody was told about.
+    CACHE_READ_RATE = 0.1
+    CACHE_WRITE_RATE = 1.25
+
     def _bill(self, res, choice):
         """Charge a run. Some CLIs report money, some report only tokens; those
         get priced from our own registry and marked as an estimate, because a
@@ -1628,7 +1670,16 @@ class Orchestrator:
         if not tok or not choice:
             return None
         spec = choice.spec or {}
-        usd = (tok["in"] / 1e6) * float(spec.get("cost_in", 0)) + \
+        rate_in = float(spec.get("cost_in", 0))
+        # Falls back to the total at the fresh rate when a CLI reports no split
+        # -- an over-estimate, but the honest one when the breakdown is absent.
+        if "cache_read" in tok:
+            billable = (tok.get("fresh_in", 0)
+                        + tok.get("cache_read", 0) * self.CACHE_READ_RATE
+                        + tok.get("cache_write", 0) * self.CACHE_WRITE_RATE)
+        else:
+            billable = tok["in"]
+        usd = (billable / 1e6) * rate_in + \
               (tok["out"] / 1e6) * float(spec.get("cost_out", 0))
         if usd <= 0:
             return None

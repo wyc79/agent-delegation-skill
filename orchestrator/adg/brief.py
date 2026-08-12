@@ -211,6 +211,13 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
                       "not evidence of anything." % "; ".join(verify.skipped))
         for f in verify.failures()[:3]:
             md.append("- Failed: `%s`" % f["cmd"])
+            # The last lines, not just the command. A slow check is often the
+            # only thing that can say whether the change works, and "Failed:
+            # `sh check-grade.sh`" tells a human that something is wrong while
+            # withholding the one line that says what -- which is the line the
+            # check was configured to produce.
+            tail = [ln for ln in (f.get("output") or "").splitlines() if ln.strip()][-3:]
+            md += ["      %s" % ln[:160] for ln in tail]
         md.append("")
 
     # No "what didn't go to plan" section. It rendered when `deviations.md`

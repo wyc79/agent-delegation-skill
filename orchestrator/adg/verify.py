@@ -106,6 +106,25 @@ def run(task, repo, cwd, tier="fast", timeout=900):
     return result
 
 
+def combine(*results):
+    """One Result over several tiers, for a gate that ran more than one.
+
+    `skipped` is recomputed rather than concatenated: a command the fast run
+    listed as skipped is not skipped once the slow run has executed it, and
+    carrying both would print "1/1 checks passed" beside "not run: the same
+    command".
+    """
+    results = [r for r in results if r is not None]
+    if not results:
+        return Result(_run_id("none"), True, [], [])
+    steps = [s for r in results for s in r.steps]
+    ran = {s["cmd"] for s in steps}
+    skipped = [c for r in results for c in r.skipped if c not in ran]
+    return Result(results[0].run_id,
+                  all(s["ok"] for s in steps) if steps else True,
+                  steps, sorted(set(skipped)))
+
+
 def is_ignored(path, extra=()):
     import fnmatch
     for pat in list(ALWAYS_IGNORE) + list(extra or []):
