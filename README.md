@@ -345,6 +345,111 @@ headroom nobody can claim, so a test refuses one.
   agent is a billed subprocess, and a leaked one keeps costing after the run has
   stopped.
 
+## Walkthrough: superpowers → delegate → superpowers
+
+`superpowers:subagent-driven-development` carries a Red Flag that reads **"Never
+dispatch multiple implementation subagents in parallel (conflicts)."** That rule
+exists because its subagents share one working tree. `delegate` is what removes
+the reason for it — disjoint declared write scopes, one git worktree per job,
+merged afterward.
+
+So the handoff is not "SDD calls `delegate` per task". It is: **SDD's per-task
+implementer loop is replaced by one `delegate` run over a batch of independent
+tasks, and SDD's review loop picks up after.** Everything before and after stays
+superpowers.
+
+**0. Brainstorm and plan.** `superpowers:brainstorming` → `superpowers:writing-plans`,
+unchanged. You end with a plan whose `### Task N` blocks each carry **Files**
+(Create/Modify/Test) and **Interfaces** (Consumes/Produces). Those two sections
+are what make the next step mechanical.
+
+**1. Check there are two seats.** This is the go/no-go, and it is one command:
+
+```bash
+cd /path/to/your/repo
+delegate init
+```
+
+If it ends *"Every tier resolves to …"*, stop and use SDD normally — on one seat
+you are buying subprocess indirection. If it ends *"2 seats serve these tiers"*,
+continue.
+
+**2. Translate the plan into `jobs.md`.** The only real work, and a field lift:
+
+| superpowers plan | delegate job block |
+|---|---|
+| `### Task 3: Rate limiter` | `id: st-3-rate-limiter` |
+| **Files:** Create / Modify / Test | `file_scope:` — all of them, tests included |
+| **Interfaces: Consumes** | `reads:` and `depends_on:` |
+| **Interfaces: Produces** | `frozen_interfaces:` |
+| Model Selection: cheap / standard / most capable | `tier: t1` / `t2` / `t3` |
+| Global Constraints | repeated into each `goal` or `acceptance` |
+
+The tier column is the interesting one. SDD already tells you to choose a model
+per task and to **"always specify the model explicitly"**. `tier` is that same
+decision — except a tier resolves to a model *on whichever seat has headroom*,
+which a plain subagent dispatch cannot do.
+
+**3. Give it your checks.** `.adg.yaml` in the repo under work. Nothing here has
+an opinion about what passing means:
+
+```yaml
+fast: ["pytest -q"]
+slow: ["pytest -q --integration"]
+```
+
+**4. Run it.** `delegate run "rate limiting" --plan jobs.md`. Jobs land in
+sibling worktrees under `../.adg-worktrees/<project-key>/`, each on
+`adg/<task-id>/<job-id>`, merged into `adg/<task-id>/work`.
+
+**5. The gate parks — exit 1 is not failure.** A calling agent has no tty, so
+the gate cannot ask it. The question is recorded and the run exits `awaiting_approval`:
+
+```bash
+delegate show --brief                     # the question, written for a human
+delegate approve --note "yes, but keep the v1 endpoint working"
+```
+
+The note is not decoration: it flows into every prompt downstream, so a
+qualified yes reaches the agents that act on it.
+
+**6. Read what came back.** The brief carries a row per job — the files it
+touched and which of them fell outside the scope it was given — plus per-seat
+cost and your check output. And, in as many words, that nothing reviewed any of
+it.
+
+**7. If a job escalated**, it hands back its `signals` whole and leaves its
+worktree in place. That is exactly SDD's **BLOCKED** input: more context, a
+stronger tier, split the task, or escalate to the human. `delegate` does none of
+that itself — it would be a worse copy of the skill that called it.
+
+**8. Review, and this is where superpowers returns.** Attended mode leaves
+`integrate.patch` in the task directory:
+
+```bash
+delegate status                           # prints the task directory
+git apply <task-dir>/integrate.patch
+```
+
+Then run `superpowers:requesting-code-review` over the branch, in your own warm
+session, on work you can see. This is the step `delegate` refuses to fake.
+Finish with `superpowers:finishing-a-development-branch`.
+
+**Three things that bite:**
+
+- **Commit the plan first.** Job agents work in worktrees cut from your HEAD, so
+  an uncommitted plan file is invisible to them. Either commit it or put the
+  requirements in `goal` — the goal *is* the whole brief; the agent gets no plan
+  and no context from you.
+- **Running from inside a superpowers worktree is fine.** The project key comes
+  from `git rev-parse --git-common-dir`, which is identical from every worktree
+  of a repo, so the task state is the same from anywhere in it.
+- **A parked or crashed task keeps its worktree on purpose.** That is the
+  salvage point. Only `done` reaps them; the branch survives either way.
+
+`--dry-run` walks the whole state machine, spends nothing, and shows the wave
+shape before you pay for it.
+
 ## Where it sits beside other skills
 
 It does not compete with them, and that is deliberate. The caller brings the
