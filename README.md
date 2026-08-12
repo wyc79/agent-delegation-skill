@@ -504,6 +504,8 @@ open.
 | **E2** | a wall mid-job, twice, 2 seats | 31/31 across two provider changes | the failover claim is earned |
 | **E3** | a wall mid-job on a **single** seat | salvaged, parked, resumed from the checkpoint | found a bug that failed the recovery |
 | **G/H** | inlining the protocol to save turns | **no change** — 30 turns either way | progressive disclosure kept |
+| **J** | the skill **executed** by a fresh agent, 1 seat, contracts *not* supplied | 31/31, $6.01, 6 min — after a 29/31 first merge it had to debug | what the recipe costs when nobody hands you the contracts |
+| **K** | code-winnow's five judgment passes dispatched as jobs, 2 seats | five findings files, zero scope violations, $7.18 | the tier bands generalise to a foreign package |
 
 **A third of the wall-clock gap is a config default, not overhead.** F's clean
 rerun took 576s against D's 210s — 2.74×, worse than the 1.8× its per-agent
@@ -513,6 +515,24 @@ per-job times, `max(117, 224, 381) + 178 = 559s` against 576s measured, and all
 four concurrently would have been 381s. So ~195s of that gap is the cap. Whether
 `3` is the right default is open: raising it trades wall clock against
 contention on one provider's rate limits, and only the first has been measured.
+
+**What the decomposition is worth, and who paid for it.** D and J run the same
+recipe on one seat. D cost $2.92, J cost $6.01. The difference is that D was
+handed the frozen contracts and J had to derive them — and did not, at first:
+it merged at 29/31, with the two scenes that turn on one interpolation rule
+failing, then diagnosed and fixed it. That **$3.09 gap is almost exactly the
+$2.93 the retired planner cost to produce those contracts.** Every single-seat
+figure in this table except J's is subsidised by a decomposition somebody else
+paid for. J is the only end-to-end number here.
+
+**It generalises past the task it was built on.** Arm K dispatched code-winnow's
+judgment passes — five readers over *one* diff, rather than writers of disjoint
+code — and the scope accounting held with zero violations. code-winnow's own
+band guidance ("tier down the volume passes, keep the supervisor passes at your
+tier") mapped onto `tier:` with no translation: the two volume passes cost $0.13
+together, the two supervisor passes $6.69. Building that plan also found the job
+id pattern only accepted `st-<number>-`, which fitted this repository's first
+task and nothing else.
 
 **Why the skill tells you not to use this on one seat.** D and F are the same
 jobs, provider and model; only `delegate` differs. Per job it ran 1.77× and

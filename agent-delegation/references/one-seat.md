@@ -96,6 +96,15 @@ Write the contracts before you write the goals. If you cannot state them, the
 jobs are not actually independent and you should not be running them in
 parallel.
 
+**Budget for writing them.** Measured on the same task twice: handed the
+contracts, this pattern cost X; made to derive them, it cost roughly double, and
+the extra was not setup — it was one agent merging work that looked right,
+scoring below the bar on the two cases that turned on a single interpolation
+rule, and having to bisect its way back to the cause. The contracts are not
+paperwork you do before the real work. They *are* the part of the work that
+cannot be parallelised, and skipping them moves the cost to the far end where it
+is dearer.
+
 ## What you give up
 
 - **No gate.** Nothing holds the work until you look at it.

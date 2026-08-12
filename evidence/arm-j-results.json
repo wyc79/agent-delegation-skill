@@ -1,0 +1,21 @@
+{
+  "arm": "J",
+  "what": "the skill executed end to end by a fresh agent, one seat, contracts NOT supplied",
+  "score": 31,
+  "cost_usd": 6.010527499999999,
+  "wall_secs": 360,
+  "turns": 21,
+  "usage": {
+    "input_tokens": 39,
+    "cache_read_input_tokens": 2018774,
+    "cache_creation_input_tokens": 28264,
+    "output_tokens": 19337
+  },
+  "first_merge_score": 29,
+  "first_merge_failures": [
+    "scene 21",
+    "scene 25"
+  ],
+  "cause": "noperspective attributes blended by the clip-space parameter t instead of the screen parameter s = t*w_out/w_new",
+  "note": "that rule is FI-7, which arm D was handed and this arm had to derive"
+}
