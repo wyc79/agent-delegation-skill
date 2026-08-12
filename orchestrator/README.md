@@ -22,8 +22,7 @@ explains, never in a separate spec that can drift out of step unnoticed.
 **`adg`** is short for *agent delegation*. It is the Python package name, and the
 prefix on everything this tool creates so it is greppable and never mistaken for
 your own: branches `adg/<task-id>/<job>`, worktrees under
-`.adg-worktrees/<project-key>/`, project config `.adg.yaml`, and the
-`ADG_WINNOW_SCAN` override.
+`.adg-worktrees/<project-key>/`, and project config `.adg.yaml`.
 
 Python 3.9+, standard library only. No install step, no dependencies (the YAML
 subset the project uses is parsed by `adg/yamlite.py`, because PyYAML is not in
@@ -203,8 +202,10 @@ provider gave.
 - **None of this system's state is written into the working repository.** Task
   state lives in `$XDG_STATE_HOME/agent-delegation/`; the project key comes from
   `git rev-parse --git-common-dir`, which is identical from every worktree.
-- **Attended mode never commits to your branch**, and no mode merges. The
-  terminal state is a patch file or a pushed branch. There is no commit path to
+- **Attended mode never commits to your branch**, and no mode merges or opens a
+  pull request. The terminal state is a patch file or a pushed branch, and
+  pushing is as far outward as a dispatcher goes: proposing work that nothing
+  here reviewed is the caller's decision. There is no commit path to
   the user's branch in this codebase — checkpoint commits happen only inside
   worktrees, which are removed when the task reaches `done` and deliberately
   kept when it parks, because a parked worktree is the salvage point.
@@ -246,7 +247,7 @@ python3 orchestrator/tests/test_orchestrator.py
 python3 orchestrator/tests/test_failover.py
 ```
 
-260 tests, none of which spend a token: the end-to-end ones drive the real state
+261 tests, none of which spend a token: the end-to-end ones drive the real state
 machine over a real git repository with a scripted adapter, so dispatch,
 isolated worktrees, waves, verify, failover and integration are all exercised
 for real.

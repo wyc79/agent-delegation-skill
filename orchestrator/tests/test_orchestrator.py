@@ -653,22 +653,41 @@ class TestClosedGaps(unittest.TestCase):
         self.assertGreater(task.state["spent"]["usd"], 0.0, "cost was never recorded")
 
     # --- autonomous mode --------------------------------------------------
-    def test_autonomous_mode_pushes_and_never_merges(self):
+    def _autonomous(self, task_id):
         src = os.path.join(self.t.dir, "origin.git")
         subprocess.run(["git", "init", "-q", "--bare", src], check=True)
         sh(["git", "remote", "add", "origin", src], self.t.repo)
         script, _ = TestEndToEnd._script(self)[0], None
-        task = _task(self.t.repo, "T-C2", "# t\n\nAdd subtract\n",
-                                 self.pol, mode="autonomous")
-        orch = Orchestrator(task, self.reg, runtime.MockAdapter(script),
-                            lambda k, t: True, log=lambda *_: None)
-        orch.run()
+        task = _task(self.t.repo, task_id, "# t\n\nAdd subtract\n",
+                     self.pol, mode="autonomous")
+        logs = []
+        Orchestrator(task, self.reg, runtime.MockAdapter(script),
+                     lambda k, t: True, log=logs.append).run()
+        return src, task, logs
+
+    def test_autonomous_mode_pushes_and_never_merges(self):
+        src, _, _ = self._autonomous("T-C2")
         branches = subprocess.run(["git", "branch", "-a"], cwd=src,
                                   capture_output=True, text=True).stdout
         self.assertIn("adg/T-C2/work", branches, "autonomous mode did not push")
         head = subprocess.run(["git", "log", "--oneline", "main"], cwd=self.t.repo,
                               capture_output=True, text=True).stdout
         self.assertEqual(len(head.strip().splitlines()), 1, "it merged to main")
+
+    def test_autonomous_mode_stops_at_the_branch(self):
+        """A pushed branch is where a dispatcher's authority ends. It used to
+        run `gh pr create` with the merge brief as the body -- an outward-facing
+        act on the caller's account, proposing work that nothing here reviewed,
+        decided by a program that cannot know whether it is ready to be shown to
+        anyone."""
+        _, task, logs = self._autonomous("T-C6")
+        self.assertNotIn("pull_request", task.state,
+                         "a pull request was opened on the caller's behalf")
+        joined = "\n".join(logs)
+        self.assertIn("pushed", joined)
+        self.assertIn("gh pr create", joined,
+                      "the branch is on the remote and nothing says what to do next")
+        self.assertFalse(hasattr(Orchestrator, "_push_and_open_pr"))
 
     # --- what a run is allowed to pay for ---------------------------------
     def test_a_run_dispatches_nothing_but_the_work(self):

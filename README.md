@@ -170,11 +170,16 @@ Two modes, and the difference is who answers the gates:
 | Mode | Flag | Gates | Ends at |
 |---|---|---|---|
 | **Attended** (default) | — | Park for you | A patch file you apply yourself |
-| **Autonomous** | `--mode autonomous --yes` | Auto-approved | An opened PR |
+| **Autonomous** | `--mode autonomous --yes` | Auto-approved | A branch pushed to `origin` |
 
 **Merge is never automatic in either mode**, and there is no commit path to your
 branch in this codebase — checkpoint commits happen only inside throwaway
 worktrees.
+
+**Neither mode opens a pull request.** Autonomous mode used to, with the merge
+brief as the body. Proposing a branch is an outward-facing act on your account,
+and this program cannot know whether work nothing reviewed is ready to be shown
+to anyone — so it pushes, prints the `gh pr create` you would run, and stops.
 
 Worktrees live under `.adg-worktrees/<project-key>/` and are removed when the
 task reaches `done` — **only** then. A parked or crashed task keeps its
@@ -371,7 +376,7 @@ keeping it moving when one empties.
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 161 tests, no tokens spent
+python3 orchestrator/tests/test_orchestrator.py  # 162 tests, no tokens spent
 python3 orchestrator/tests/test_failover.py      # 99 more, same
 ```
 
@@ -389,7 +394,7 @@ band, so a strong model on one provider worked alongside two on another.
 
 **Built and exercised:** dependency waves in isolated worktrees; scope measured
 per job; the Integrator on merge conflicts; cost and elapsed time recorded per
-delegation from the CLI's own JSON; autonomous mode ending at an opened PR;
+delegation from the CLI's own JSON; autonomous mode ending at a pushed branch;
 quota-aware failover with per-channel cooldowns shared across repos; the
 utilization shadow price; tier-to-provider routing; gates that park and are
 answered out of band; and teardown that leaves no agent process behind whatever

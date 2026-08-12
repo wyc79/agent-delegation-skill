@@ -131,7 +131,9 @@ with your own review skills, or by running a quality pass over the patch.
 yours behind a subprocess boundary.
 
 **The patch is the deliverable.** Attended mode writes `integrate.patch` and
-commits nothing to your branch.
+commits nothing to your branch. `--mode autonomous` pushes the task branch to
+`origin` instead and stops there — it opens no pull request, because proposing
+work that nothing reviewed is your call, not the dispatcher's.
 
 ## Checks
 

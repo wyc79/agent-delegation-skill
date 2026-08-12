@@ -1100,8 +1100,13 @@ class Orchestrator:
         self._reap_worktrees()
 
     def _land(self):
-        """attended: write the diff as a patch for the human to apply. The
-        orchestrator has no path that commits to the user's branch."""
+        """Where a run ends: a patch file, or a pushed branch.
+
+        Neither commits to the user's branch and neither merges. The two modes
+        differ only in whether the work leaves this machine -- attended hands
+        back a diff to apply, autonomous puts the branch on the remote so
+        somebody else can fetch it.
+        """
         state = self.task.state
         wt = state.get("worktree")
         if not wt or self.dry_run:
@@ -1120,39 +1125,31 @@ class Orchestrator:
             self.log("integrate: patch ready at %s" % patch)
             self.log("           apply with: git apply %s" % patch)
         else:
-            self._push_and_open_pr(branch)
+            self._push(branch)
 
-    def _push_and_open_pr(self, branch):
-        """Autonomous mode ends at an opened PR. There is deliberately no merge
-        path here -- the credential may even be branch-restricted."""
-        import shutil as _shutil
+    def _push(self, branch):
+        """Autonomous mode ends at a pushed branch, and stops there.
+
+        It used to run `gh pr create` as well, with the merge brief as the body.
+        Opening a pull request is an outward-facing act on the caller's account
+        -- it notifies reviewers, it is the thing a team reacts to -- and this
+        program is a dispatcher that does not know whether the work is ready to
+        be shown to anyone. Nothing here reviewed it. Deciding that a branch is
+        worth proposing belongs to whoever wrote the jobs, and it is one command
+        once the branch is on the remote.
+
+        The push itself stays: without it the work never leaves this machine,
+        which is the whole difference between the two modes. There is still no
+        merge path, and the credential may even be branch-restricted.
+        """
         push = subprocess.run(["git", "push", "-u", "origin", branch],
                               cwd=self.repo, capture_output=True, text=True)
         if push.returncode != 0:
             raise Halt("needs_human", "could not push %s: %s"
                        % (branch, push.stderr.strip()[:200]))
         self.log("integrate: pushed %s" % branch)
-        if _shutil.which("gh") is None:
-            self.log("           gh not installed — open the PR yourself")
-            return
-        body = self.task.read_text("brief.md", "")
-        pr = subprocess.run(
-            ["gh", "pr", "create", "--head", branch, "--title",
-             "%s: %s" % (self.task.state["id"], self._title()), "--body", body],
-            cwd=self.repo, capture_output=True, text=True)
-        if pr.returncode != 0:
-            self.log("           gh pr create failed: %s" % pr.stderr.strip()[:200])
-            return
-        url = (pr.stdout or "").strip().splitlines()[-1:] or [""]
-        self.log("integrate: opened %s" % url[0])
-        self.task.update(pull_request=url[0])
-
-    def _title(self):
-        for line in self.task.read_text("task.md", "").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and not line.startswith(">"):
-                return line[:70]
-        return "delegated change"
+        self.log("           open a pull request from it when you have judged "
+                 "the work: gh pr create --head %s" % branch)
 
     # ---------------------------------------------------------------- infra
     def _top_tier(self):
