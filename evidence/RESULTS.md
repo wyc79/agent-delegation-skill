@@ -22,6 +22,9 @@ diffed against reference images, 31 points, pass only at 31/31.
 | **E1** | B, with a quota wall injected on a single-seat band | yes | 2 |
 | **E2** | B, with a quota wall injected mid-job on a two-seat band | yes | 2 |
 | **F** | B's jobs, run through delegate with Claude as the only seat | yes | **1** |
+| **O** ✦ | D's jobs, run by a session following the skill instead of a script | no | 1 |
+
+✦ ran 2026-08-12, a day after the rest; see *What O settles*.
 
 **F is D's twin, and the pair is the cleanest measurement here.** Same provider,
 same model, same four jobs, same frozen contracts — the only difference is
@@ -151,6 +154,57 @@ attached.
 B lands with D and C (≈$3.0 vs $2.92 vs $3.10) because routing three of four
 jobs to the cheaper seat pays back roughly what the overhead costs.
 
+## What O settles — what the *skill* costs on top of the plan (2026-08-12)
+
+D's executor is a Python script that already knows the procedure. **O is D with
+a live session in that slot**, reading `agent-delegation/SKILL.md` and following
+it. Same `jobs.md`, same base commit, same single-seat registry, same grader.
+The brief says the decomposition is already written and forbids re-planning, so
+planning is held constant and the only difference is who drives.
+
+| | D | O |
+|---|---|---|
+| plan | `jobs.md`, hand-authored | `jobs.md`, hand-authored |
+| executor | ~150 lines of Python | a session following the skill |
+| Score | 31/31 | **31/31** |
+| Wall clock | 3.5 min | 8.3 min |
+| Cost | $2.92 (agents only) | **$3.44** (everything) |
+| Summed agent time | 495s | **509s** |
+
+**Read the last row, not the wall clock.** Arm wall clock is hostage to whichever
+single job happens to be slowest, and that job moved between runs — D waited on
+`st-4-raster` at 210s, O on `st-3-clip` at 313s, the same two specs. Per job,
+O against D: buffers 55s vs 56s, render 67s vs 107s, clip 313s vs 122s, raster
+74s vs 210s. Noisy in both directions, summing to within 3%.
+
+So **the skill costs nothing per agent.** What it costs is the dispatcher: 160s
+of wall clock that the script spends zero on — 55s reading SKILL.md, `jobs.md`
+and `delegate init`, 32s setting up worktrees, 73s merging, checking scope and
+grading — plus $0.52 of its own context, 18% on top.
+
+**Against N, the same skill without a supplied plan** (14.2 min, $5.76, also
+31/31), the decomposition N wrote for itself cost ~5.9 min and ~$2.32. That is a
+floor rather than an estimate: N's plan also quietly narrowed `clip_triangle` to
+the near and far faces, and its clip agent ran 151s where O's did all six in
+313s. N paid more and built less.
+
+Two behaviours worth recording, because they are what the arm was really for:
+
+- **The empty-branch gate in `references/one-seat.md` was adopted verbatim** —
+  `[ "$(git rev-list --count "$base..$j")" -gt 0 ] || { echo "EMPTY: $j"; break; }`
+  appeared in O's merge loop exactly as written, and O reached for `rev-list
+  --count` three more times to poll which jobs had landed. It also diffed
+  `--name-only` per branch before merging, which is the scope report done by
+  hand.
+- **The one-message dispatch rule was not followed**, for the second run in a
+  row. O sent four dispatches in four messages, 11–13s apart. It cost 23s of a
+  336s parallel phase here — peak concurrency still reached 4 of 4 — because the
+  harness returns from a dispatch immediately. The rule survives on the
+  dispatcher not *waiting* between sends, not on it batching them.
+
+The pair of them is the useful signal: the step that shipped as a runnable
+command was copied; the step that shipped as an instruction was not.
+
 ## What E settles — and it is the only thing no other arm can do
 
 **E2: a provider went down mid-job, twice, and the run finished at 31/31.**
@@ -240,6 +294,16 @@ arm here paid for producing its own decomposition.
   output for the two jobs, including the pair that refuted the 0.86x anomaly.
 - `jobs.example.md` — the decomposition handed to `delegate`, with the frozen
   contracts written out. A worked `--plan` file.
+- `anatomy.py` — reads a `--output-format stream-json` transcript and says who
+  did what: the dispatcher's own calls, each dispatch's send/return/duration,
+  peak concurrency, what the stagger cost, and who committed. It exists because
+  a subagent's messages are emitted into the *parent's* stream and are
+  distinguishable only by `parent_tool_use_id`; filtering on `type ==
+  "assistant"` alone reads a subagent's writes and commits as the dispatcher's
+  own, which inverts the conclusion. Two claims in `one-seat.md` were published
+  from that mistake and had to be withdrawn.
+- `arm-o-results.json` — arm O's record: per-job times against D's, the
+  dispatcher overhead breakdown, and the dispatch pattern.
 
 The per-run task state, patches and briefs are not committed: they are large,
 specific to one machine's paths, and nothing in the repository reads them.

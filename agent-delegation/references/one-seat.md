@@ -54,28 +54,31 @@ its siblings are doing.
 
 Do it in that order deliberately, because the obvious order fails:
 
-> **This is the step that slips, and knowing the rule does not save you.**
-> Measured: an agent read this file, then four tool calls later built three
-> correct dispatches — right worktree, right scope, right contracts — and sent
-> them in three separate messages, 36 and 33 seconds apart.
+> **Measured twice, and both times the agent did it the other way.** One had
+> read this file four tool calls earlier and sent three dispatches in three
+> separate messages. The second read this file *with this warning already in
+> it*, and sent four in four. Right worktrees, right scopes, right contracts,
+> one per message, both times.
 >
-> It got away with it, because in that harness a dispatch returns immediately
-> and its agent runs in the background, so the three overlapped anyway. What the
-> stagger cost was the stagger: the first agent had **finished** before the
-> third was sent, peak concurrency was two of three, and the parallel phase ran
-> about 69 seconds past the slowest job — a third again on top of it.
+> Both got away with it. In that harness a dispatch returns immediately and its
+> agent runs in the background, so the jobs overlapped regardless: the stagger
+> cost 68s of a 219s parallel phase in the first run and 23s of 336s in the
+> second. Only the first was slow enough to matter — one agent **finished**
+> before the third was sent, holding peak concurrency at two of three.
 >
-> That is the forgiving case. Where a dispatch blocks until its agent returns,
-> those same three messages serialize completely, and you have paid the whole
-> setup cost of isolation for none of the speed. Whether you are in a harness
-> that saves you is not something to be relying on.
+> Do not read that as permission. It survives on one property, which neither
+> dispatcher set out to preserve: **neither waited on a result before sending
+> the next.** Protect that and the rest is a rounding error. Break it — a
+> harness where dispatch blocks until the agent returns, or a habit of reading
+> the first result before composing the second — and the same shape serializes
+> completely, having paid the entire setup cost of isolation for none of the
+> speed.
 >
-> It slips because composing a prompt and sending it is one motion, and three
-> jobs is that motion three times. Nothing warns you. That is why the fix is an
-> order of operations and not a rule to remember: draft all N prompts as text
-> first, so that when you dispatch there is nothing left to compose and N calls
-> go out together. **If you are sending a dispatch and the next one is going in
-> a later message, stop.**
+> Drafting all N prompts before sending any is what makes that impossible to get
+> wrong, which is why this is written as an order of operations rather than a
+> rule to remember: composing a prompt and sending it is one motion, and N jobs
+> is that motion N times. If you do end up sending them one at a time anyway,
+> **send them back to back and read nothing in between.**
 
 ```text
 You are implementing one file of <the thing>. Other agents are implementing

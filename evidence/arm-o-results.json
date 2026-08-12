@@ -1,0 +1,71 @@
+{
+  "arm": "O",
+  "date": "2026-08-12",
+  "what": "D's jobs.md, executed by a live session following agent-delegation/SKILL.md instead of run-arm-d.py. Planning held constant; only the executor differs.",
+  "base_commit": "dae63ef56030d7838d1ff8cb16a7415ec5c8a30e",
+  "registry": "registry.one-seat.yaml (single seat, all three tiers)",
+  "score": "31/31",
+  "wall_clock_s": 496,
+  "cost_usd": 3.44,
+  "cost_note": "session total: the dispatcher's own context plus all four agents. D's $2.92 is agents only -- its dispatcher was a script.",
+  "dispatcher_overhead_s": {
+    "orientation": 55,
+    "worktree_setup": 32,
+    "merge_check_grade": 73,
+    "total": 160
+  },
+  "jobs": [
+    {
+      "id": "st-1-buffers",
+      "sent": "07:51:00",
+      "done": "07:51:55",
+      "ran_s": 55,
+      "prompt_chars": 2558,
+      "d_ran_s": 56
+    },
+    {
+      "id": "st-2-render",
+      "sent": "07:51:11",
+      "done": "07:52:18",
+      "ran_s": 67,
+      "prompt_chars": 3245,
+      "d_ran_s": 107
+    },
+    {
+      "id": "st-3-clip",
+      "sent": "07:51:23",
+      "done": "07:56:36",
+      "ran_s": 313,
+      "prompt_chars": 3683,
+      "d_ran_s": 122
+    },
+    {
+      "id": "st-4-raster",
+      "sent": "07:51:36",
+      "done": "07:52:50",
+      "ran_s": 74,
+      "prompt_chars": 3520,
+      "d_ran_s": 210
+    }
+  ],
+  "summed_agent_time_s": {
+    "O": 509,
+    "D": 495,
+    "ratio": 1.03
+  },
+  "dispatch_pattern": {
+    "messages": 4,
+    "dispatches_per_message": 1,
+    "stagger_s": 36,
+    "peak_concurrency": "4 of 4",
+    "cost_of_stagger_s": 23,
+    "note": "one per message again -- the second run to ignore the one-message rule. Harmless here only because the harness returns from a dispatch immediately and the dispatcher never waited on a result before sending the next."
+  },
+  "commits": "all four agents committed their own work; no empty branches",
+  "adopted_from_the_skill": [
+    "the empty-branch guard from references/one-seat.md step 3, verbatim",
+    "git rev-list --count used three more times to poll which jobs had landed",
+    "git diff --name-only per branch before merging (the scope report, by hand)"
+  ],
+  "clip_faces": "six -- jobs.md names them, and the agent built all six (cf. arm N, which planned its own and built two)"
+}
