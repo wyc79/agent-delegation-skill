@@ -115,8 +115,7 @@ overwrites the declaration between the gate and the audit — and the first run
 then checks its branches against the second run's scopes, reporting violations
 of a boundary nobody set and passing files that were out of bounds. No error
 anywhere. Anchoring on `--show-toplevel` also makes both work from a
-subdirectory. `delegate` puts its worktrees in
-`<repo-parent>/.adg-worktrees/<project-key>/` for the same reason.
+subdirectory.
 
 The branch names are left bare on purpose: `git worktree add -b` **fails loudly**
 if `st-1-alpha` already exists, which is the right outcome for a leftover from a
