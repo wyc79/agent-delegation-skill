@@ -69,7 +69,14 @@ _RELATIVE = re.compile(
 _ISO = re.compile(
     r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?\s*(Z|UTC)?", re.I)
 _CLOCK = re.compile(r"reset\w*\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.I)
-_EPOCH = re.compile(r"reset\w*\D{0,12}\b(1[5-9]\d{8}|2\d{9})\b")
+# `re.I` like every sibling above it. Without it "Resets 1786499561" -- a
+# provider message that begins a sentence, which is most of them -- matched
+# nothing, so a run that had been told exactly when the seat reopens fell back
+# to the channel's configured window instead. The fallback is meant for a
+# provider that stated nothing, and it parks the task longer than it needs to
+# be parked; `resume --when-open` then waits out a window that had already
+# reopened.
+_EPOCH = re.compile(r"reset\w*\D{0,12}\b(1[5-9]\d{8}|2\d{9})\b", re.I)
 _DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-z]+)\s*$", re.I)
 _NUMBER = re.compile(r"^\s*(\d+(?:\.\d+)?)")
 

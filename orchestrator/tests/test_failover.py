@@ -97,6 +97,18 @@ class TestClassification(unittest.TestCase):
 
 
 class TestResetParsing(unittest.TestCase):
+    def test_an_epoch_reset_is_read_whatever_its_case(self):
+        """`_EPOCH` was the one pattern here without `re.I`, so a message that
+        began its sentence with "Resets" -- most of them -- lost the reset time
+        the provider had just stated, and the run fell back to the channel's
+        configured window. That parks a task longer than it needs to be parked
+        and makes `resume --when-open` wait out a window already reopened."""
+        want = int(T0 + 3600)
+        for text in ("resets %d" % want, "Resets %d" % want, "RESETS %d" % want,
+                     "Claude AI usage limit reached. Resets %d" % want):
+            self.assertEqual(quota.parse_reset(text, T0), float(want),
+                             "lost the reset time in %r" % text)
+
     def test_relative_minutes(self):
         at = quota.parse_reset("rate limited; try again in 45 minutes", T0)
         self.assertEqual(at, T0 + 45 * 60)
