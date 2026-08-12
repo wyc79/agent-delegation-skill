@@ -25,9 +25,12 @@ Two pieces ship here:
   cooldown breakers, failover with checkpoint reuse, isolated worktrees and
   dependency waves, and three adapters: `local` (plain subprocesses), `herdr`
   (the same agents in visible panes), and `mock` (scripted, for the tests).
-- **[`agent-delegation/SKILL.md`](agent-delegation/SKILL.md) — the front door.**
-  One file, for the agent deciding whether to reach for this: when it is worth
-  the cost, how to write the jobs, and how to read what comes back.
+- **[`agent-delegation/`](agent-delegation/) — the front door.** For the agent
+  deciding whether to reach for this: when it is worth the cost, how to write
+  the jobs, and how to read what comes back. Plus one reference loaded only on
+  its trigger — `one-seat.md`, which is how to run parallel jobs *without* this
+  when `init` says you have a single provider, because on one seat that is
+  measurably the better choice.
 
 [`orchestrator/README.md`](orchestrator/README.md) is the reference for what is
 actually built and why each decision went the way it did.
@@ -230,9 +233,14 @@ system's state — no `.task/`, not even ignored — is ever written into it.
 
 ```text
 agent-delegation/
-└── SKILL.md              THE FRONT DOOR. For the agent a human is talking to:
-                          when to call `delegate`, which command comes next,
-                          how to answer a parked gate. No methodology.
+├── SKILL.md              THE FRONT DOOR. For the agent a human is talking to:
+│                         when to call `delegate`, which command comes next,
+│                         how to answer a parked gate. No methodology.
+└── references/
+    └── one-seat.md       loaded only when `init` shows one provider: how to run
+                          parallel jobs WITHOUT this, which on a single seat is
+                          cheaper and faster. A skill that will not say so is
+                          selling, not advising.
 
 orchestrator/
 ├── delegate              the entry point

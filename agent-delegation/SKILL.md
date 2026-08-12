@@ -91,33 +91,17 @@ still settling what is wanted — all delegate badly.
 ### On one seat, do this instead
 
 The alternative is not "give up on parallelism" — it is the pattern that beat
-delegating in the table above, and you can run it with the tools you already
-have. Per job:
+delegating in the table above, and you can run it with tools you already have:
+a git worktree per job, all the agents dispatched in one message so they run
+concurrently, then merge one at a time with your checks between.
 
-1. `git worktree add ../wt/<job-id> -b <job-id>` — one checkout per job, cut
-   from the same commit.
-2. Dispatch one agent per worktree, **all in the same message so they run
-   concurrently**, each given only its own goal, its `file_scope`, and the
-   frozen contracts the other jobs are coding against. Nothing else — no plan
-   file, no shared history. `superpowers:dispatching-parallel-agents` is the
-   procedure.
-3. Merge the branches one at a time, running your checks after each, so a break
-   surfaces against the smallest diff.
+**→ `references/one-seat.md`** has it in full: the exact git commands, the
+prompt shape, why `superpowers:subagent-driven-development`'s "never dispatch
+implementation subagents in parallel" does not apply once each agent has its own
+worktree, and what you give up by not paying for the gate.
 
-The contracts are the part that carries the whole thing. Agents in separate
-worktrees cannot see each other's code, so every signature or invariant two
-jobs share has to be written into **both** their prompts, verbatim. Get that
-wrong and the disagreement surfaces at merge time, which is the one place
-isolation cannot help you.
-
-**What you give up, so you can choose it knowingly:** no merge gate holding the
-work until a human looks; no per-job scope measurement, so an agent that edits
-a file outside its remit is invisible; no spend or attempt cap that binds; and
-no checkpoint when the seat walls — the CLI dies with your in-flight work
-uncommitted and the job restarts from nothing. That list is what the ~2x buys.
-
-The last one is the one people discover the expensive way. A wall does not wait
-for a good moment.
+Read it when `init` showed one provider and you have independent jobs. Skip it
+otherwise — on two seats this is the worse choice.
 
 ## Writing the jobs
 
