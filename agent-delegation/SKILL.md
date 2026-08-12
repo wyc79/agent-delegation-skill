@@ -35,15 +35,18 @@ expense.
 Measured, on a task with four independent jobs and no quota pressure. All of
 these scored identically; only the bill differs:
 
-| | delegating, 2 seats | one warm session | 4 cold agents, hand-rolled |
-|---|---|---|---|
-| Cost | ≈$3.0 | $3.10 | **$2.92** |
-| Wall clock | 9.6 min | 6.8 min | **3.5 min** |
+| | delegating, 2 seats | **delegating, 1 seat** | one warm session | 4 cold agents, hand-rolled |
+|---|---|---|---|---|
+| Cost | ≈$3.0 | **$4.41** | $3.10 | **$2.92** |
+| Wall clock | 9.6 min | — | 6.8 min | **3.5 min** |
 
-The third column is the one that should decide you. It is *this program's own
-structure* — a worktree per job, cold parallel agents, disjoint scopes, merge —
-as a short script with no `delegate` in it, on one provider. It beat delegating
-on both axes.
+**Read the second and last columns against each other** — those are the two
+things actually on your desk if `init` showed one provider. The 2-seat column is
+there for scale, not for your decision.
+
+The last is *this program's own structure* — a worktree per job, cold parallel
+agents, disjoint scopes, merge — as a short script with no `delegate` in it. On
+one seat it wins on cost and wall clock both.
 
 Run head to head on one provider, same model, same jobs, `delegate` costs
 **~1.8-2.1x** the hand-rolled equivalent. The overhead is four extra turns per
@@ -52,8 +55,18 @@ then writing the report back. Three of those are what let another provider pick
 the job up mid-flight; the fourth is the only way a stuck job can tell you why.
 
 So on a single seat you are paying about double for a merge gate carrying graded
-evidence, per-job scope measurement, caps that bind, a resumable task on disk —
-and a failover you have no second seat to use. Make that trade on purpose.
+evidence, per-job scope measurement, caps that bind — and one thing that is easy
+to write off and should not be.
+
+**A single seat still hits walls, and this survives one.** When the wall lands
+mid-job there is nowhere to fail over to, but the partial work is committed as a
+checkpoint first, the seat is cooled with its reopen time, and the task parks
+holding all of it. `delegate resume --when-open` sleeps out the window and picks
+up from that checkpoint. The hand-rolled script has no equivalent: the CLI dies,
+whatever was uncommitted is gone, and you start the job again.
+
+If your one seat is a subscription you actually run down — and if it were not,
+you would not be reading this section — that is the argument, not the gate.
 
 Also on a single seat: **`tier` stops meaning anything.** Nothing here pins a
 model, so a band only picks a different model when your seats expose different
@@ -99,9 +112,12 @@ isolation cannot help you.
 
 **What you give up, so you can choose it knowingly:** no merge gate holding the
 work until a human looks; no per-job scope measurement, so an agent that edits
-a file outside its remit is invisible; no spend or attempt cap that binds; no
-task on disk to resume from after a crash; and no failover — if the seat goes
-out, the run is simply over. That list is what the ~2x buys.
+a file outside its remit is invisible; no spend or attempt cap that binds; and
+no checkpoint when the seat walls — the CLI dies with your in-flight work
+uncommitted and the job restarts from nothing. That list is what the ~2x buys.
+
+The last one is the one people discover the expensive way. A wall does not wait
+for a good moment.
 
 ## Writing the jobs
 
