@@ -529,13 +529,13 @@ schema, then writing the report. That is not waste to be trimmed. Three of those
 four are what makes a job resumable on another provider, and the fourth is the
 only way a stuck job can tell you why it stopped.
 
-What that ~1.5x buys is everything the script leaves out because it is a
+What that overhead buys is everything the script leaves out because it is a
 throwaway: a merge gate that hands a human graded evidence before anything
 lands, per-job scope measurement, `max_cost_usd` and `max_attempts_per_subtask`
 that bind, a resumable task on disk, and the grader running at the gate.
 
 **Which is why the precondition in the skill is not a formality.** On a single
-provider with no quota pressure you are paying ~1.5x for a gate, a scope report
+provider with no quota pressure you are paying roughly double for a gate, a scope report
 and a resumable record. That may be worth it; it is not worth it by accident.
 Run `init`; if every tier resolves to one provider, decide deliberately.
 

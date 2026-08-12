@@ -101,7 +101,7 @@ isolation cannot help you.
 work until a human looks; no per-job scope measurement, so an agent that edits
 a file outside its remit is invisible; no spend or attempt cap that binds; no
 task on disk to resume from after a crash; and no failover — if the seat goes
-out, the run is simply over. That list is the ~1.5x.
+out, the run is simply over. That list is what the ~2x buys.
 
 ## Writing the jobs
 
