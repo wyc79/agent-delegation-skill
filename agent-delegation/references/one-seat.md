@@ -36,16 +36,35 @@ fan-out.
 write scopes do not overlap. Overlapping scopes go back to being sequential, and
 SDD's advice applies again unchanged.
 
+That rule is the one thing here worth checking mechanically rather than
+believing, so it appears twice below as a command — once before you dispatch and
+once before you merge. Overlap is the failure this pattern cannot absorb: two
+agents writing one file surface it at merge with both sides already written, and
+the run that produced it looks fine the whole way through.
+
 ## The pattern
 
-**1. A worktree per job, all cut from the same commit.**
+**1. A worktree per job, all cut from the same commit — and prove the scopes are
+disjoint before you spend anything.**
 
 ```bash
 base=$(git rev-parse HEAD)
-for job in st-1-alpha st-2-beta st-3-gamma; do
-  git worktree add "../wt/$job" -b "$job" "$base"
-done
+
+# every job's write scope, one line each: "<job> <file> [file...]"
+cat > /tmp/scopes <<'EOF'
+st-1-alpha  alpha.c
+st-2-beta   beta.c beta.h
+st-3-gamma  gamma.c
+EOF
+
+awk '{for(i=2;i<=NF;i++) if($i in o){print "OVERLAP: "$i" in "o[$i]" and "$1; e=1} \
+      else o[$i]=$1} END{exit e}' /tmp/scopes || exit 1
+
+while read -r job _; do git worktree add "../wt/$job" -b "$job" "$base"; done < /tmp/scopes
 ```
+
+If that prints `OVERLAP`, you do not have N parallel jobs — you have fewer. Merge
+the colliding ones into a single job or run them in sequence.
 
 **2. Write every prompt out first. Then send them all in one message**, so they
 run concurrently. Each gets its own goal, its write scope, and the frozen
@@ -97,27 +116,41 @@ Match them exactly; changing one breaks work you cannot inspect:
 Verify with `<your check>` before you finish. Commit when it is green.
 ```
 
-**3. Check each branch actually has a commit, then merge one at a time,
-checking after each**, so a break surfaces against the smallest diff:
+**3. Check each branch committed something and stayed in its scope, then merge
+one at a time, checking after each**, so a break surfaces against the smallest
+diff:
 
 ```bash
 git checkout -b integration "$base"
-for job in st-1-alpha st-2-beta st-3-gamma; do
+while read -r job scope; do
   [ "$(git rev-list --count "$base..$job")" -gt 0 ] || { echo "EMPTY: $job"; break; }
+  stray=$(git diff --name-only "$base" "$job" | grep -vxF "$(echo "$scope" | tr ' ' '\n')")
+  [ -z "$stray" ] || echo "OUT OF SCOPE in $job: $stray"      # report, do not stop
   git merge --no-edit "$job" && <your check> || break
-done
+done < /tmp/scopes
 ```
 
-That first line is insurance against a failure with no symptoms. An agent that
-reports success without committing leaves its branch sitting at `base`, and
-merging that branch **succeeds** — a merge with nothing to merge is a clean
-no-op. The untouched stub still compiles, so your build check passes too. Green
-integration, missing feature, nothing anywhere reporting a problem.
+**`rev-list` catches a failure with no symptoms.** An agent that reports success
+without committing leaves its branch sitting at `base`, and merging that branch
+**succeeds** — a merge with nothing to merge is a clean no-op. The untouched stub
+still compiles, so your build check passes too. Green integration, missing
+feature, nothing anywhere reporting a problem. On the measured runs every agent
+did commit, on the strength of one line in its brief. The check costs a
+`rev-list` and removes the case where you find out at the end. The branch is the
+evidence that work happened — not the agent's report, and not the merge's exit
+code.
 
-On the measured run all three agents did commit, on the strength of one line in
-their brief. The check costs a `rev-list` and removes the case where you find
-out at the end. What it buys is the habit behind it: the branch is the evidence
-that work happened — not the agent's report, and not the merge's exit code.
+**`diff --name-only` closes the scope rule.** Step 1 proved the scopes were
+disjoint *as declared*; this is the only thing that tells you they were disjoint
+*as written*, since nothing stopped an agent from editing a file it was merely
+asked not to. Report and keep going rather than stopping: by now the work exists
+and the question is whether to keep it, which is a judgement. Two branches that
+both touched one file are also the one case where merge order changes the
+result — merge the smaller claim first so the conflict surfaces while it is still
+small.
+
+Both checks read the same `/tmp/scopes` from step 1, so the declaration you
+gated on is the declaration you audit against.
 
 ## The frozen contracts are the whole thing
 
