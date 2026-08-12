@@ -520,10 +520,15 @@ contention on one provider's rate limits, and only the first has been measured.
 recipe on one seat. D cost $2.92, J cost $6.01. The difference is that D was
 handed the frozen contracts and J had to derive them — and did not, at first:
 it merged at 29/31, with the two scenes that turn on one interpolation rule
-failing, then diagnosed and fixed it. That **$3.09 gap is almost exactly the
-$2.93 the retired planner cost to produce those contracts.** Every single-seat
-figure in this table except J's is subsidised by a decomposition somebody else
-paid for. J is the only end-to-end number here.
+failing, then diagnosed and fixed it. Nothing planned for J — there is no
+planner — so that **$3.09 is what deriving the contracts cost when the work
+itself had to pay for it**, most of it spent recovering from the one rule it got
+wrong. For scale, the retired planner that originally wrote those contracts cost
+$2.93; the two figures are not connected, but they are the same size, and both
+are the price of the same artifact.
+
+Every single-seat figure in this table except J's is subsidised by a
+decomposition somebody else paid for. J is the only end-to-end number here.
 
 **It generalises past the task it was built on.** Arm K dispatched code-winnow's
 judgment passes — five readers over *one* diff, rather than writers of disjoint
