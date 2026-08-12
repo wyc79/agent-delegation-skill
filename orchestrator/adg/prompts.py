@@ -6,6 +6,22 @@ the agent loads from disk -- so protocol growth costs disk, not per-agent
 context, and prompts stay short.
 
 Deliberately absent: any model name, any routing logic, any provider detail.
+
+**Inlining the protocol was tried and measured and does not help.** Cost here
+tracks TURNS almost exactly -- on the same job, same model, one provider, a
+dispatched agent took 30 turns and cost 1.88x a hand-rolled control that took
+16. The obvious reading is that the three files an agent opens before starting
+(this protocol, its role card, the report schema) are three of those turns, so
+they were inlined into the prompt and the job re-run.
+
+Turn count was **identical**: 30 either way, and cost rose 1.15x because ~1,900
+extra prompt tokens then rode along on every one of the 30 turns. The reads were
+never separate turns. Whatever the ~14 extra turns are, they are not this, and
+finding them needs turn-level transcripts the runtime does not yet capture.
+
+So progressive disclosure stays, and the README's "protocol growth costs disk,
+not per-agent context" stands -- not as a principle worth defending on taste,
+but as one that was attacked with a measurement and held.
 """
 
 import os

@@ -499,11 +499,16 @@ anything.
 software rasterizer, graded by the course's own script over 26 reference images,
 pass only at 31/31. Every arm scored 31/31; what differs is what it cost.
 
-| | role protocol | **wrapper**, 2 seats | warm session | **wrapper**, 1 seat | 4 cold agents, no delegate |
-|---|---|---|---|---|---|
-| Cost | $13.07 | ≈$3.0 | $3.10 | $4.41 | **$2.92** |
-| Wall clock | 31.5 min | 9.6 min | 6.8 min | — | **3.5 min** |
-| Tokens in | 6.74M | 2.63M | 1.52M | 2.67M | 1.94M |
+| | **wrapper**, 2 seats | **wrapper**, 1 seat | one warm session | 4 cold agents, no delegate |
+|---|---|---|---|---|
+| Cost | ≈$3.0 | $4.41 | $3.10 | **$2.92** |
+| Wall clock | 9.6 min | — | 6.8 min | **3.5 min** |
+| Tokens in | 2.63M | 2.67M | 1.52M | 1.94M |
+
+Every one of these scored 31/31. The retired role protocol is deliberately not
+a column: it is not something anyone can choose now, and measuring this against
+a version of itself that no longer ships would flatter it for free. Its numbers
+are in the section above, as the reason it went.
 
 The last column is the one to read first. It is **this program's own structure —
 a worktree per job, cold parallel agents, disjoint scopes, merge — as a 150-line
