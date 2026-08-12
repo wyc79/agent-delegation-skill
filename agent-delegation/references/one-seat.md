@@ -47,23 +47,30 @@ for job in st-1-alpha st-2-beta st-3-gamma; do
 done
 ```
 
-**2. Dispatch one agent per worktree, all in the same message** so they run
-concurrently. Each gets its own goal, its write scope, and the frozen contracts
-— nothing else. No plan file, no session history, no summary of what its
-siblings are doing.
+**2. Write every prompt out first. Then send them all in one message**, so they
+run concurrently. Each gets its own goal, its write scope, and the frozen
+contracts — nothing else. No plan file, no session history, no summary of what
+its siblings are doing.
 
-> **This is the step that actually fails.** Measured: an agent that had read
-> this file built three correct dispatches — right worktree, right scope, right
-> contracts — and issued them in three separate messages. One dispatch per
-> message runs them **sequentially**, so it paid the whole setup cost of
-> isolation and collected none of the speed: four times the wall clock of the
-> same work done in one context, and the slowest arm measured.
+Do it in that order deliberately, because the obvious order fails:
+
+> **This is the step that actually fails, and knowing the rule does not save
+> you.** Measured: an agent read this file, then four tool calls later built
+> three correct dispatches — right worktree, right scope, right contracts — and
+> sent them in three separate messages. One dispatch per message runs them
+> **sequentially**. It paid the entire setup cost of isolation and collected
+> none of the speed: four times the wall clock of the same work done by one
+> agent in one context, and the slowest arrangement measured.
 >
-> Nothing goes visibly wrong when you get this wrong. The worktrees are still
-> isolated, the merges are still clean, the result is still correct — it is
-> simply slower than not having bothered. If you are about to send a dispatch,
-> and the next one is going in a later message, stop: you want them in *this*
-> message or you want to do the work yourself.
+> It failed because composing a prompt and sending it is one motion, and three
+> jobs is that motion three times. Nothing warns you. The worktrees are still
+> isolated, the merges still clean, the result still correct — only slower than
+> not having bothered. That is why the fix is an order of operations and not a
+> rule to remember: draft all N prompts as text first, so that when you dispatch
+> there is nothing left to compose and N calls go out together. **If you are
+> sending a dispatch and the next one is going in a later message, stop.** Send
+> them together, or do the work yourself — those are the two arrangements that
+> beat this one.
 
 ```text
 You are implementing one file of <the thing>. Other agents are implementing
