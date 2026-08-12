@@ -38,7 +38,7 @@ def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
         data = json.loads(stdout or "")
     except ValueError:
         data = None
-    usage, elapsed_ms = None, None
+    usage, elapsed_ms, turns = None, None, None
     if isinstance(data, dict):
         text = data.get("result") or data.get("output") or raw
         for key in ("total_cost_usd", "cost_usd"):
@@ -52,11 +52,20 @@ def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
         # are one-second resolution, so two quick steps look simultaneous.
         if isinstance(data.get("duration_ms"), (int, float)):
             elapsed_ms = int(data["duration_ms"])
+        # Turns, when the CLI counts them. Cost on a cached run is driven by
+        # how many turns an agent takes, not by how long its prompt is: every
+        # turn re-sends the accumulated context, so one extra tool call is
+        # worth far more than one extra paragraph. Without this the record can
+        # say an agent cost 2x another and not say why, which is exactly the
+        # question a run comparing itself to a hand-rolled control has to
+        # answer.
+        if isinstance(data.get("num_turns"), (int, float)):
+            turns = int(data["num_turns"])
         if isinstance(data.get("error"), dict):
             error_code = error_code or data["error"].get("code")
     res = {"settled": "idle" if code == 0 else "blocked",
            "output": text, "code": code, "cost_usd": cost, "usage": usage,
-           "elapsed_ms": elapsed_ms, "error_code": error_code}
+           "elapsed_ms": elapsed_ms, "turns": turns, "error_code": error_code}
     return classify(res, kind, now, raw)
 
 

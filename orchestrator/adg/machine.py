@@ -1521,7 +1521,7 @@ class Orchestrator:
                 # the failover path exists to shorten -- so it has to be on the
                 # record even though the call bought nothing.
                 "tokens": res.get("usage"), "elapsed_ms": res.get("elapsed_ms"),
-                "reopens_at": at})
+                "turns": res.get("turns"), "reopens_at": at})
             # Excluded explicitly as well as through the breaker: if the state
             # file could not be written, the loop must still terminate.
             try:
@@ -1574,6 +1574,10 @@ class Orchestrator:
             # record to say which was which.
             "tokens": res.get("usage"),
             "elapsed_ms": res.get("elapsed_ms"),
+            # What the money actually bought. On a cached run cost tracks turns
+            # far more closely than it tracks prompt length, so a comparison
+            # that records only dollars cannot say WHERE they went.
+            "turns": res.get("turns"),
             "report_problems": problems or None,
         })
         # No timeout branch here any more. Since the hop/cool split a timeout
