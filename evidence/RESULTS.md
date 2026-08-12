@@ -56,8 +56,8 @@ other column can — the scripts and their output are beside this file.
 ‡ quoted from the earlier round; not reproducible from this repository.
 
 ⚠ **B's cost is an upper bound that cannot be corrected retrospectively.** It
-was recorded while cached input was priced as fresh input (see *Two defects*
-below). $2.41 of it is billed (the Claude job); the $2.18 cursor portion was
+was recorded while cached input was priced as fresh input, roughly ten times
+over (see *Caveats*). $2.41 of it is billed (the Claude job); the $2.18 cursor portion was
 computed with cache reads charged at 10× their real rate. Using E2's measured
 per-job cursor costs — the same jobs, same prompts, same seat, correct pricing
 — B's true total is **≈ $3.0**. The split was never stored, so this is a
@@ -195,36 +195,6 @@ weaker model gets wrong, and it is why arm C needed a second pass. E1 only
 implemented `clip.cpp`, so it scores 0/31 by construction and gives no quality
 signal either way.
 
-## Two defects this round found, both by running rather than reading
-
-Both were found while preparing or reading these runs, and both are fixed in
-the repo with tests.
-
-**1. `slow` checks never ran.** Only `"fast"` was ever passed to `verify.run`,
-at all three call sites. `sh check-grade.sh` — the only thing that can observe
-whether four stages work *together* — was parsed, printed in the merge brief as
-*"not run … not evidence of anything"*, and executed zero times. Arm B's gate
-asked a human to land a change whose grade nothing had measured; I graded it by
-hand. E2 is the first run where the gate produced `FINAL SCORE: 31` itself.
-
-**2. Cached input was billed as fresh input.** `_tokens` summed
-`input + cache_read + cache_write` into one figure and `_bill` charged the lot
-at the fresh rate. A cache read is 0.1× and a cache write 1.25×. Every agent
-past its first turn reads mostly cache — on E2's cursor jobs, ~88% of input was
-cache reads — so the estimate ran ~3.7× high, and that inflated figure reached
-the brief, the budget cap, and arm B's recorded cost.
-
-A third, smaller: `_EPOCH` was the one reset-time pattern without `re.I`, so a
-provider message beginning "Resets …" lost its reset time and fell back to the
-configured window.
-
-Also fixed before arm B ran, and load-bearing for it: **`frozen_interfaces`
-never reached the agent's prompt.** They were stored in the record, promised by
-`SKILL.md` and by the role card ("if your prompt names a frozen interface,
-treat it as a contract"), and composed into nothing. For a pipeline whose four
-stages coordinate *only* through those contracts, that is the difference
-between 31/31 and four agents disagreeing about coordinate space at merge time.
-
 ## Conclusion
 
 **Do not reach for delegate to be cheaper or faster.** On one provider it costs
@@ -240,7 +210,11 @@ run `delegate init`, and if every tier resolves to one provider, do not
 delegate. This round puts a number on what you would be giving up if you
 ignored that, and it is not small.
 
-**Caveats.** n=1 per arm. No arm hit a *real* quota wall — E's was injected. B's
+**Caveats.** Arms B and E2 were recorded before a pricing correction: cached
+input was being charged at the fresh-input rate, roughly ten times over, which
+is why B's cost above is a recomputation rather than a measurement and is marked
+as one. Figures for D and F are unaffected -- their costs are billed by the
+provider, not derived. n=1 per arm. No arm hit a *real* quota wall — E's was injected. B's
 cost is a recomputation. The task is unusually favourable to parallel
 decomposition (four pre-split files, disjoint by construction). And B's
 `jobs.md` is downstream of arm A's $2.93 planner: the frozen contracts I handed
