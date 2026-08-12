@@ -232,62 +232,41 @@ system's state — no `.task/`, not even ignored — is ever written into it.
 ## What's in the repo
 
 ```text
-agent-delegation/
-├── SKILL.md              THE FRONT DOOR. For the agent a human is talking to:
-│                         when to call `delegate`, which command comes next,
-│                         how to answer a parked gate. No methodology.
+agent-delegation/         THE FRONT DOOR, for the agent a human talks to
+├── SKILL.md              when to call `delegate`, and when not to
 └── references/
     └── one-seat.md       loaded only when `init` shows one provider: how to run
-                          parallel jobs WITHOUT this, which on a single seat is
-                          cheaper and faster. A skill that will not say so is
-                          selling, not advising.
+                          parallel jobs WITHOUT this, which on one seat is
+                          cheaper and faster
 
 orchestrator/
 ├── delegate              the entry point
-├── adg/                  the runtime: state machine, router, quota, cooldowns,
-│                         adapters, verification, prompts  (see its README)
+├── adg/                  the runtime — state machine, router, quota, cooldowns,
+│                         adapters, verification, prompts (see its README)
 ├── tests/                two suites that spend nothing, plus
-│                         test_skill_behaviour.py which launches a real agent
-│                         CLI and does cost money — run that one deliberately
-└── workflows/default/    the contract DISPATCHED agents follow — what a
-                          worktree is, what the scope boundary means, what to
-                          write on the way out. Orchestrator-internal, not
-                          installed, and repointable with `--workflow`.
-    ├── PROTOCOL.md       entry point, read before any role card. No
-    │                     frontmatter: it is read by absolute path rather than
-    │                     installed, and two files claiming the same skill name
-    │                     is a collision a loader resolves arbitrarily
-    ├── workflow.yaml     the stage manifest
-    ├── roles/            one card per role; an agent reads exactly one
-    ├── references/       depth loaded only when its trigger fires: task-dir,
-    │                     parallelism, handover, scratch-files
-    └── schemas/          JSON Schema for reports and job blocks
+│                         test_skill_behaviour.py, which launches a real agent
+│                         CLI and does cost money
+└── workflows/default/    the contract DISPATCHED agents follow. Names no model
+                          and no runtime, so it stands alone wherever it is
+                          unpacked; repointable with `--workflow`
 
-evidence/                 the measurements the Status section cites, and the
-                          scripts that produced them. `run-arm-d.py` is the
-                          control: this program's structure with no delegate in
-                          it, which is what the cost figures are measured
-                          against.
+evidence/                 the measurements Status cites and the scripts that
+                          produced them, including the no-delegate control
 
-registry.default.yaml     model capability scores, the one job profile,
-                          channels (seats), and policy — the only file that
-                          names models
+registry.default.yaml     capability scores, one job profile, channels (seats)
+                          and policy — the only file that names models
 ```
 
-The split between those two directories is the point, and it was one directory
-until recently. The front-door skill's whole job is to name the runtime, down to
-`--adapter herdr|local|mock`. The protocol's whole job is to name **no** model
-and no runtime, so that it stands alone wherever the orchestrator unpacks it.
-Merged, every implementer was handed a document telling it to call `delegate` —
+The two skill directories have different audiences and that is the point.
+`agent-delegation/` names the runtime down to `--adapter herdr|local|mock`;
+`workflows/default/` must name **no** model and no runtime. Merged, every
+dispatched implementer was handed a document telling it to call `delegate` —
 the wrong document, and an invitation to recurse.
 
-**Progressive disclosure is a hard constraint on the protocol, not a style**, and
-the budget that matters is per agent rather than per repo. `PROTOCOL.md` is read
-by every dispatched agent, so a line there costs once per job in the wave, and a
-reference loads only when its stated trigger fires ("a previous agent held this
-job and stopped part-way → read `references/handover.md`"). Moving those rows out
-of the shared entry point lengthened the cards and made every individual job
-cheaper.
+**Progressive disclosure is a constraint on both, and it was tested rather than
+assumed.** A reference loads only when its stated trigger fires. Inlining the
+three files every dispatched agent opens *should* have saved three turns; it
+saved zero and cost more (see Experiments), so the principle stayed.
 
 ## The graph, and how a job finds a seat
 
@@ -366,39 +345,17 @@ headroom nobody can claim, so a test refuses one.
   agent is a billed subprocess, and a leaked one keeps costing after the run has
   stopped.
 
-## Walkthrough: superpowers → delegate → superpowers
+## Using it from a superpowers session
 
-`superpowers:subagent-driven-development` carries a Red Flag that reads **"Never
-dispatch multiple implementation subagents in parallel (conflicts)."** That rule
-exists because its subagents share one working tree. `delegate` is what removes
-the reason for it — disjoint declared write scopes, one git worktree per job,
-merged afterward.
+`superpowers:subagent-driven-development` carries a Red Flag: **"Never dispatch
+multiple implementation subagents in parallel (conflicts)."** That is right, and
+it is right because its subagents share one working tree. Give each its own
+worktree and the premise is gone — which is what this does, and why the handoff
+is not "SDD calls `delegate` per task" but **SDD's per-task implementer loop
+replaced by one run over a batch, with its review loop picking up after.**
 
-So the handoff is not "SDD calls `delegate` per task". It is: **SDD's per-task
-implementer loop is replaced by one `delegate` run over a batch of independent
-tasks, and SDD's review loop picks up after.** Everything before and after stays
-superpowers.
-
-**0. Brainstorm and plan.** `superpowers:brainstorming` → `superpowers:writing-plans`,
-unchanged. You end with a plan whose `### Task N` blocks each carry **Files**
-(Create/Modify/Test) and **Interfaces** (Consumes/Produces). Those two sections
-are what make the next step mechanical.
-
-**1. Check there are two seats.** This is the go/no-go, and it is one command:
-
-```bash
-cd /path/to/your/repo
-delegate init
-```
-
-If it ends *"Every tier resolves to …"*, stop — and do **not** simply fall back
-to SDD's sequential loop. The skill ships the better single-seat answer at
-[`agent-delegation/references/one-seat.md`](agent-delegation/references/one-seat.md):
-the same worktree-per-job fan-out, run yourself, which measured cheaper and
-faster than both `delegate` and one warm session. If it ends *"2 seats serve
-these tiers"*, continue here.
-
-**2. Translate the plan into `jobs.md`.** The only real work, and a field lift:
+Brainstorm and plan with superpowers unchanged. Then the only real work is
+turning the plan into `jobs.md`, which is a field lift:
 
 | superpowers plan | delegate job block |
 |---|---|
@@ -407,72 +364,21 @@ these tiers"*, continue here.
 | **Interfaces: Consumes** | `reads:` and `depends_on:` |
 | **Interfaces: Produces** | `frozen_interfaces:` |
 | Model Selection: cheap / standard / most capable | `tier: t1` / `t2` / `t3` |
-| Global Constraints | repeated into each `goal` or `acceptance` |
 
-The tier column is the interesting one. SDD already tells you to choose a model
-per task and to **"always specify the model explicitly"**. `tier` is that same
-decision — except a tier resolves to a model *on whichever seat has headroom*,
-which a plain subagent dispatch cannot do.
-
-**3. Give it your checks.** `.adg.yaml` in the repo under work. Nothing here has
-an opinion about what passing means:
-
-```yaml
-fast: ["pytest -q"]
-slow: ["pytest -q --integration"]
-```
-
-**4. Run it.** `delegate run "rate limiting" --plan jobs.md`. Jobs land in
-sibling worktrees under `../.adg-worktrees/<project-key>/`, each on
-`adg/<task-id>/<job-id>`, merged into `adg/<task-id>/work`.
-
-**5. The gate parks — exit 1 is not failure.** A calling agent has no tty, so
-the gate cannot ask it. The question is recorded and the run exits `awaiting_approval`:
-
-```bash
-delegate show --brief                     # the question, written for a human
-delegate approve --note "yes, but keep the v1 endpoint working"
-```
-
-The note is not decoration: it flows into every prompt downstream, so a
-qualified yes reaches the agents that act on it.
-
-**6. Read what came back.** The brief carries a row per job — the files it
-touched and which of them fell outside the scope it was given — plus per-seat
-cost and your check output. And, in as many words, that nothing reviewed any of
-it.
-
-**7. If a job escalated**, it hands back its `signals` whole and leaves its
-worktree in place. That is exactly SDD's **BLOCKED** input: more context, a
-stronger tier, split the task, or escalate to the human. `delegate` does none of
-that itself — it would be a worse copy of the skill that called it.
-
-**8. Review, and this is where superpowers returns.** Attended mode leaves
-`integrate.patch` in the task directory:
-
-```bash
-delegate status                           # prints the task directory
-git apply <task-dir>/integrate.patch
-```
-
-Then run `superpowers:requesting-code-review` over the branch, in your own warm
-session, on work you can see. This is the step `delegate` refuses to fake.
-Finish with `superpowers:finishing-a-development-branch`.
+Run it, answer the gate, apply the patch, then review with
+`superpowers:requesting-code-review` in your own warm session — that last step is
+the one this refuses to fake. The commands are above; the agent-facing version
+is [`agent-delegation/SKILL.md`](agent-delegation/SKILL.md).
 
 **Three things that bite:**
 
 - **Commit the plan first.** Job agents work in worktrees cut from your HEAD, so
-  an uncommitted plan file is invisible to them. Either commit it or put the
-  requirements in `goal` — the goal *is* the whole brief; the agent gets no plan
-  and no context from you.
+  an uncommitted plan file is invisible to them. Better: put the requirements in
+  `goal` — that *is* the whole brief, and the agent gets nothing else from you.
 - **Running from inside a superpowers worktree is fine.** The project key comes
-  from `git rev-parse --git-common-dir`, which is identical from every worktree
-  of a repo, so the task state is the same from anywhere in it.
-- **A parked or crashed task keeps its worktree on purpose.** That is the
-  salvage point. Only `done` reaps them; the branch survives either way.
-
-`--dry-run` walks the whole state machine, spends nothing, and shows the wave
-shape before you pay for it.
+  from `git rev-parse --git-common-dir`, identical from every worktree of a repo.
+- **A parked or crashed task keeps its worktree on purpose.** That is the salvage
+  point. Only `done` reaps them.
 
 ## Where it sits beside other skills
 
@@ -544,39 +450,15 @@ answer and `delegate` is not: run head to head on the same jobs and model, this
 costs about double, and the skill hands the caller that recipe rather than its
 own.
 
-**The fourth column is the one nothing else does.** A provider hit its usage
-limit mid-job, twice. Each time the partial work was committed as a checkpoint,
-the seat was cooled with its reopen time, the job was re-selected on the other
-provider and the replacement continued **in the same worktree** from its
-predecessor's commit — then the merge gate ran the grader itself: `FINAL SCORE:
-31`. Columns one and two have no answer to a seat going out; they stop.
+**Which is why the skill's precondition is not a formality.** On one seat you
+are paying roughly double for a gate, a scope report, caps, and a run that
+survives a quota wall instead of losing its in-flight work — and `tier` stops
+meaning anything, because nothing here pins a model and every band resolves to
+the same seat. The skill hands single-seat callers the alternative rather than
+selling itself.
 
-That is the whole pitch, and it is narrower than it looks. Not cheaper. Not
-faster. It keeps going.
-
-**Which is why the precondition in the skill is not a formality.** On a single
-provider with no quota pressure you are paying roughly double for a gate, a scope report
-and a resumable record. That may be worth it; it is not worth it by accident.
-Run `init`; if every tier resolves to one provider, decide deliberately.
-
-**And on one provider `tier` is decoration.** `delegate` never pins a model — the
-CLI runs whatever it is configured with — so a band only routes to a different
-model when the *seats* expose different models. The same fifteen-line job cost
-**$0.018** on a `t1` cursor seat and **$0.80** on a Claude-only deployment where
-`t1` resolved to the same Opus as everything else.
-
-**What no control can do.** A fifth arm injected a provider usage-limit failure
-mid-job, twice. Each time the partial work was committed as a checkpoint, the
-seat was cooled, the job was re-selected on the other provider and the
-replacement continued **in the same worktree** from its predecessor's commit —
-then the merge gate ran the grader itself: `FINAL SCORE: 31`. Routing across
-providers mid-flight cost no correctness. Every other arm in that table simply
-stops when a seat goes out.
-
-Full write-up, per-agent figures, and the scripts that produced them:
-[`evidence/`](evidence/) — including `run-arm-d.py`, the control this is
-measured against, and `diagnose-turns.py`, which attributes every turn to the
-tool that made it.
+How every one of those figures was arrived at, what else was tried, and what had
+to be corrected along the way, is the next section.
 
 **Built and exercised:** dependency waves in isolated worktrees; scope measured
 per job; cost and elapsed time recorded per delegation from the CLI's own JSON;
@@ -590,13 +472,6 @@ band; and teardown that leaves no agent process behind whatever ends the run.
 and a wall that arrived unprompted rather than injected. Both are covered by
 deterministic tests; neither has been seen in the wild.
 
-**A known rough edge.** When a job's band is served by exactly one seat and that
-seat walls, the replacement does not re-ask for the band — it asks for the
-walled model's reasoning floor, and when nothing clears it, drops the floor and
-continues on a weaker model, logging that it did. The work finishes; the tier
-the caller asked for does not survive, and only the run log says so. Whether
-that should park instead is not yet decided.
-
 **Two honest weaknesses.** Cross-provider *dollars* are weaker than
 cross-provider tokens: not every CLI returns a cost figure, so where one reports
 usage but not money the spend is this project's own price table applied to token
@@ -604,6 +479,78 @@ counts, carried as `usd_estimated` rather than passed off as billed. And there
 is no cross-process lock on the breaker file — writes merge under an in-process
 lock, so a breaker lost between two `delegate` processes is recoverable but the
 file is not safe for simultaneous writers in the strict sense.
+
+## Experiments
+
+Every design decision below was forced by a run, not argued into place. The task
+throughout is the same: four stages of a software rasterizer, graded by the
+course's own script over 26 reference images, pass only at 31/31. Full records
+and caveats in [`evidence/RESULTS.md`](evidence/RESULTS.md).
+
+| # | What it tested | Result | What changed here |
+|---|---|---|---|
+| **A** | the old role protocol: planner → 4 implementers → reviewer, 2 seats | 31/31, $13.07, 31.5 min | the planner and reviewer were deleted |
+| **C** | one warm Claude session, its own subagents | 31/31 *(two passes)*, $3.10, 6.8 min | the control A was retired against |
+| **B** | the wrapper: 4 caller-written jobs, 2 seats | 31/31, ≈$3.0, 9.6 min | first run of the product as it now is |
+| **D** | the same structure **hand-rolled, no `delegate`**, 1 seat | 31/31, **$2.92, 3.5 min** | the skill now ships this recipe |
+| **F** | the wrapper on **1 seat**, same jobs as D | 31/31, $4.41 | the ~1.8–2.1× per-agent overhead |
+| **E1** | a wall on a band only one seat serves | did **not** park — `_replacement` re-asks for the walled model's *reasoning floor*, not its tier, and on failing it drops the floor | a known rough edge: the caller's band does not survive its seat going out, and only the run log says so |
+| **E2** | a wall mid-job, twice, 2 seats | 31/31 across two provider changes | the failover claim is earned |
+| **E3** | a wall mid-job on a **single** seat | salvaged, parked, resumed from the checkpoint | found a bug that failed the recovery |
+| **G/H** | inlining the protocol to save turns | **no change** — 30 turns either way | progressive disclosure kept |
+
+**Why there is no planner and no reviewer.** A and C scored the same. The
+protocol cost 4.2× the money for it. A claim whose baseline improves with every
+model release is not worth defending, so the roles went rather than being
+defended — and everything below is what remains once you stop paying for them.
+
+**Why the skill tells you not to use this on one seat.** D and F are the same
+jobs, provider and model; only `delegate` differs. Per job it ran 1.77× and
+2.10× the cost, and cost tracks *turns* almost exactly. Four to five of the
+eight-to-ten extra turns are the protocol and its report; the rest is
+unexplained. So the skill ships D's recipe at
+[`references/one-seat.md`](agent-delegation/references/one-seat.md) instead of
+selling itself.
+
+**Why failover is the whole pitch.** E2 is the only arm that survives a provider
+going out: partial work committed, seat cooled, job re-selected elsewhere,
+replacement continuing in the same worktree — then the gate ran the grader
+itself. E3 showed the single-seat half works too (no hop, but a checkpoint and a
+resume). Neither has been seen on an unprompted wall; both were injected.
+
+**What was tried and refuted.** Cost tracks turns, so inlining the three files
+each agent opens *should* have saved three turns. It saved zero and cost 1.15×
+more, because ~1,900 extra prompt tokens then rode on every turn. Reverted, and
+the note stays in `prompts.py` so the next person reads the result first.
+Separately, one job where `delegate` appeared *cheaper* (0.86×) did not
+reproduce — re-run controlled it came back 1.77× the other way.
+
+**What measuring found that reading did not.** Every one of these shipped, and a
+green suite of 270 tests caught none:
+
+- `slow` checks were parsed, printed in the brief as *"not run"*, and executed
+  **zero times** — so the merge gate asked a human to land a change whose only
+  real check had never run.
+- `frozen_interfaces` were stored, promised by two documents, and **composed
+  into no prompt** — on a pipeline whose four stages coordinate only through
+  them.
+- Cached input was billed at the fresh-input rate, ~10× over, inflating every
+  estimated figure this project published.
+- A one-letter typo in a plan file silently produced a job with **no write
+  scope**, which means it claims every file in the repository.
+
+They share a shape: each lives in the seam between the program and reality —
+config parsed but never executed, data stored but never composed, a correct
+price applied to the wrong quantity. Unit tests cannot see it, because both
+halves pass alone. `tests/test_orchestrator.py`'s `TestTheSeams` now checks
+those joins, driven from where each claim is made.
+
+**How much to trust this.** n=1 per arm. Both walls were injected, not
+encountered. The task is unusually friendly to parallel decomposition — four
+pre-split files, disjoint by construction. And B's job file is downstream of A's
+$2.93 planner: no arm here paid for producing its own decomposition. Every
+number in this session moved when it was sampled a second time, which is the
+best argument for the caveats and against the confidence.
 
 ## License
 
