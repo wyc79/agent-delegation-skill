@@ -28,18 +28,34 @@ different times. On one seat you are paying for subprocess indirection and
 isolation you could get from your own subagents, more slowly and with no shared
 prompt cache.
 
-Measured, on a task with four independent jobs and no quota pressure: against
-the same work done by parallel subagents in one warm context, delegating cost
-**4.2× the money, 4.6× the wall clock and 4.4× the tokens for an identical
-result**. That is the honest price of isolation and cross-provider routing. Pay
-it when you are getting those; do not pay it otherwise.
+Measured, on a task with four independent jobs and no quota pressure. All of
+these scored identically; only the bill differs:
+
+| | delegating | one warm session | 4 cold agents, hand-rolled |
+|---|---|---|---|
+| Cost | ≈$3.0 | $3.10 | **$2.92** |
+| Wall clock | 9.6 min | 6.8 min | **3.5 min** |
+
+The third column is the one that should decide you. It is *this program's own
+structure* — a worktree per job, cold parallel agents, disjoint scopes, merge —
+as a short script with no `delegate` in it, on one provider. It beat delegating
+on both axes. Isolation is not what you are paying for; the protocol each
+dispatched agent loads is.
+
+So on one seat you are buying **wall clock you could have had for free**. Pay it
+when there is a second provider to route to, and not otherwise.
 
 **Delegate when** two or more providers are enrolled *and* at least one holds:
 
-- The jobs are genuinely independent and would run in parallel worktrees.
 - Your own seat is the constraint — a quota wall you are about to hit, or work
-  better served by a model on another provider.
-- You want the jobs isolated from each other's context on purpose.
+  better served by a model on another provider. This is the strong reason.
+  Measured: a provider walled mid-job twice in one run, and the run still
+  finished at full marks — each time the partial work was committed, the seat
+  cooled, and the job continued on the other provider in the same worktree.
+  Nothing you can write yourself in an afternoon does that.
+- The jobs are genuinely independent and would run in parallel worktrees.
+- You want the jobs isolated from each other's context on purpose — though note
+  the table above: isolation alone is not worth the overhead.
 
 **Do it yourself otherwise.** A handful of edits, a question, a conversation
 still settling what is wanted — all delegate badly.

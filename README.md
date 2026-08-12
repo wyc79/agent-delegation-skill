@@ -57,6 +57,11 @@ and a caller that already has planning and review skills does not need worse
 copies of them behind a subprocess boundary. So they were removed rather than
 defended.
 
+Those ratios describe **the protocol**, not what is here now. Cutting it took
+the run from $13.07 to about $3 — see Status, where the wrapper is measured
+against two further controls and does not come out ahead of either on a single
+provider.
+
 What does not improve with model releases is the seat that empties at 3pm while
 another sits idle. That gets *worse*, because stronger models are metered
 harder. Routing across providers, metering the draw on each, and moving a
@@ -490,26 +495,64 @@ adapter, so dispatch, isolated worktrees, waves, verify, failover and
 integration are exercised without an agent CLI installed and without spending
 anything.
 
-**Exercised with real agents, once.** Four jobs across two providers on a real
-assignment, graded by that course's own script: **31/31, first attempt, no human
-correction**, one attempt per job, zero scope violations. The wave ran three
-jobs concurrently and a second wave of one, and it crossed providers without
-being told to — the plan marked one job `t3`, and only one seat serves that
-band, so a strong model on one provider worked alongside two on another.
+**Measured against three controls, on a real assignment.** Four stages of a
+software rasterizer, graded by the course's own script over 26 reference images,
+pass only at 31/31. Every arm scored 31/31; what differs is what it cost.
+
+| | the role protocol | **this wrapper** | one warm Claude session | 4 cold agents, no delegate |
+|---|---|---|---|---|
+| Wall clock | 31.5 min | 9.6 min | 6.8 min | **3.5 min** |
+| Cost | $13.07 | ≈$3.0 | $3.10 | **$2.92** |
+| Tokens in | 6.74M | 2.63M | 1.52M | 1.94M |
+| Agent calls | 6 | 4 | 10 turns | 4 |
+
+The last column is the one to read first. It is **this program's own structure —
+a worktree per job, four cold parallel agents, disjoint scopes, merge — written
+as a 150-line script with no `delegate` in it**, on one provider. It is cheaper
+and faster than everything else in the table, including the warm single session.
+
+So isolation is not what this costs. Same file, same model, both figures billed:
+`clip.cpp` took **$2.41 and 477s through `delegate`** against **$0.68 and 122s
+hand-rolled** — 3.6x the money for the same work. That gap is the layer wrapped
+around each agent (`PROTOCOL.md`, the role card, the report schema, the report
+written back), and it is the largest remaining cost in the system. Routing three
+of four jobs to the cheaper seat is what claws it back and lands this level with
+the controls.
+
+**Which is why the precondition in the skill is not a formality.** On a single
+provider with no quota pressure, `delegate` buys nothing a short script does not,
+and spends wall clock doing it. Run `init`; if every tier resolves to one
+provider, do not delegate.
+
+**What no control can do.** A fifth arm injected a provider usage-limit failure
+mid-job, twice. Each time the partial work was committed as a checkpoint, the
+seat was cooled, the job was re-selected on the other provider and the
+replacement continued **in the same worktree** from its predecessor's commit —
+then the merge gate ran the grader itself: `FINAL SCORE: 31`. Routing across
+providers mid-flight cost no correctness. Every other arm in that table simply
+stops when a seat goes out.
+
+Full write-up, per-agent figures and the scripts:
+[`gpudriver-shakedown-result-wrapper/RESULTS.md`](https://github.com/wyc79/agent-delegation-skill).
 
 **Built and exercised:** dependency waves in isolated worktrees; scope measured
-per job; the Integrator on merge conflicts; cost and elapsed time recorded per
-delegation from the CLI's own JSON; autonomous mode ending at a pushed branch;
-quota-aware failover with per-channel cooldowns shared across repos; the
-utilization shadow price; tier-to-provider routing; gates that park and are
-answered out of band; and teardown that leaves no agent process behind whatever
-ends the run. Multi-provider placement is exercised against the shipped registry
-rather than a fixture one.
+per job; cost and elapsed time recorded per delegation from the CLI's own JSON;
+autonomous mode ending at a pushed branch; quota-aware failover with per-channel
+cooldowns shared across repos, **including salvage-and-continue across a real
+mid-job provider failure**; the utilization shadow price; tier-to-provider
+routing; slow checks at the merge gate; gates that park and are answered out of
+band; and teardown that leaves no agent process behind whatever ends the run.
 
-**Not yet exercised with real agents**, because the conditions have not arisen
-in a live run: failover on an actual quota wall, and the Integrator on a real
-merge conflict. Both are covered by deterministic tests; neither has been seen
-in the wild.
+**Not yet exercised with real agents:** the Integrator on a real merge conflict,
+and a wall that arrived unprompted rather than injected. Both are covered by
+deterministic tests; neither has been seen in the wild.
+
+**A known rough edge.** When a job's band is served by exactly one seat and that
+seat walls, the replacement does not re-ask for the band — it asks for the
+walled model's reasoning floor, and when nothing clears it, drops the floor and
+continues on a weaker model, logging that it did. The work finishes; the tier
+the caller asked for does not survive, and only the run log says so. Whether
+that should park instead is not yet decided.
 
 **Two honest weaknesses.** Cross-provider *dollars* are weaker than
 cross-provider tokens: not every CLI returns a cost figure, so where one reports

@@ -13,7 +13,10 @@ work in one warm context. It cost **4.2x the money, 4.6x the wall clock and 4.4x
 the tokens for an identical result**. A caller that already has planning and
 review skills does not need worse copies of them behind a subprocess boundary.
 What no model release makes redundant is the seat that empties at 3pm, so that
-is what is left.
+is what is left — and that is now the *only* thing it is for. Measured against a
+hand-rolled control with the same structure and no orchestrator in it, this is
+not cheaper and not faster on one provider (README, Status). It survives a
+provider going out mid-job; the control cannot.
 
 **This file is what is actually built**, and it is the design document: the
 reasoning for a decision lives either here or in a comment beside the code it
