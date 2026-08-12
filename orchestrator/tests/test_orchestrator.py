@@ -3135,6 +3135,33 @@ class TestEndToEnd(unittest.TestCase):
                           "the implementer was never shown %r, which "
                           "scope_violations measures it against.\n%s" % (glob, section))
 
+    def test_the_frozen_interfaces_reach_the_agent_that_must_honour_them(self):
+        """The only channel between jobs running at the same time.
+
+        They were stored in the record and composed into no prompt, while
+        `roles/worker.md` told the agent "if your prompt names a frozen
+        interface, treat it as a contract" and the front-door skill listed them
+        as carried into the prompt. Agents in separate worktrees cannot read
+        each other's code, so a signature both sides build against either
+        arrives in the prompt or the merge is where the disagreement is found.
+        """
+        task = _task(self.t.repo, "T-062", "# t\n\nwhatever\n",
+                     self.reg["policy"]["limits"])
+        text = prompts.compose("implementer", task, subtask={
+            "id": "st-1", "goal": "implement the clipper",
+            "planned_scope": ["clip.cpp"],
+            "frozen_interfaces": ["void clip_triangle(driver_state&, int face);",
+                                  "FI-2: gl_Position is clip space at both boundaries."],
+            "hotspots": ["shared/scene.tscn"]})
+        for contract in ("void clip_triangle(driver_state&, int face);",
+                         "FI-2: gl_Position is clip space at both boundaries."):
+            self.assertIn(contract, text, "a frozen interface never reached the agent")
+        self.assertIn("shared/scene.tscn", text,
+                      "the agent is not told which unmergeable file it holds")
+        # Named as a contract, not dropped in as a bare list: an agent that does
+        # not know why the line is there will treat it as a suggestion.
+        self.assertIn("Frozen interfaces", text)
+
     def test_an_unrestricted_subtask_says_so_rather_than_showing_a_bare_header(self):
         """An empty scope means `**` to `scope_violations`. Printing "a hard
         boundary:" with nothing under it reads as unspecified when it means

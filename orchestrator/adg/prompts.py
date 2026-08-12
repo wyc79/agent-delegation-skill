@@ -104,6 +104,26 @@ def compose(role, task, subtask=None, extra=None, verify_cfg=None):
                          "every file you touch is still recorded and reported.")
         if subtask.get("reads"):
             lines.append("May read (do not modify): %s" % ", ".join(subtask["reads"]))
+        # The only thing an agent learns about the jobs running beside it.
+        #
+        # It was stored in the record and never composed into a prompt, while
+        # `roles/worker.md` told the agent "if your prompt names a frozen
+        # interface, treat it as a contract" and the front-door skill listed it
+        # as carried into the prompt. Three places describing a channel that did
+        # not exist -- and it is the channel isolation depends on: agents in
+        # separate worktrees cannot see each other's code, so a signature both
+        # sides code against has to arrive here or the merge is where the
+        # disagreement is discovered.
+        if subtask.get("frozen_interfaces"):
+            lines.append("Frozen interfaces — other jobs are coding against these "
+                         "right now, in worktrees you cannot see. Match them exactly. "
+                         "Changing one breaks work you have no way to inspect, so it "
+                         "is something to report rather than something to do:")
+            lines += ["  %s" % f for f in subtask["frozen_interfaces"]]
+        if subtask.get("hotspots"):
+            lines.append("Unmergeable files held exclusively for this job (no other "
+                         "job runs while you hold them): %s"
+                         % ", ".join(subtask["hotspots"]))
         if subtask.get("acceptance"):
             lines.append("Acceptance criteria you own: %s" % ", ".join(subtask["acceptance"]))
 
