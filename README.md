@@ -511,50 +511,45 @@ adapter, so dispatch, isolated worktrees, waves, verify, failover and
 integration are exercised without an agent CLI installed and without spending
 anything.
 
-**Measured against three controls, on a real assignment.** Four stages of a
-software rasterizer, graded by the course's own script over 26 reference images,
-pass only at 31/31. Every arm scored 31/31; what differs is what it cost.
+**Measured on a real assignment.** Four stages of a software rasterizer, graded
+by the course's own script over 26 reference images, pass only at 31/31. Four
+situations a reader might actually be in — every one of them scored **31/31**:
 
-| | **wrapper**, 2 seats | **wrapper**, 1 seat | one warm session | 4 cold agents, no delegate |
+| | one warm session | one provider, parallel *(the skill's recipe)* | two providers, `delegate` | two providers, `delegate`, **one goes down mid-job** |
 |---|---|---|---|---|
-| Cost | ≈$3.0 | $4.41 | $3.10 | **$2.92** |
-| Wall clock | 9.6 min | — | 6.8 min | **3.5 min** |
-| Tokens in | 2.63M | 2.67M | 1.52M | 1.94M |
+| Agents | 1 session, 10 turns | 4 cold, isolated | 4 cold, isolated | 4 cold + 2 replacements |
+| Cost | $3.10 | **$2.92** | ≈$3.0 | $0.80 † |
+| Wall clock | 6.8 min | **3.5 min** | 9.6 min | 4.8 min |
+| Tokens in | 1.52M | 1.94M | 2.63M | 1.76M |
+| If a seat goes out | run ends | run ends | fails over | **failed over twice, still 31/31** |
 
-Every one of these scored 31/31. The retired role protocol is deliberately not
-a column: it is not something anyone can choose now, and measuring this against
-a version of itself that no longer ships would flatter it for free. Its numbers
-are in the section above, as the reason it went.
+† that figure excludes real work thrown away: two agents ran ~88s each before
+the injected wall, and a killed CLI reports no usage. This column is cheap
+because it finished on the cheaper seat, not because failover is free.
 
-The last column is the one to read first. It is **this program's own structure —
-a worktree per job, cold parallel agents, disjoint scopes, merge — as a 150-line
-script with no `delegate` in it**, on one provider. It is cheaper and faster than
-everything else in the table, including the warm single session. So isolation is
-not what this costs.
+Columns three and four are the same deployment; the fourth is what happened when
+a provider was walled mid-job on purpose. Every figure is one run — n=1 per
+column, on a task unusually friendly to parallel decomposition (four pre-split
+files, disjoint by construction). `evidence/RESULTS.md` carries the caveats in
+full, including which numbers are billed and which are estimated.
 
-The two middle columns isolate what does: same provider, same model, same four
-jobs, only `delegate` added — **1.51x overall**. Run back to back under
-controlled conditions, with every turn attributed to the tool that made it, the
-same two jobs come in at **1.77x and 2.10x**; the arm-level 1.51x is diluted by
-run-to-run noise wide enough to have produced one pair where `delegate` looked
-*cheaper*, which did not reproduce.
+**Read the first two columns together.** Four cold isolated agents beat one warm
+session on both axes — so isolation is *not* what this costs, and the shared
+prompt cache it gives up is worth far less than it sounds, because a cache read
+is a tenth of fresh input. On a single provider the second column is the right
+answer and `delegate` is not: run head to head on the same jobs and model, this
+costs about double, and the skill hands the caller that recipe rather than its
+own.
 
-Where it goes is only **half** accounted for. Both jobs show four to five
-turns of protocol layer — reading `PROTOCOL.md`, the role card and the report
-schema, then writing the report — against eight to ten extra turns in total. The
-rest is more `Bash` calls and more source files read, and this repository does
-not know why. The prompt is ~1.5x longer, which is a plausible cause and is not
-evidence.
+**The fourth column is the one nothing else does.** A provider hit its usage
+limit mid-job, twice. Each time the partial work was committed as a checkpoint,
+the seat was cooled with its reopen time, the job was re-selected on the other
+provider and the replacement continued **in the same worktree** from its
+predecessor's commit — then the merge gate ran the grader itself: `FINAL SCORE:
+31`. Columns one and two have no answer to a seat going out; they stop.
 
-What the protocol half buys is real: the report is the only channel a stuck job
-has, and the checkpoint commits are what a failover resumes from. What the other
-half buys is unknown, and calling all of it "the feature list" would be a nicer
-story than the data tells.
-
-What that overhead buys is everything the script leaves out because it is a
-throwaway: a merge gate that hands a human graded evidence before anything
-lands, per-job scope measurement, `max_cost_usd` and `max_attempts_per_subtask`
-that bind, a resumable task on disk, and the grader running at the gate.
+That is the whole pitch, and it is narrower than it looks. Not cheaper. Not
+faster. It keeps going.
 
 **Which is why the precondition in the skill is not a formality.** On a single
 provider with no quota pressure you are paying roughly double for a gate, a scope report

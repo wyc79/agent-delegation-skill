@@ -4,17 +4,15 @@ Read this when `delegate init` said every tier resolves to one provider and you
 still have several independent jobs to run.
 
 **Independence is not the gate — size is.** Three one-line functions are three
-`Write` calls in one message; a worktree apiece plus three cold agents costs
-more in wall clock and tokens than doing it yourself, however disjoint they are.
-This earns its setup when each job is substantial enough that an agent would
-spend real turns on it. Below that, write the code.
+`Write` calls in one message; a worktree apiece plus three cold agents is slower
+than doing it yourself, however disjoint they are. This earns its setup when
+each job is substantial enough that an agent would spend real turns on it. Below
+that, write the code.
 
-Measured on a four-job task, all arms scoring identically: this pattern cost
-**$2.92 in 3.5 minutes** against **$4.41** for the same jobs through `delegate`
-on one seat. Per agent, `delegate` runs about **1.8-2.1x** the cost — eight to
-ten extra turns, of which four or five are the protocol and its report. The rest
-is not accounted for. On one seat you are paying that for a gate and a record.
-Sometimes worth it. Often not.
+Measured on a four-job task, all arms scoring the same: on a single seat this
+pattern beats dispatching the same jobs through `delegate`, on both money and
+wall clock. What `delegate` adds there is a merge gate, a scope report and caps
+— worth having if you will use them, and pure overhead if you will not.
 
 ## Why this is not the thing superpowers warns you off
 

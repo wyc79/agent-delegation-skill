@@ -26,53 +26,21 @@ provider, think hard before delegating.** `init` says which case you are in, in
 as many words. The whole value here is placing work across seats that empty at
 different times.
 
-One belief this used to carry is now measured and false: cold isolated agents do
-*not* cost you meaningfully for the lost shared prompt cache. Four cold agents
-beat one warm session on both cost and wall clock, because a cache read is a
-tenth of fresh input and re-reading context is cheap. Isolation is not the
-expense.
+**On one seat, prefer your own parallel agents.** Measured head to head on the
+same jobs and the same model, dispatching through `delegate` costs meaningfully
+more than running a git worktree per job yourself, and buys you a merge gate, a
+scope report and caps — none of which need a second provider to be useful, and
+none of which are worth much if you were not going to read them.
 
-Measured, on a task with four independent jobs and no quota pressure. All of
-these scored identically; only the bill differs:
+The exception is a seat you actually run into walls. When one lands mid-job
+`delegate` commits what the agent had, records when the seat reopens, and
+resumes from that commit; doing it yourself, the CLI dies and the job restarts
+from nothing. If that is your situation, pay the overhead on one seat too.
 
-| | delegating, 2 seats | **delegating, 1 seat** | one warm session | 4 cold agents, hand-rolled |
-|---|---|---|---|---|
-| Cost | ≈$3.0 | **$4.41** | $3.10 | **$2.92** |
-| Wall clock | 9.6 min | — | 6.8 min | **3.5 min** |
-
-**Read the second and last columns against each other** — those are the two
-things actually on your desk if `init` showed one provider. The 2-seat column is
-there for scale, not for your decision.
-
-The last is *this program's own structure* — a worktree per job, cold parallel
-agents, disjoint scopes, merge — as a short script with no `delegate` in it. On
-one seat it wins on cost and wall clock both.
-
-Run head to head on one provider, same model, same jobs, `delegate` costs
-**~1.8-2.1x** the hand-rolled equivalent — eight to ten extra turns per agent.
-Four or five of those are the protocol: reading it, reading the role card and
-the report schema, then writing the report back. The report is the only channel
-a stuck job has, and the checkpoints are what a failover resumes from. The other
-half of the extra turns is unexplained.
-
-So on a single seat you are paying about double for a merge gate carrying graded
-evidence, per-job scope measurement, caps that bind — and one thing that is easy
-to write off and should not be.
-
-**A single seat still hits walls, and this survives one.** When the wall lands
-mid-job there is nowhere to fail over to, but the partial work is committed as a
-checkpoint first, the seat is cooled with its reopen time, and the task parks
-holding all of it. `delegate resume --when-open` sleeps out the window and picks
-up from that checkpoint. The hand-rolled script has no equivalent: the CLI dies,
-whatever was uncommitted is gone, and you start the job again.
-
-If your one seat is a subscription you actually run down — and if it were not,
-you would not be reading this section — that is the argument, not the gate.
-
-Also on a single seat: **`tier` stops meaning anything.** Nothing here pins a
-model, so a band only picks a different model when your seats expose different
-models. The same fifteen-line job cost $0.018 on a cheap seat and $0.80 when
-every band resolved to the same one.
+**On one seat `tier` also stops meaning anything.** Nothing here pins a model,
+so a band only routes differently when your *seats* expose different models.
+With one seat every band resolves to the same one, and a job you marked `t1` to
+keep it cheap runs on whatever that seat's CLI is configured with.
 
 **Delegate when** two or more providers are enrolled *and* at least one holds:
 
@@ -84,15 +52,16 @@ every band resolved to the same one.
   Nothing you can write yourself in an afternoon does that.
 - The jobs are genuinely independent and would run in parallel worktrees.
 - You want the jobs isolated from each other's context on purpose — though note
-  the table above: isolation alone is not worth the overhead.
+  that isolation alone is not worth the overhead: you can have it from your own
+  worktrees, without this.
 
 **Do it yourself otherwise.** A handful of edits, a question, a conversation
 still settling what is wanted — all delegate badly.
 
 ### On one seat, do this instead
 
-The alternative is not "give up on parallelism" — it is the pattern that beat
-delegating in the table above, and you can run it with tools you already have:
+The alternative is not "give up on parallelism" — it is the pattern that beats
+delegating on a single seat, and you can run it with tools you already have:
 a git worktree per job, all the agents dispatched in one message so they run
 concurrently, then merge one at a time with your checks between.
 
