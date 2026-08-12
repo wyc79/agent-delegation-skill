@@ -499,30 +499,40 @@ anything.
 software rasterizer, graded by the course's own script over 26 reference images,
 pass only at 31/31. Every arm scored 31/31; what differs is what it cost.
 
-| | the role protocol | **this wrapper** | one warm Claude session | 4 cold agents, no delegate |
-|---|---|---|---|---|
-| Wall clock | 31.5 min | 9.6 min | 6.8 min | **3.5 min** |
-| Cost | $13.07 | ≈$3.0 | $3.10 | **$2.92** |
-| Tokens in | 6.74M | 2.63M | 1.52M | 1.94M |
-| Agent calls | 6 | 4 | 10 turns | 4 |
+| | role protocol | **wrapper**, 2 seats | warm session | **wrapper**, 1 seat | 4 cold agents, no delegate |
+|---|---|---|---|---|---|
+| Cost | $13.07 | ≈$3.0 | $3.10 | $4.41 | **$2.92** |
+| Wall clock | 31.5 min | 9.6 min | 6.8 min | — | **3.5 min** |
+| Tokens in | 6.74M | 2.63M | 1.52M | 2.67M | 1.94M |
 
 The last column is the one to read first. It is **this program's own structure —
-a worktree per job, four cold parallel agents, disjoint scopes, merge — written
-as a 150-line script with no `delegate` in it**, on one provider. It is cheaper
-and faster than everything else in the table, including the warm single session.
+a worktree per job, cold parallel agents, disjoint scopes, merge — as a 150-line
+script with no `delegate` in it**, on one provider. It is cheaper and faster than
+everything else in the table, including the warm single session. So isolation is
+not what this costs.
 
-So isolation is not what this costs. Same file, same model, both figures billed:
-`clip.cpp` took **$2.41 and 477s through `delegate`** against **$0.68 and 122s
-hand-rolled** — 3.6x the money for the same work. That gap is the layer wrapped
-around each agent (`PROTOCOL.md`, the role card, the report schema, the report
-written back), and it is the largest remaining cost in the system. Routing three
-of four jobs to the cheaper seat is what claws it back and lands this level with
-the controls.
+The two middle columns isolate what does: same provider, same model, same four
+jobs, only `delegate` added. Per job it ran **2.25x, 1.63x, 2.18x and 0.86x** the
+hand-rolled cost — **1.51x overall, and 1.50x on wall clock**. Read the spread
+before taking 1.5x as a constant: on one of the four jobs `delegate` was cheaper
+*and* faster, and the variance between individual agent runs is wider than the
+effect. n=1 per job.
+
+What that ~1.5x buys is everything the script leaves out because it is a
+throwaway: a merge gate that hands a human graded evidence before anything
+lands, per-job scope measurement, `max_cost_usd` and `max_attempts_per_subtask`
+that bind, a resumable task on disk, and the grader running at the gate.
 
 **Which is why the precondition in the skill is not a formality.** On a single
-provider with no quota pressure, `delegate` buys nothing a short script does not,
-and spends wall clock doing it. Run `init`; if every tier resolves to one
-provider, do not delegate.
+provider with no quota pressure you are paying ~1.5x for a gate, a scope report
+and a resumable record. That may be worth it; it is not worth it by accident.
+Run `init`; if every tier resolves to one provider, decide deliberately.
+
+**And on one provider `tier` is decoration.** `delegate` never pins a model — the
+CLI runs whatever it is configured with — so a band only routes to a different
+model when the *seats* expose different models. The same fifteen-line job cost
+**$0.018** on a `t1` cursor seat and **$0.80** on a Claude-only deployment where
+`t1` resolved to the same Opus as everything else.
 
 **What no control can do.** A fifth arm injected a provider usage-limit failure
 mid-job, twice. Each time the partial work was committed as a checkpoint, the

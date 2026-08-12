@@ -22,16 +22,20 @@ task directory on disk; none of them sees your context and you never see theirs.
 ## Before anything: is there more than one seat?
 
 Run `delegate init` and read the tier table. **If every tier resolves to one
-provider, stop — do not delegate.** `init` says which case you are in, in as
-many words. The whole value here is placing work across seats that empty at
-different times. On one seat you are paying for subprocess indirection and
-isolation you could get from your own subagents, more slowly and with no shared
-prompt cache.
+provider, think hard before delegating.** `init` says which case you are in, in
+as many words. The whole value here is placing work across seats that empty at
+different times.
+
+One belief this used to carry is now measured and false: cold isolated agents do
+*not* cost you meaningfully for the lost shared prompt cache. Four cold agents
+beat one warm session on both cost and wall clock, because a cache read is a
+tenth of fresh input and re-reading context is cheap. Isolation is not the
+expense.
 
 Measured, on a task with four independent jobs and no quota pressure. All of
 these scored identically; only the bill differs:
 
-| | delegating | one warm session | 4 cold agents, hand-rolled |
+| | delegating, 2 seats | one warm session | 4 cold agents, hand-rolled |
 |---|---|---|---|
 | Cost | ≈$3.0 | $3.10 | **$2.92** |
 | Wall clock | 9.6 min | 6.8 min | **3.5 min** |
@@ -39,11 +43,18 @@ these scored identically; only the bill differs:
 The third column is the one that should decide you. It is *this program's own
 structure* — a worktree per job, cold parallel agents, disjoint scopes, merge —
 as a short script with no `delegate` in it, on one provider. It beat delegating
-on both axes. Isolation is not what you are paying for; the protocol each
-dispatched agent loads is.
+on both axes.
 
-So on one seat you are buying **wall clock you could have had for free**. Pay it
-when there is a second provider to route to, and not otherwise.
+Run head to head on one provider, same model, same jobs, `delegate` costs
+**~1.5x** the hand-rolled equivalent in both money and wall clock. What you get
+for it is a merge gate carrying graded evidence, per-job scope measurement, cost
+and attempt caps that bind, and a task on disk you can resume after a crash. On
+a single seat that is the whole of the trade, and you should make it on purpose.
+
+Also on a single seat: **`tier` stops meaning anything.** Nothing here pins a
+model, so a band only picks a different model when your seats expose different
+models. The same fifteen-line job cost $0.018 on a cheap seat and $0.80 when
+every band resolved to the same one.
 
 **Delegate when** two or more providers are enrolled *and* at least one holds:
 
