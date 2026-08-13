@@ -366,10 +366,18 @@ class TestCooldownStore(unittest.TestCase):
                 self.assertEqual(cooldown.active(T0), {"claude-seat"},
                                  "the write did not recover the file")
 
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() != 0,
+                         "chmod is a no-op for root")
     def test_an_unwritable_state_dir_is_reported_not_raised(self):
         # A read-only $XDG_STATE_HOME with a writable task dir is an ordinary CI
         # sandbox. _meter runs on the first agent call, so raising here kills
         # the run before it starts.
+        #
+        # Skipped as root, and on Windows, where there is no geteuid: root
+        # ignores the mode bits, so `record_use` succeeds and the assertion that
+        # the failure was REPORTED fails -- a red test that says nothing about
+        # this code, in the one environment (a container running as root) where
+        # a reader is least able to tell it apart from a real one.
         root = store.state_root()
         os.makedirs(root, exist_ok=True)
         mode = os.stat(root).st_mode
