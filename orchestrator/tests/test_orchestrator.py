@@ -4007,6 +4007,170 @@ stages:
 
 
 
+class TestPaneModeHumanTurns(unittest.TestCase):
+    """Somebody typed into a running job's pane.
+
+    Every adapter this program started with was the session's only writer: a
+    subprocess with the prompt on stdin has no keyboard on it. `herdr` with
+    panes does not hold that -- a pane is a real terminal, shown on purpose, and
+    what it is shown FOR is a human watching a job and reacting to it.
+
+    Measured and reported, never rejected: the same contract `file_scope` has.
+    A steered job is not a failed job, it is a job whose result may no longer
+    answer the goal the brief says it was dispatched with, and that is a
+    difference the reader of the brief is entitled to know about.
+
+    See orchestrator/docs/pane-mode-human-input.md.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    # --- the counter itself ----------------------------------------------
+    def test_a_line_the_dispatcher_sent_is_not_a_human_turn(self):
+        from adg.machine import foreign_input
+        sent = ["Your job: st-1\nWrite ONLY these files: app.py\n"]
+        pane = "> Your job: st-1\n  reading app.py\n> Write ONLY these files: app.py\n"
+        self.assertEqual(foreign_input(pane, sent), [])
+
+    def test_a_line_nobody_sent_is_a_human_turn(self):
+        from adg.machine import foreign_input
+        got = foreign_input("> Your job: st-1\n  working\n"
+                            "> actually skip the tests\n  ok\n",
+                            ["Your job: st-1\n"])
+        self.assertEqual(got, [("actually skip the tests", None)])
+
+    def test_a_stamped_line_keeps_its_stamp(self):
+        """The count says a job was steered; the stamp is what lets a reader go
+        and look at when. Absent when the terminal did not write one -- an
+        invented time would take away the only thing the row is for."""
+        from adg.machine import foreign_input
+        got = foreign_input("[14:03] > use the other endpoint\n> and rerun\n", [])
+        self.assertEqual(got, [("use the other endpoint", "14:03"),
+                               ("and rerun", None)])
+
+    def test_a_prompt_echoed_whole_is_still_ours(self):
+        """The undercount bias, asserted. A terminal may echo a multi-line
+        prompt on one line, wrapped, or a line at a time, and the scrollback
+        does not say which -- so a line that appears anywhere inside something
+        we sent is credited to us. Missing a steered job under-reports it;
+        inventing one puts a human-interference caveat on a run nobody touched,
+        and a caveat that fires on clean runs is a caveat nobody reads."""
+        from adg.machine import foreign_input
+        sent = ["Your job: st-1\nWrite ONLY these files: app.py\n"]
+        self.assertEqual(
+            foreign_input("> Your job: st-1 Write ONLY these files: app.py\n", sent),
+            [])
+
+    # --- what reaches the state file and the brief ------------------------
+    def _run_with_pane(self, transcript, panes=True):
+        """One job, dispatched into a mock 'pane' whose scrollback is
+        `transcript`. `pane_transcript` is what HerdrAdapter.prompt sets and no
+        other adapter does -- it is the flag that says this text came off a
+        terminal a human can type into."""
+        plan = ('# p\n\n```yaml\n- id: st-1-subtract\n'
+                '  goal: Add subtract to app.py\n  file_scope: ["app.py"]\n```\n')
+        task = _task(self.t.repo, "T-PANE", "# t\n\nAdd subtract\n",
+                     self.reg["policy"]["limits"], plan=plan)
+
+        def implementer(env, cwd):
+            _spit(os.path.join(cwd, "app.py"),
+                  "def add(a, b):\n    return a + b\n\n"
+                  "def subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"],
+                    "implement-st-1-subtract.json",
+                    {"stage": "implement", "role": "implementer",
+                     "subtask": "st-1-subtract", "status": "complete",
+                     "summary": "added subtract", "evidence": {"tests": "ok"}})
+            out = {"output": transcript}
+            if panes:
+                out["pane_transcript"] = True
+            return out
+
+        logs = []
+        status = Orchestrator(task, self.reg,
+                              runtime.MockAdapter({"implementer": implementer}),
+                              lambda k, t: True, log=logs.append).run()
+        return status, task, logs
+
+    def test_a_foreign_turn_is_counted_against_the_job_and_lands_in_the_brief(self):
+        status, task, logs = self._run_with_pane(
+            "[14:03] > no, use the other endpoint\n  understood\n")
+        self.assertEqual(status, "done", "\n".join(logs))
+        sub = task.state["subtasks"][0]
+        self.assertEqual((sub.get("human_turns") or {}).get("count"), 1,
+                         "a line nobody dispatched was not counted: %s" % sub)
+        self.assertEqual(sub["human_turns"]["at"], ["14:03"])
+
+        text = brief.render(task, "merge", "Land it?")
+        self.assertIn("Human turns", text, "the brief has no human-turns column")
+        row = [l for l in text.splitlines() if l.startswith("| st-1-subtract")][0]
+        self.assertIn("14:03", row, "the row does not say when")
+        self.assertIn("were steered", text,
+                      "the brief counts the turns and never says what they mean")
+        # Reported, never rejected -- the file_scope contract.
+        self.assertIn("Nothing was rejected", text)
+        self.assertEqual(task.state["status"], "done",
+                         "a steered job was treated as a failed one")
+
+    def test_a_clean_pane_run_gets_no_column_and_no_warning(self):
+        """A caveat that fires when nobody touched anything is a caveat nobody
+        reads -- the same rule the own-checks column follows."""
+        _, task, logs = self._run_with_pane("  working\n  done\n")
+        self.assertIsNone(task.state["subtasks"][0].get("human_turns"))
+        text = brief.render(task, "merge", "Land it?")
+        self.assertNotIn("Human turns", text)
+        self.assertNotIn("were steered", text)
+
+    def test_a_run_without_panes_is_not_scanned_at_all(self):
+        """A subprocess has no keyboard on it, and its `output` is the agent's
+        own prose -- where a line beginning `>` is a markdown blockquote and not
+        somebody talking. Scanning it would manufacture human turns out of
+        ordinary writing."""
+        _, task, _ = self._run_with_pane(
+            "> the retry loop should back off here\n", panes=False)
+        self.assertIsNone(task.state["subtasks"][0].get("human_turns"),
+                          "a subprocess run was read as if it had a terminal")
+
+    def test_the_same_scrollback_read_twice_counts_once(self):
+        """`agent read` returns a rolling window, so every turn re-reads lines
+        already counted. Without the per-session ledger a single human turn
+        accumulates once per attempt, and the number in the brief becomes a
+        count of reads rather than a count of people talking."""
+        from adg.machine import foreign_input
+        session = runtime.Session("s", self.t.repo)
+        session.sent.append("Your job: st-1\n")
+        pane = "> Your job: st-1\n> skip the tests\n"
+        first = [l for l, _ in foreign_input(pane, session.sent)
+                 if l not in session.counted]
+        session.counted.update(first)
+        second = [l for l, _ in foreign_input(pane, session.sent)
+                  if l not in session.counted]
+        self.assertEqual(first, ["skip the tests"])
+        self.assertEqual(second, [], "the second read counted the same line again")
+
+    def test_the_skill_warns_that_a_pane_is_not_for_steering(self):
+        """The flag description is where a caller decides to use panes, so it is
+        where the cost of using them to steer has to be stated. Anywhere else
+        and the warning arrives after the run it was about."""
+        skill = _slurp(os.path.join(REPO_ROOT, "agent-delegation", "SKILL.md"))
+        self.assertIn("--no-panes", skill)
+        self.assertRegex(skill, r"(?s)watching and unblocking, not steering")
+
+    def test_the_design_note_ships_beside_the_code(self):
+        """The heuristic is cheap on purpose and its replacement is a field
+        somebody else has to expose. A note nobody can find is a request nobody
+        can act on."""
+        doc = _slurp(os.path.join(REPO_ROOT, "orchestrator", "docs",
+                                  "pane-mode-human-input.md"))
+        for wanted in ("pane_keyboard", "agent_state", "undercount"):
+            self.assertIn(wanted, doc, "the design note no longer says %r" % wanted)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

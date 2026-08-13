@@ -70,6 +70,13 @@ def _files_by_area(files, limit=12):
     return lines
 
 
+def _turns(sub):
+    """How many lines a human typed into this job's pane. 0 when nobody did,
+    and when the run was not in panes at all -- nothing counts there, because
+    a subprocess has no keyboard on it."""
+    return int(((sub.get("human_turns") or {}).get("count") or 0))
+
+
 def _by_job(state, limit=8):
     """What each job touched, and what it touched outside the boundary it was
     given.
@@ -86,15 +93,23 @@ def _by_job(state, limit=8):
     agents it never saw. "st-2 also wrote build.gradle" is the single most
     useful sentence in that decision, and it was being computed and thrown away.
     """
-    subs = [s for s in (state.get("subtasks") or []) if s.get("actual_files")]
+    # A job that was steered but wrote nothing still belongs in this table: the
+    # human turns are the whole reason its row is worth reading.
+    subs = [s for s in (state.get("subtasks") or [])
+            if s.get("actual_files") or _turns(s)]
     if not subs:
         return []
     # The own-checks column appears only when some job declared one. On a plan
     # that uses none it would be a column of "none declared" saying nothing.
     any_own = any((s.get("own_checks") or {}).get("declared") for s in subs)
+    # Same rule for human turns: a column of dashes over a run nobody touched
+    # is a caveat that fires on clean runs, which is a caveat nobody reads.
+    any_human = any(_turns(s) for s in subs)
     head = "| Job | Files | Outside its scope |"
-    rows = [head + (" Own checks |" if any_own else ""),
-            "|---|---|---|" + ("---|" if any_own else "")]
+    rows = [head + (" Own checks |" if any_own else "")
+                 + (" Human turns |" if any_human else ""),
+            "|---|---|---|" + ("---|" if any_own else "")
+                            + ("---|" if any_human else "")]
     for sub in subs[:limit]:
         files = sub.get("actual_files") or []
         out = set(sub.get("scope_violations") or [])
@@ -117,6 +132,11 @@ def _by_job(state, limit=8):
             else:
                 cell = "%d/%d passed" % (oc.get("passed") or 0, n)
             row += " %s |" % cell
+        if any_human:
+            n = _turns(sub)
+            when = (sub.get("human_turns") or {}).get("at") or []
+            row += " %s |" % ("—" if not n else
+                              "**%d**%s" % (n, " (%s)" % ", ".join(when[:3]) if when else ""))
         rows.append(row)
     if len(subs) > limit:
         rows.append("| … | %d more jobs | |" % (len(subs) - limit))
@@ -126,6 +146,15 @@ def _by_job(state, limit=8):
                  "%d file(s) were written outside the scope their job declared. "
                  "Nothing was reverted — this is a measurement, and what to do "
                  "about it is yours." % len(flagged)]
+    steered = [s for s in subs if _turns(s)]
+    if steered:
+        rows += ["",
+                 "%d job(s) had input typed into their terminal pane while they "
+                 "were working — they were steered, so their results may not map "
+                 "to the goals they were dispatched with. Nothing was rejected; "
+                 "this is a measurement, like the scope column. Answering a "
+                 "question from a stuck agent counts here too, and looks the "
+                 "same from outside." % len(steered)]
     return rows
 
 

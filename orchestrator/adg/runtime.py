@@ -135,6 +135,13 @@ def _tokens(usage):
 class Session:
     def __init__(self, name, cwd, handle=None):
         self.name, self.cwd, self.handle = name, cwd, handle
+        # Every prompt the orchestrator has sent this session, and the foreign
+        # input lines it has already counted against it. Both are maintained by
+        # `machine`, not by any adapter: they are what "did somebody else type
+        # into this pane?" is answered by subtraction from. The second exists
+        # because a pane transcript is a rolling window re-read on every turn,
+        # so without it the same human line is counted again on every read.
+        self.sent, self.counted = [], set()
 
 
 # Where each agent CLI looks for a repository's standing conventions. One entry
@@ -494,9 +501,17 @@ class HerdrAdapter(LocalAdapter):
         state = agent.get("agent_status") or agent.get("state") or "idle"
         # herdr reports liveness, never success -- `blocked` means it is waiting
         # on a human, which for an unattended run is a failure to report.
+        #
+        # `pane_transcript` says where `output` came from, and only this branch
+        # can say it: this is a real terminal a human can type into, and what
+        # comes back is the pane's scrollback rather than the agent's answer.
+        # `machine` reads it to decide whether counting input lines means
+        # anything. A subprocess run has no keyboard on it, and its output is
+        # the agent's own prose, where a line beginning `>` is a blockquote and
+        # not somebody talking.
         return classify({"settled": "blocked" if state == "blocked" else "idle",
                          "output": out, "code": 0 if state != "blocked" else 1,
-                         "cost_usd": None,
+                         "cost_usd": None, "pane_transcript": True,
                          "error_code": agent.get("error_code")}, kind)
 
     def follow_up(self, session, text, timeout):

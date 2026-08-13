@@ -201,6 +201,11 @@ overrides. Useful flags: `--no-panes` (trades herdr's visible agent panes for
 cost accounting, so `max_cost_usd` can bind), `--max-cost N` (lowers, never
 raises), `--dry-run`, `--yes`.
 
+**Panes are for watching and unblocking, not steering.** Typing into a running
+agent's pane is invisible to the record — nothing knows which turn came from
+you — so the job is counted and flagged in the merge brief instead, as a result
+that may no longer answer the goal it was dispatched with.
+
 **Exit code 1 does not mean it failed.** Only `done` exits 0; parked, waiting on
 quota, declined and crashed all exit 1. Read the status.
 

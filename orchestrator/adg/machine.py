@@ -63,6 +63,57 @@ def _stamp(epoch):
 _LOG_SEQ = [0]
 _LOG_LOCK = threading.Lock()
 
+# An input line in a pane transcript: the terminal's own prompt marker, with an
+# optional clock stamp in front of it. There is one marker for both parties,
+# because to the terminal a prompt this program sent and a line a human typed
+# are the same event -- which is exactly why the two can only be told apart by
+# subtracting what we know we sent.
+_PANE_INPUT = re.compile(
+    r"^\s*(?:[\[(](\d{1,2}:\d{2}(?::\d{2})?)[\])]\s*)?[>›❯]\s?(.*)$")
+
+
+def _flat(text):
+    """Whitespace-insensitive form, for comparing what a terminal rendered
+    against what we sent. A pane wraps at its own width and re-indents; the
+    words are the only part that survives both ends."""
+    return " ".join((text or "").split())
+
+
+def foreign_input(transcript, sent):
+    """Input lines in a pane transcript that this program did not send.
+
+    -> [(line, timestamp_or_None)], in transcript order.
+
+    Pane mode hands a human a real terminal, so `delegate`'s assumption that it
+    is the session's only writer stops holding. This is the cheap way to notice:
+    it knows every prompt it sent, so anything else on an input line came from
+    somebody else.
+
+    It is a heuristic and biased to UNDERCOUNT, deliberately -- the same
+    one-sided bias `quota.classify` takes, for the same reason. A line is
+    credited to this program if it appears anywhere inside a prompt we sent,
+    compared with runs of whitespace flattened, because a terminal may echo a
+    multi-line prompt whole, wrapped at its own width, or a line at a time and
+    the scrollback does not say which. Missing a human turn under-reports a job
+    that was steered; inventing one puts a warning about human interference on
+    a brief where nobody touched anything, and a caveat that fires on clean runs
+    is a caveat nobody reads.
+
+    See orchestrator/docs/pane-mode-human-input.md for what this cannot see and
+    what herdr would have to expose to replace it.
+    """
+    mine = [_flat(t) for t in (sent or ())]
+    out = []
+    for raw in (transcript or "").splitlines():
+        m = _PANE_INPUT.match(raw)
+        if not m:
+            continue
+        said = (m.group(2) or "").strip()
+        if not said or any(_flat(said) in one for one in mine):
+            continue
+        out.append((said, m.group(1)))
+    return out
+
 
 class Halt(Exception):
     """Stop cleanly and leave the task resumable."""
@@ -1633,11 +1684,14 @@ class Orchestrator:
                     role, choice.agent_kind, cwd, prompts.env_for(self.task, role))
                 with self._live_lock:
                     self._live.add(session)
+                self._sent(session, text)
                 res = self.adapter.prompt(session, text, timeout=3600)
             else:
                 text = prompts.retry(failure)
+                self._sent(session, text)
                 res = self.adapter.follow_up(session, text, timeout=3600)
             self._log_transcript(role, text, res)
+            self._count_human_turns(session, subtask, res)
             reason = res.get("failure")
             if reason not in self.HOPS_TO_ANOTHER_SEAT:
                 break
@@ -1869,6 +1923,58 @@ class Orchestrator:
         res["cost_usd"], res["cost_estimated"] = round(usd, 6), True
         self.budget.spend(res["cost_usd"])
         return res["cost_usd"]
+
+    @staticmethod
+    def _sent(session, text):
+        """Remember a prompt, so a line in the pane that is not one of these can
+        be recognised as somebody else's."""
+        if session is not None:
+            session.sent.append(text)
+
+    def _count_human_turns(self, session, sub, res):
+        """Count the lines somebody typed into this job's pane while it worked.
+
+        `delegate` was written assuming it is the only writer of a session.
+        Pane mode is a real terminal, so that assumption stops holding the
+        moment a human uses the thing panes exist for. Measured and reported at
+        the gate, never rejected -- the same contract `file_scope` has, and for
+        the same reason: what to do about it is a judgement, and this program
+        does not make those.
+
+        Only a pane transcript is read (see `HerdrAdapter.prompt`), and the
+        lines already counted for this session are skipped, because the read is
+        a rolling window that returns the same scrollback every turn.
+
+        This does not yet separate unblocking from steering. Input arriving
+        while the session sits at herdr's waiting-on-human state is expected and
+        harmless; input arriving while it works is a downgrade of what this
+        program can claim about the result. The transcript does not carry the
+        state the line arrived in, so the count carries both and the brief says
+        so. orchestrator/docs/pane-mode-human-input.md has the field that would
+        fix it.
+        """
+        if sub is None or session is None or not res.get("pane_transcript"):
+            return
+        fresh = [(line, at) for line, at in
+                 foreign_input(res.get("output"), session.sent)
+                 if line not in session.counted]
+        if not fresh:
+            return
+        session.counted.update(line for line, _ in fresh)
+        stamps = [at for _, at in fresh if at]
+
+        def mark(state):
+            for s in state["subtasks"]:
+                if s["id"] == sub["id"]:
+                    ht = s.get("human_turns") or {"count": 0, "at": []}
+                    ht["count"] = int(ht.get("count") or 0) + len(fresh)
+                    # Only when the terminal stamped them. An invented time is
+                    # worse than none here: the whole value of the row is that
+                    # a reader can go and look at when it happened.
+                    ht["at"] = (ht.get("at") or []) + stamps
+                    s["human_turns"] = ht
+        self.task.mutate(mark)
+        self.log("  %s: %d human turn(s) typed into its pane" % (sub["id"], len(fresh)))
 
     def _log_transcript(self, role, prompt, res):
         """Keep what the agent was asked and what it said. An agent that does
