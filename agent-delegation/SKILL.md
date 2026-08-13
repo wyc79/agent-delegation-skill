@@ -189,7 +189,7 @@ before you trust the result.
 ```bash
 delegate init                                  # which seat serves which tier
 delegate run "<label>" --plan jobs.md          # dispatch
-delegate status                                # one line per task
+delegate status                                # one line per task, then per seat
 delegate show --brief                          # the merge-gate brief
 delegate approve --note "..."                  # answer the gate
 delegate resume --when-open                    # sleep out a quota window, then continue

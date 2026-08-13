@@ -489,11 +489,77 @@ def cmd_resume(args):
     sys.exit(0 if status == "done" else 1)
 
 
+def _seat_quota_lines(registry, cools, usage, now):
+    """One line per enrolled seat: how much of each metered window is left, and
+    when it reopens if it is shut.
+
+    Read-only, and nothing here meters anything. The router already counts
+    invocations against a window and prices a seat off the result -- that
+    number decided which provider ran your code, and the only place it surfaced
+    was `delegate channels`, a command a caller reaches for after something has
+    gone wrong rather than before.
+
+    It shows the windows THE STORE ACTUALLY METERS and no others. One `quota:`
+    block per channel means one window per seat today; a seat whose registry
+    entry carries no `est_capacity` has no meter at all, and says so rather than
+    rendering the 0.0 that `cooldown.utilization` returns for "unknown" as
+    "100% left". A fabricated headroom figure is worse than none: it is the
+    number a caller would decide to dispatch a wave on.
+    """
+    seats = []
+    for name, chan in sorted((registry.get("channels") or {}).items()):
+        if not isinstance(chan, dict) or chan.get("disabled"):
+            continue
+        # The same "enrolled" test `_conventions_audit` uses: a seat exposing
+        # nothing the router may pick is not a seat this deployment has.
+        if not any((registry.get("models") or {}).get(m, {}).get("enrolled")
+                   for m in (chan.get("exposes") or [])):
+            continue
+        q = chan.get("quota") or {}
+        cap = quota.parse_capacity(q.get("est_capacity"))
+        if cap:
+            util = cooldown.utilization(usage.get(name), q, now)
+            # Clamped: `utilization` is 0.0-1.0+, and "-12% left" reads as a
+            # bug rather than as a seat that is well past its estimate.
+            left = "%s window: %d%% left" % (
+                q.get("window") or "5h", round(max(0.0, 1.0 - util) * 100))
+        else:
+            left = "%s window: no capacity estimate" % (q.get("window") or "5h")
+        entry = cools.get(name)
+        shut = ("  [cooling until %s]" % _stamp(entry["reopen_at"])) if entry else ""
+        seats.append("%-14s %s%s" % (name, left, shut))
+    if not seats:
+        return []
+    return ["", "seats:"] + ["  " + s for s in seats] + [
+        "  (draw is estimated — providers expose no meter, so one invocation "
+        "counts as one unit)"]
+
+
+def _print_seat_quota(args, cools, usage, now):
+    """The seat block, on every `status` including one with no tasks.
+
+    Never fatal. `status` is a command a user reaches for when something is
+    already wrong, so a registry that will not load costs them the seat lines
+    and not the task lines -- the same rule `main` applies to a workflow
+    manifest that will not parse.
+    """
+    try:
+        reg = routing.load_registry(args.registry)
+    except (routing.RoutingError, yamlite.YamlError, OSError) as e:
+        print("\nseats: the registry could not be read (%s)" % e)
+        return
+    for line in _seat_quota_lines(reg, cools, usage, now):
+        print(line)
+
+
 def cmd_status(args):
     repo = _repo(args.repo)
     tasks = store.Task.list(repo)
+    now = time.time()
     if not tasks:
         print("no tasks for %s" % store.project_key(repo))
+        cools, usage, _ = cooldown.read(now)
+        _print_seat_quota(args, cools, usage, now)
         return
     # The breaker file is the truth and `park` only records why we stopped, so
     # this asks the same question `_quota_guard` does rather than reading the
@@ -501,8 +567,7 @@ def cmd_status(args):
     # `channels --clear`, and a window that simply reopened -- and reporting
     # from it left `status` saying "waiting on quota" beside a reopen time in
     # the past, for a task that `resume` would have run immediately.
-    now = time.time()
-    cools, _, warning = cooldown.read(now)
+    cools, usage, warning = cooldown.read(now)
     if warning:
         print("warning: %s" % warning)
     for t in tasks:
@@ -540,6 +605,7 @@ def cmd_status(args):
         if reopen and reopen > now:
             print("%-8s   %s reopens at %s" % (
                 "", ", ".join(sorted(still) or ["the seat"]), _stamp(reopen)))
+    _print_seat_quota(args, cools, usage, now)
 
 
 def cmd_show(args):

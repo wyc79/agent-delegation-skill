@@ -1266,6 +1266,139 @@ class TestChannelsCommand(unittest.TestCase):
         self.assertIn("25%", out, out)   # 10 of est_capacity 40
 
 
+class TestStatusShowsSeatQuota(unittest.TestCase):
+    """What is left on each seat, on the command a caller actually runs.
+
+    The router already meters invocations against each channel's window and
+    prices the seat off the result -- that number decided which provider ran
+    the work. It surfaced only in `delegate channels`, which is a command you
+    reach for after something has gone wrong. `status` is the one you run
+    before dispatching a wave, and it is the answer to "have I got the room".
+
+    Read-only by construction: `status` renders what the store already knows
+    and must not so much as touch the file it reads.
+    """
+
+    def setUp(self):
+        import time as _time
+        self.t = TempRepo()
+        self.now = _time.time()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def _status(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+
+        class Args:
+            repo, registry = self.t.repo, REGISTRY
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_status(Args())
+        return buf.getvalue()
+
+    def test_a_seeded_store_renders_the_remaining_window_per_seat(self):
+        # 34 of claude-seat's est_capacity 40 -> 15% left; 180 of cursor-seat's
+        # 500 over a monthly window -> 64%.
+        for i in range(34):
+            cooldown.record_use("claude-seat", 5 * 3600, self.now - i)
+        for i in range(180):
+            cooldown.record_use("cursor-seat", 30 * 86400, self.now - i * 3600)
+        out = self._status()
+        self.assertIn("  claude-seat    5h window: 15% left", out, out)
+        self.assertIn("  cursor-seat    monthly window: 64% left", out, out)
+        # Machine-tolerable: one seat per line, stable order, nothing coloured.
+        seats = [l for l in out.splitlines() if l.startswith("  claude-seat")
+                 or l.startswith("  cursor-seat")]
+        self.assertEqual([l.split()[0] for l in seats],
+                         ["claude-seat", "cursor-seat"], "seat order is not stable")
+        self.assertNotIn("\x1b", out, "status emitted a terminal escape")
+
+    def test_a_cooling_seat_says_when_it_reopens(self):
+        """The reopen time the classifier parsed out of the provider's own
+        message. Without it the line says a seat is empty and not when to come
+        back, which is the question the caller is actually asking."""
+        reopen = self.now + 4200
+        cooldown.open_breaker("claude-seat", "quota", reopen, self.now, "usage limit")
+        out = self._status()
+        self.assertIn("[cooling until %s]" % cli._stamp(reopen), out, out)
+        # And the seat that is fine is not decorated as if it were not.
+        cursor = [l for l in out.splitlines() if l.startswith("  cursor-seat")][0]
+        self.assertNotIn("cooling", cursor)
+
+    def test_an_unmetered_seat_shows_no_percentage_at_all(self):
+        """`cooldown.utilization` returns 0.0 for a channel with no capacity
+        estimate -- deliberately, so no estimate means no shadow price. Rendered
+        as a percentage that is "100% left", which is the fabricated number a
+        caller would decide to dispatch a wave on."""
+        reg = json.loads(json.dumps(self.reg))          # a deep copy of plain data
+        reg["channels"]["claude-seat"]["quota"] = {"window": "5h"}
+        lines = cli._seat_quota_lines(reg, {}, {}, self.now)
+        claude = [l for l in lines if "claude-seat" in l][0]
+        self.assertIn("no capacity estimate", claude)
+        self.assertNotIn("%", claude, "a seat with no meter was given a figure")
+
+    def test_a_seat_drawn_past_its_estimate_reads_as_empty_not_negative(self):
+        """The estimate is one invocation per unit and providers expose no
+        meter, so a seat can genuinely go past it. "-12% left" reads as a bug in
+        this program rather than as a seat well past its guess."""
+        usage = {"claude-seat": [self.now - i for i in range(60)]}   # 60 of 40
+        lines = cli._seat_quota_lines(self.reg, {}, usage, self.now)
+        claude = [l for l in lines if "claude-seat" in l][0]
+        self.assertIn("0% left", claude)
+        self.assertNotRegex(claude, r"-\d+%")
+
+    def test_a_seat_the_router_cannot_pick_is_not_listed(self):
+        reg = json.loads(json.dumps(self.reg))
+        reg["channels"]["cursor-seat"]["disabled"] = True
+        lines = cli._seat_quota_lines(reg, {}, {}, self.now)
+        self.assertTrue(any("claude-seat" in l for l in lines))
+        self.assertFalse(any("cursor-seat" in l for l in lines),
+                         "a disabled seat advertised headroom it will never serve")
+
+    def test_status_writes_nothing(self):
+        """The whole item is a render. A reporting command that mutated the
+        breaker file would change the routing of the next run by being looked
+        at, and `status` is the command a user runs repeatedly while waiting."""
+        cooldown.record_use("claude-seat", 5 * 3600, self.now)
+        before = {}
+        for root, _, names in os.walk(store.state_root()):
+            for n in names:
+                p = os.path.join(root, n)
+                with open(p, "rb") as fh:
+                    before[p] = fh.read()
+        self.assertTrue(before, "nothing was seeded, so this proves nothing")
+        self._status()
+        after = {}
+        for root, _, names in os.walk(store.state_root()):
+            for n in names:
+                p = os.path.join(root, n)
+                with open(p, "rb") as fh:
+                    after[p] = fh.read()
+        self.assertEqual(before, after, "`status` wrote to the state it reports on")
+
+    def test_the_seat_block_survives_a_registry_that_will_not_load(self):
+        """`status` is what a user runs when something is already broken. A bad
+        --registry may cost them the seat lines; it must not cost them the task
+        lines, which is the same rule `main` applies to a workflow manifest."""
+        import contextlib
+        import io
+        bad = os.path.join(self.t.dir, "bad.yaml")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("channels: [this is not a mapping\n")
+
+        class Args:
+            repo, registry = self.t.repo, bad
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_status(Args())
+        out = buf.getvalue()
+        self.assertIn("no tasks for", out, "the task half died with the seat half")
+        self.assertIn("registry could not be read", out)
+
+
 class TestResumeAtTheWindow(unittest.TestCase):
     def setUp(self):
         self.t = TempRepo()

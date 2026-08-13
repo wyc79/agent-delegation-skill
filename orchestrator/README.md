@@ -273,7 +273,7 @@ usable, rather than depending on a vendor binary being on PATH.
 ```bash
 orchestrator/delegate init                          # which seat serves which tier
 orchestrator/delegate run "add subtract" --plan jobs.md
-orchestrator/delegate status                        # tasks for this project
+orchestrator/delegate status                        # tasks, then room left per seat
 orchestrator/delegate show --brief                  # the merge-gate brief
 orchestrator/delegate approve --note "..."          # answer it
 orchestrator/delegate resume --id T-001             # continue a parked task
