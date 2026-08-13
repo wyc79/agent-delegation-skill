@@ -20,7 +20,14 @@ import time
 MAX_COOLDOWN = 14 * 24 * 3600
 
 # One table per agent_kind, so adding a provider is a data edit. Matched
-# case-insensitively against the CLI's combined stdout+stderr.
+# case-insensitively against `res["output"]`, which is whatever the adapter
+# decided this table is allowed to read -- NOT the raw stream. `runtime._result`
+# holds an agent's own words back: a CLI that returns a JSON envelope is
+# classified on the rest of that envelope (`error`, `subtype`, `is_error`) plus
+# stderr, with `result`/`output` removed, because those are definitionally the
+# agent talking and not the provider. A plain-text CLI has no envelope to split
+# on, so it is still classified on the whole stream; that residue is carried in
+# `fixtures/provider-messages.json` as the cases marked `wrong`.
 PATTERNS = {
     "claude": [
         r"usage limit reached",
