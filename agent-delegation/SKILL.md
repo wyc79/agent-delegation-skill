@@ -31,28 +31,26 @@ the pattern below by hand — git worktrees and your own agents — and it needs
 nothing from this repository. Same if `init` runs but enrolls a single provider.
 
 **On one seat, prefer your own parallel agents.** Measured head to head on the
-same jobs and the same model, dispatching through `delegate` costs meaningfully
-more than running a git worktree per job yourself, and buys you a merge gate, a
-scope report and caps — none of which need a second provider to be useful, and
-none of which are worth much if you were not going to read them.
+same jobs and the same model, dispatching through `delegate` cost roughly double
+a git worktree per job (`evidence/RESULTS.md`, arms D and F). What it buys is a
+merge gate, a scope report and caps — worth the overhead only if you were going
+to read them.
 
 The exception is a seat you actually run into walls. When one lands mid-job
 `delegate` commits what the agent had, records when the seat reopens, and
 resumes from that commit; doing it yourself, the CLI dies and the job restarts
 from nothing. If that is your situation, pay the overhead on one seat too.
 
-**On one seat `tier` also stops meaning anything.** Nothing here pins a model,
-so a band only routes differently when your *seats* expose different models.
-With one seat every band resolves to the same one, and a job you marked `t1` to
-keep it cheap runs on whatever that seat's CLI is configured with.
+**On one seat `tier` also stops meaning anything.** Nothing here pins a model, so
+a band only routes differently when your *seats* expose different ones — and a
+job you marked `t1` to keep it cheap runs on whatever that single seat's CLI is
+configured with.
 
 **Delegate when** two or more providers are enrolled *and* at least one holds:
 
 - Your own seat is the constraint — a quota wall you are about to hit, or work
   better served by a model on another provider. This is the strong reason.
-  Measured: a provider walled mid-job twice in one run, and the run still
-  finished at full marks — each time the partial work was committed, the seat
-  cooled, and the job continued on the other provider in the same worktree.
+  Measured: two mid-run walls, still full marks (`evidence/RESULTS.md`, arm E2).
   Nothing you can write yourself in an afternoon does that.
 - The jobs are genuinely independent and would run in parallel worktrees.
 - You want the jobs isolated from each other's context on purpose — though note
@@ -65,10 +63,7 @@ still settling what is wanted — all delegate badly.
 ### On one seat, do this instead
 
 The alternative is not "give up on parallelism" — it is the pattern that beats
-delegating on a single seat, and you can run it with tools you already have:
-a git worktree per job, every prompt drafted before any is sent so the agents
-go out in one message and run concurrently, then merge one at a time with your
-checks between.
+delegating on a single seat, run with tools you already have.
 
 **→ `references/one-seat.md`** has it in full: the exact git commands, the
 prompt shape, why `superpowers:subagent-driven-development`'s "never dispatch
@@ -108,14 +103,11 @@ Delegate reads a decomposition from a markdown file you write, passed with
 | `reads`, `frozen_interfaces`, `hotspots` | carried into the agent's prompt and the record. |
 
 **How big the job is, is part of the brief — and if you leave it out an agent
-will decide it for you.** Measured on the same task twice. Told to "implement
-`clip_triangle`", one agent planned a defensible smaller version — two of the
-six clipping planes, which the project's own stub comment calls usually enough
-— built exactly that, and **passed the whole test suite**. The run that spelled
-out "the six clip-space faces" got all six.
-
-Neither agent was careless. The first was never told where the line was, so it
-drew one, and every signal available said it had succeeded.
+will decide it for you.** Told to "implement `clip_triangle`", one agent built
+two of the six clipping planes and **passed the whole test suite**; the run that
+spelled out "the six clip-space faces" got all six. Nothing was careless about
+it — the first was never told where the line was, so it drew one, and every
+signal available said it had succeeded. (`evidence/RESULTS.md` has the pair.)
 
 So: if a job could be satisfied by something smaller than you have in mind, the
 checks will not tell you — they pass, and a scope report only covers files, not
@@ -148,13 +140,10 @@ briefing: [docs/conventions.md, docs/testing.md]
 A separate block from the job list, paths relative to the repo. Every job's
 prompt lists them as required reading before it starts; the paths are validated
 before anything is dispatched, so a wrong one costs you a message rather than N
-confused agents. Paths, not contents — the file is the source of truth, the
-agent is in a checkout that has it, and a pasted copy goes stale.
+confused agents. Paths, not contents — a pasted copy goes stale.
 
-**They must be committed, and that is checked.** The same worktree rule applies
-here as to `CLAUDE.md`: a briefing file you have written but not committed is in
-your checkout and in none of theirs, so every job would be told to read a file
-it cannot see. Untracked is refused exactly like missing — `git add` it and
+**They must be committed, and that is checked.** Same worktree rule as
+`CLAUDE.md`: untracked is refused exactly like missing — `git add` it and
 re-run.
 
 **Disjoint `file_scope` is what buys parallelism.** Two jobs whose scopes
@@ -181,21 +170,19 @@ Mixing tiers within one batch is normal and is where this earns its cost: the
 hard job draws the strong model on one provider while the easy ones run
 concurrently on another.
 
-**The band is a preference under failover too, and that is the sharp edge.**
-When a seat walls mid-job, the replacement is asked for at least the walled
-model's reasoning score. If no seat left can hold that floor, the floor is
-dropped and the job continues on whatever is best remaining — **weaker than what
-you asked for.** It is the right call for finishing the work and the wrong one
-to discover later, so know where it shows: the run log says *"no seat left at X's
-strength — continuing on Y, which is weaker."* The merge brief does not. It
-reports spend per model, so a `t3` job that ran on the workhorse is inferable
-from the rows, but nothing states the band was abandoned.
+**The band is a preference under failover too, and that is the sharp edge.** A
+replacement is asked for at least the walled model's strength, but when no seat
+left can hold that floor it is dropped and the job continues on whatever is best
+remaining — **weaker than what you asked for.** Know where that shows: the run
+log says *"no seat left at X's strength — continuing on Y, which is weaker."*
+The merge brief does not. It reports spend per model, so the demotion is
+inferable from the rows and stated by nothing.
 
 The case that bites is a band only one seat can serve — `t3` where a single
-provider exposes the strong model. Wall that seat and there is no equal
-replacement by construction, so the demotion is not an edge case, it is the
-default outcome. If a job is `t3` because a cheaper model gets it *silently*
-wrong, check the log before you trust the result.
+provider exposes the strong model. There is then no equal replacement by
+construction, so the demotion is the default outcome rather than an edge case.
+If a job is `t3` because a cheaper model gets it *silently* wrong, check the log
+before you trust the result.
 
 ## Running it
 
