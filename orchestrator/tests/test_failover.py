@@ -1374,5 +1374,163 @@ class TestResumeAtTheWindow(unittest.TestCase):
                          "budget_exhausted", "the guard cleared a park it does not own")
 
 
+class TestCorpusCapture(unittest.TestCase):
+    """A real wall is a test case, and collecting them was a chore nobody did.
+
+    `fixtures/provider-messages.json` says so about itself: its cases are
+    written from provider error formats, not recorded from runs, and detection
+    is the one judgement this program makes on its own account. So a live run
+    now writes down every wall it classifies, and somebody promotes the useful
+    ones by hand.
+
+    Exhaust, not a feature. Nothing reads the file back, and nothing about the
+    run changes if it cannot be written.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+
+    def tearDown(self):
+        self.t.close()
+
+    def _lines(self):
+        from adg import corpus
+        if not os.path.exists(corpus.path()):
+            return []
+        with open(corpus.path(), encoding="utf-8") as fh:
+            return [json.loads(x) for x in fh if x.strip()]
+
+    def _wall(self, message=QUOTA_MSG):
+        """One job that walls on its first seat and finishes on the second --
+        the shape TestFailoverEndToEnd drives, run for its side effect."""
+        state = {"seen": []}
+
+        def implementer(env, cwd):
+            state["seen"].append(cwd)
+            if len(state["seen"]) == 1:
+                return blocked(message)
+            with open(os.path.join(cwd, "app.py"), "a") as fh:
+                fh.write("\ndef subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "subtask": "st-1-main",
+                "status": "complete", "summary": "added subtract",
+                "evidence": {"tests": "green"}})
+            return None
+
+        task = store.Task.create(self.t.repo, "T-CAP", "# t\n\n- **AC-1** — x\n",
+                                 self.pol)
+        task.write_text("plan.md", PLAN_MD)
+        logs = []
+        status = Orchestrator(task, self.reg,
+                              runtime.MockAdapter({"implementer": implementer},
+                                                  now=lambda: T0),
+                              lambda k, x: True, log=logs.append,
+                              clock=lambda: T0).run()
+        return status, logs
+
+    def test_a_wall_writes_one_well_formed_line(self):
+        status, logs = self._wall()
+        self.assertEqual(status, "done", "\n".join(logs))
+        lines = self._lines()
+        self.assertEqual(len(lines), 1, "expected exactly one capture: %s" % lines)
+        rec = lines[0]
+        walled = _seats(self.reg)[0]
+        self.assertEqual(rec["verdict"], "quota_exhausted")
+        self.assertEqual(rec["adapter"], "mock")
+        self.assertEqual(rec["channel"], walled)
+        # Read from the registry rather than named here: the agent kind is the
+        # only field a promoted case is keyed on, so it has to be the kind that
+        # actually walled, not the one this test expected to go first.
+        self.assertEqual(rec["kind"], self.reg["channels"][walled]["agent_kind"])
+        self.assertIn(rec["model"], self.reg["models"])
+        # The message said "reset in 2 hours", and the point of keeping it is
+        # that a promoted case can be written as {T0+N}.
+        self.assertEqual(rec["reset_in_s"], 2 * 3600)
+        self.assertEqual(rec["reset_at"], T0 + 2 * 3600)
+        self.assertIn("usage limit reached", rec["text"])
+        # Everything a hand-promotion needs, so the promotion recipe in the
+        # corpus file cannot ask for a field that is not written.
+        for field in ("at", "kind", "text", "verdict", "reset_in_s"):
+            self.assertIn(field, rec)
+
+    def test_the_captured_text_is_redacted(self):
+        home = os.path.expanduser("~")
+        secret = "sk-" + "A1b2C3d4E5f6G7h8"
+        status, logs = self._wall(
+            "Error: Claude AI usage limit reached. Your limit will reset in 2 "
+            "hours. context=%s/work/proj/app.py user=ada@example.com "
+            "auth=%s" % (home, secret))
+        self.assertEqual(status, "done", "\n".join(logs))
+        text = self._lines()[0]["text"]
+        self.assertNotIn(home, text, "a home path reached the capture file")
+        self.assertNotIn("ada@example.com", text, "an address reached the file")
+        self.assertNotIn(secret, text, "a key-shaped string reached the file")
+        self.assertIn("<path>", text)
+        self.assertIn("<email>", text)
+        self.assertIn("<key>", text)
+        # And the part the corpus is actually for survives the scrubbing.
+        self.assertIn("usage limit reached", text)
+
+    def test_an_unwritable_capture_path_does_not_touch_the_run(self):
+        """Exhaust must never be load-bearing. The state root is where the
+        breaker also lives, and that failure is already reported to the run --
+        this one is not even that: the line is lost and the run cannot tell."""
+        from adg import corpus
+        os.makedirs(os.path.dirname(corpus.path()), exist_ok=True)
+        # A directory where the file goes: open(..., "a") cannot win, on every
+        # platform, without depending on chmod semantics or on not being root.
+        os.makedirs(corpus.path(), exist_ok=True)
+        status, logs = self._wall()
+        self.assertEqual(status, "done",
+                         "an unwritable capture path changed the run:\n"
+                         + "\n".join(logs))
+        self.assertTrue(any("failover:" in x for x in logs),
+                        "the failover itself stopped working")
+        self.assertFalse(any("corpus" in x.lower() for x in logs),
+                         "capture complained into the run log")
+
+    def test_an_ordinary_crash_captures_nothing(self):
+        """A corpus that fills up on ordinary failures is a corpus nobody
+        trusts. A stack trace says nothing about a provider's quota, and
+        `quota.classify` calls it `other` for exactly that reason -- the capture
+        hangs off `_cool`, which only a wall reaches."""
+        def implementer(env, cwd):
+            return blocked("Traceback (most recent call last):\n"
+                           "ValueError: limit is not a number")
+
+        task = store.Task.create(self.t.repo, "T-NOCAP", "# t\n\n- **AC-1** — x\n",
+                                 self.pol)
+        task.write_text("plan.md", PLAN_MD)
+        Orchestrator(task, self.reg,
+                     runtime.MockAdapter({"implementer": implementer},
+                                         now=lambda: T0),
+                     lambda k, x: True, log=lambda *_: None, clock=lambda: T0).run()
+        self.assertEqual(self._lines(), [],
+                         "a crash was filed as a provider wall")
+
+    def test_redaction_is_not_asked_to_be_clever(self):
+        """Unit-level, because the promise in the docstring is a bounded one:
+        these shapes and no others. A test that asserted 'no secrets' would be
+        claiming something stdlib regex cannot deliver."""
+        from adg import corpus
+        got = corpus.redact(
+            "path /home/ada/x.py and C:\\Users\\ada\\y.py, mail a.b@c.co, "
+            "ghp_abcdefghij1234567890, Bearer abcdefghijklmnop, "
+            "and " + "z" * 44)
+        self.assertNotIn("/home/ada", got)
+        self.assertNotIn("Users\\ada", got)
+        self.assertNotIn("a.b@c.co", got)
+        self.assertNotIn("ghp_abcdefghij", got)
+        self.assertNotIn("z" * 44, got)
+        self.assertIn("Bearer <key>", got)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-from . import (brief, cooldown, limits as lim, prompts, quota,
+from . import (brief, cooldown, corpus, limits as lim, prompts, quota,
                router as routing, schema, verify, workflow as wf, yamlite)
 from .store import git
 
@@ -1583,6 +1583,17 @@ class Orchestrator:
         self._breaker_write(
             cooldown.open_breaker(choice.channel, "quota", at, self.clock(),
                                   detail=(res.get("output") or "")[-200:]))
+        # And keep the message. This is the only moment a real provider wall is
+        # in scope with everything needed to write it down -- the text the
+        # pattern table read, the seat, the model, and how the reset time came
+        # out -- and every one of them is a test case somebody would otherwise
+        # have to invent. `capture` cannot raise and its answer is ignored:
+        # exhaust, not a feature the run depends on.
+        corpus.capture("quota_exhausted", choice.agent_kind,
+                       res.get("classified_text") or res.get("output"),
+                       reset_at=res.get("reset_at"), now=self.clock(),
+                       adapter=self.adapter.name, channel=choice.channel,
+                       model=choice.model)
         return at
 
     def _breaker_write(self, warning):
