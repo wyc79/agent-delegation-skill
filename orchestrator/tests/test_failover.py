@@ -1164,6 +1164,44 @@ class TestFailoverEndToEnd(unittest.TestCase):
         self.assertEqual(status, "done", "\n".join(logs))
         self.assertTrue(any("failover:" in x for x in logs), "\n".join(logs))
 
+    def test_a_failover_that_drops_the_band_is_recorded_and_briefed(self):
+        """The other demotion site, and the one SKILL.md calls the default
+        outcome rather than the edge case: `t3` is served by one seat only, so
+        walling it means there is no equal replacement by construction. The
+        floor is dropped, the work finishes on the workhorse, and the brief has
+        to say which job that happened to."""
+        plan = ('# Plan\n\n```yaml\n- id: st-1-main\n'
+                '  goal: Add a subtract function to app.py\n'
+                '  file_scope: ["app.py"]\n  tier: t3\n```\n')
+        state = {"seen": []}
+
+        def implementer(env, cwd):
+            state["seen"].append(cwd)
+            if len(state["seen"]) == 1:
+                return blocked(QUOTA_MSG)
+            with open(os.path.join(cwd, "app.py"), "a") as fh:
+                fh.write("\ndef subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "subtask": "st-1-main",
+                "status": "complete", "summary": "added subtract",
+                "evidence": {"tests": "green"}})
+            return None
+
+        task, status, logs = self._run({"implementer": implementer}, plan=plan)
+        self.assertEqual(status, "done", "\n".join(logs))
+        got = task.state["subtasks"][0].get("demotions") or []
+        self.assertEqual(len(got), 1,
+                         "the failover demotion was not recorded:\n"
+                         + "\n".join(logs))
+        self.assertEqual(got[0]["asked"], "t3")
+        self.assertIn("opus-class-strong", got[0]["reason"])
+        self.assertNotEqual(got[0]["model"], "opus-class-strong",
+                            "recorded a demotion to the model it started on")
+        from adg import brief
+        text = brief.render(task, "merge", "Land it?")
+        self.assertIn("ran below the band", text)
+        self.assertIn(got[0]["model"], text.split("ran below the band")[1])
+
     def test_the_quota_failure_costs_no_attempt(self):
         # AC-1: a quota failure is the channel's fault, not the approach's.
         _, script = self._script(quota_first=True)

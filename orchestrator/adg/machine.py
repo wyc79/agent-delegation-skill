@@ -846,6 +846,8 @@ class Orchestrator:
             choice = self._pick()
             self.log("  %s: asked for tier %s and nothing enrolled serves it — "
                      "running on %s (%s)" % (sub["id"], tier, choice.model, e))
+            self._record_demotion(sub, tier, choice,
+                                  "nothing enrolled serves that band")
             return choice
 
     def _run_wave(self, wave):
@@ -1738,7 +1740,7 @@ class Orchestrator:
             # Excluded explicitly as well as through the breaker: if the state
             # file could not be written, the loop must still terminate.
             try:
-                nxt = self._replacement(role, choice, cooled)
+                nxt = self._replacement(role, choice, cooled, subtask=subtask)
             except routing.NoModelAvailable:
                 # Every seat has now been tried. Say what actually happened
                 # rather than letting this reach the generic handler as a
@@ -1813,7 +1815,34 @@ class Orchestrator:
         # it gets to close -- which is most of the ways `_one_subtask` can end.
         return session, report, choice
 
-    def _replacement(self, role, choice, cooled):
+    def _record_demotion(self, sub, asked, choice, reason):
+        """A job is about to run below the band its caller asked for.
+
+        Written at the moment the routing decision is made, because that is the
+        only moment the reason exists: by the time the brief is assembled all
+        that is left is a spend row on a model nobody asked for, and inferring
+        intent from a price is exactly the reading SKILL.md used to ask people
+        to do. Two sites reach here -- a band nothing enrolled can serve, and a
+        failover that could not hold the walled model's floor -- and both are
+        advisory by design. The work continues; this is the record that it
+        continued on something weaker.
+
+        Appended, never replaced. A job can be demoted at dispatch and demoted
+        again on a hop, and the second one is not a correction of the first.
+        """
+        if sub is None:
+            return
+
+        entry = {"asked": asked, "model": choice.model, "seat": choice.channel,
+                 "reason": reason}
+
+        def mark(state):
+            for s in state["subtasks"]:
+                if s["id"] == sub["id"]:
+                    s["demotions"] = (s.get("demotions") or []) + [entry]
+        self.task.mutate(mark)
+
+    def _replacement(self, role, choice, cooled, subtask=None):
         """The same strength on another seat.
 
         A quota hop must not quietly downgrade the job. The caller asked for a
@@ -1831,6 +1860,9 @@ class Orchestrator:
             nxt = self._pick(role, exclude=tuple(cooled))
             self.log("  note: no seat left at %s's strength — continuing on %s, "
                      "which is weaker" % (choice.model, nxt.model))
+            self._record_demotion(
+                subtask, (subtask or {}).get("tier"), nxt,
+                "no seat left at %s's strength" % choice.model)
             return nxt
 
     def _salvage(self, cwd, role, subtask):

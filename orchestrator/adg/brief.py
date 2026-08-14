@@ -158,6 +158,42 @@ def _by_job(state, limit=8):
     return rows
 
 
+def _demotions(state):
+    """Jobs that ran below the band they asked for.
+
+    The machine says this in the run log at the moment it happens and the brief
+    used to say nothing, so a reader was left inferring it from the spend rows
+    -- "a t3 job that ran on the workhorse is inferable from the rows" -- which
+    is reading intent out of a price. It also fails exactly where it matters
+    most: a run in panes reports no cost at all, so there are no rows to infer
+    from. This reads the routing record instead, which every mode writes.
+
+    Empty means empty. A section of "none" over a run where every job got the
+    band it asked for is a caveat that fires on clean runs, and those are the
+    ones nobody reads -- the same rule the scope and human-turns sections
+    follow.
+    """
+    rows = []
+    for sub in (state.get("subtasks") or []):
+        for d in (sub.get("demotions") or []):
+            asked = d.get("asked")
+            rows.append("| %s | %s | `%s` on %s | %s |" % (
+                sub.get("id", "?"),
+                "`%s`" % asked if asked else "no band named",
+                d.get("model", "?"), d.get("seat", "?"),
+                d.get("reason", "unrecorded")))
+    if not rows:
+        return []
+    return ["## Jobs that ran below the band they asked for", "",
+            "| Job | Asked | Ran on | Why |", "|---|---|---|---|"] + rows + [
+        "",
+        "The band is a preference, not a pin, so this is the right call for "
+        "finishing the work and the wrong one to find out later — which is why "
+        "it is here rather than only in the run log. Nothing was blocked and "
+        "nothing was retried: if a job asked for the strong model because a "
+        "cheaper one gets it silently wrong, that judgement is yours.", ""]
+
+
 def _cost_section(state):
     """Who actually did the work, and what it cost. Users should not have to
     open task.json to find out which provider ran their code, and an unreported
@@ -256,6 +292,11 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
         md += ["## What changed", ""] + per_job + [""]
     elif files:
         md += ["## What changed", ""] + _files_by_area(list(files)) + [""]
+
+    # Before the evidence, because it qualifies what the evidence is worth: a
+    # green check on a job that ran a band below the one it was given is a
+    # weaker claim than the same check on a job that got what it asked for.
+    md += _demotions(state)
 
     if verify is not None:
         md += ["## Evidence", "", "- Automated checks: %s." % verify.summary()]

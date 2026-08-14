@@ -4007,6 +4007,111 @@ stages:
 
 
 
+class TestBriefStatesTheDemotion(unittest.TestCase):
+    """A job that ran below the band it asked for has to say so at the gate.
+
+    The machine logs it the moment it happens and the brief said nothing, so
+    SKILL.md taught readers to infer it from the spend rows -- reading intent
+    out of a price, for the outcome it calls "the right call for finishing the
+    work and the wrong one to discover later". The inference also breaks
+    exactly where it matters most: a run in panes reports no cost at all, so
+    there are no rows to infer from.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        self.t.close()
+
+    def _brief(self, subtasks, history=()):
+        task = _task(self.t.repo, "T-DM", "# t\n\ndo it\n",
+                     self.reg["policy"]["limits"])
+        task.update(subtasks=subtasks, delegation_history=list(history))
+        return brief.render(task, "merge", "Land it?")
+
+    def test_a_demoted_job_gets_a_row_naming_the_band_and_the_reason(self):
+        out = self._brief([
+            {"id": "st-1-alpha", "actual_files": ["a.py"], "scope_violations": []},
+            {"id": "st-2-beta", "actual_files": ["b.py"], "scope_violations": [],
+             "demotions": [{"asked": "t3", "model": "balanced-coder",
+                            "seat": "cursor-seat",
+                            "reason": "no seat left at opus-class-strong's strength"}]},
+        ])
+        self.assertIn("ran below the band", out, "no demotion section")
+        row = [l for l in out.splitlines() if l.startswith("| st-2-beta")]
+        row = [l for l in row if "balanced-coder" in l]
+        self.assertTrue(row, "the demoted job has no row:\n%s" % out)
+        self.assertIn("`t3`", row[0], "the row does not say what was asked for")
+        self.assertIn("cursor-seat", row[0], "the row does not name the seat")
+        self.assertIn("opus-class-strong", row[0], "the row does not say why")
+        self.assertNotIn("| st-1-alpha |", out.split("ran below the band")[1],
+                         "a job that got its band was listed as demoted")
+        self.assertEqual(brief.lint(out), [], "the section trips the jargon lint")
+
+    def test_a_clean_run_gets_no_section_at_all(self):
+        out = self._brief([{"id": "st-1-alpha", "actual_files": ["a.py"],
+                            "scope_violations": []}])
+        self.assertNotIn("ran below the band", out,
+                         "a caveat fired on a run where nothing was demoted")
+
+    def test_the_row_does_not_depend_on_spend_accounting(self):
+        """The case the old inference could never cover. Agents in panes report
+        no cost, so `delegation_history` carries no `usd` and the model rows
+        that a reader was supposed to infer from are absent."""
+        out = self._brief(
+            [{"id": "st-1-alpha", "actual_files": ["a.py"], "scope_violations": [],
+              "demotions": [{"asked": "t3", "model": "fast-cheap",
+                             "seat": "cursor-seat",
+                             "reason": "nothing enrolled serves that band"}]}],
+            history=[{"stage": "implement", "role": "implementer",
+                      "model": "fast-cheap", "channel": "cursor-seat",
+                      "adapter": "herdr", "panes": True, "outcome": "complete",
+                      "usd": None}])
+        self.assertIn("cannot be measured in a pane", out,
+                      "this fixture is not actually the no-cost case")
+        self.assertIn("ran below the band", out,
+                      "the demotion row needs spend data to appear")
+        self.assertIn("fast-cheap", out.split("ran below the band")[1])
+
+    # --- and the machine has to write it, at both sites -------------------
+    def test_a_band_nothing_serves_is_recorded_at_dispatch(self):
+        """`_pick_worker`'s advisory demotion. `t3` is served by
+        opus-class-strong; un-enroll it and the band has nobody."""
+        reg = json.loads(json.dumps(self.reg))
+        for name, spec in reg["models"].items():
+            if spec.get("tier") == "t3":
+                spec["enrolled"] = False
+        plan = ('# p\n\n```yaml\n- id: st-1-subtract\n'
+                '  goal: Add subtract to app.py\n  file_scope: ["app.py"]\n'
+                '  tier: t3\n```\n')
+        task = _task(self.t.repo, "T-DM2", "# t\n\nAdd subtract\n",
+                     reg["policy"]["limits"], plan=plan)
+
+        def implementer(env, cwd):
+            _spit(os.path.join(cwd, "app.py"),
+                  "def add(a, b):\n    return a + b\n\n"
+                  "def subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"],
+                    "implement-st-1-subtract.json",
+                    {"stage": "implement", "role": "implementer",
+                     "subtask": "st-1-subtract", "status": "complete",
+                     "summary": "added subtract", "evidence": {"tests": "ok"}})
+
+        logs = []
+        status = Orchestrator(task, reg,
+                              runtime.MockAdapter({"implementer": implementer}),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        got = task.state["subtasks"][0].get("demotions") or []
+        self.assertEqual(len(got), 1, "the dispatch-time demotion was not recorded")
+        self.assertEqual(got[0]["asked"], "t3")
+        self.assertIn("nothing enrolled", got[0]["reason"])
+        self.assertIn("ran below the band",
+                      brief.render(task, "merge", "Land it?"))
+
+
 class TestPaneModeHumanTurns(unittest.TestCase):
     """Somebody typed into a running job's pane.
 

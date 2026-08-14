@@ -173,10 +173,9 @@ concurrently on another.
 **The band is a preference under failover too, and that is the sharp edge.** A
 replacement is asked for at least the walled model's strength, but when no seat
 left can hold that floor it is dropped and the job continues on whatever is best
-remaining — **weaker than what you asked for.** Know where that shows: the run
-log says *"no seat left at X's strength — continuing on Y, which is weaker."*
-The merge brief does not. It reports spend per model, so the demotion is
-inferable from the rows and stated by nothing.
+remaining — **weaker than what you asked for.** The merge brief states it
+outright: a row per job that ran below its band, naming the model and the
+reason.
 
 The case that bites is a band only one seat can serve — `t3` where a single
 provider exposes the strong model. There is then no equal replacement by
