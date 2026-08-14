@@ -1,6 +1,7 @@
 """`delegate` — the MVP orchestrator CLI."""
 
 import argparse
+import calendar
 import os
 import signal
 import sys
@@ -8,7 +9,7 @@ import time
 
 import json
 
-from . import (cooldown, limits as lim, quota, router as routing,
+from . import (cooldown, corpus, limits as lim, quota, router as routing,
                runtime, store, verify, workflow as wf, yamlite)
 
 
@@ -608,6 +609,87 @@ def cmd_status(args):
     _print_seat_quota(args, cools, usage, now)
 
 
+BUNDLE_SECTIONS = ("task.json", "run.log", "brief.md", "corpus-capture.jsonl")
+
+
+def _bundle_text(task, capture_lines):
+    """The four things a diagnosis needs, in one file, all of it scrubbed.
+
+    Concatenated text rather than a tarball on purpose: this is written to be
+    pasted into a conversation with somebody -- or something -- that is going
+    to read it, and asking that reader to unpack an archive first is a step
+    that buys nothing. Section headers are fixed strings so the reader can find
+    its way without being told the format.
+    """
+    out = []
+    for name in BUNDLE_SECTIONS:
+        out.append("=" * 72)
+        out.append("=== %s" % name)
+        out.append("=" * 72)
+        if name == "corpus-capture.jsonl":
+            body = "\n".join(capture_lines) or "(no provider walls during this run)"
+        else:
+            body = task.read_text(name, "(not written)")
+        # Every section, including the ones this program wrote itself. A run log
+        # quotes provider messages and agent output, and task.json holds
+        # absolute paths under the user's home -- the bundle is built to be
+        # shared, so nothing gets a pass for being ours.
+        out.append(corpus.redact(body).rstrip("\n"))
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def _capture_lines_for(task):
+    """Capture records stamped inside this run's window.
+
+    The capture file is machine-wide and long-lived -- a seat's quota belongs
+    to the seat, not to a repository -- so shipping the whole thing would put
+    other projects' walls into this task's bundle. Bounded by the run log's own
+    span, which is the only record of when this task was actually running.
+    """
+    try:
+        with open(corpus.path(), encoding="utf-8") as fh:
+            raw = [x.strip() for x in fh if x.strip()]
+    except OSError:
+        return []
+    stamps = []
+    for line in (task.read_text("run.log", "") or "").splitlines():
+        head = line[:19]
+        try:
+            stamps.append(time.mktime(time.strptime(head, "%Y-%m-%d %H:%M:%S")))
+        except ValueError:
+            continue
+    if not stamps:
+        return []
+    # A minute of slack each side: the log stamps local wall clock at the
+    # moment a line is written, the capture stamps UTC at the moment a wall is
+    # classified, and the two are not written by the same call.
+    lo, hi = min(stamps) - 60, max(stamps) + 60
+    keep = []
+    for line in raw:
+        try:
+            at = json.loads(line).get("at")
+            when = calendar.timegm(time.strptime(at, "%Y-%m-%dT%H:%M:%SZ"))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if lo <= when <= hi:
+            keep.append(line)
+    return keep
+
+
+def cmd_bundle(args):
+    """One shareable file holding everything a diagnosis needs."""
+    repo = _repo(args.repo)
+    task = store.Task.open(repo, args.id)
+    text = _bundle_text(task, _capture_lines_for(task))
+    out = args.out or task.file("bundle.txt")
+    with open(out, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    # The path and nothing else: this is a command whose output is a filename,
+    # and anything else printed beside it has to be stripped by whoever pipes it.
+    print(out)
+
+
 def cmd_show(args):
     repo = _repo(args.repo)
     task = store.Task.open(repo, args.id)
@@ -702,6 +784,13 @@ def main(argv=None):
     sh.add_argument("--id")
     sh.add_argument("--brief", action="store_true")
     sh.set_defaults(func=cmd_show)
+
+    bd = sub.add_parser("bundle", help="one shareable file: state, run log, "
+                                       "brief and any provider walls")
+    bd.add_argument("id", nargs="?", help="task id (default: the only one)")
+    bd.add_argument("--out", metavar="FILE",
+                    help="where to write it (default: bundle.txt in the task dir)")
+    bd.set_defaults(func=cmd_bundle)
 
     ch = sub.add_parser("channels", help="quota cooldowns and draw per channel")
     ch.add_argument("--clear", metavar="NAME",

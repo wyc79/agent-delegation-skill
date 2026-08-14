@@ -126,13 +126,17 @@ def classify(res, kind, now=None, text=None):
     failure, reset_at = quota.classify(
         kind, probe, now if now is not None else time.time())
     res["failure"], res["reset_at"] = failure, reset_at
-    # Carried only on a wall, and read only by the corpus capture in
-    # `machine._cool`. Nothing routes on it. It exists because the text the
-    # PATTERN TABLE saw is not the text the log keeps -- the local path holds
-    # the agent's own prose back from classification -- so a corpus built from
-    # `output` would be a corpus of a different question from the one detection
-    # is asked.
-    if failure == "quota_exhausted":
+    # Carried on any failure, and read only by the corpus capture and the run
+    # log. Nothing routes on it. It exists because the text the PATTERN TABLE
+    # saw is not the text the log keeps -- the local path holds the agent's own
+    # prose back from classification -- so a record built from `output` would
+    # be a record of a different question from the one detection was asked.
+    #
+    # Every failure, not only a wall: the run log has to be able to show why a
+    # message was read as `other`, and "here is what it read" is most of that
+    # answer. An adapter that classifies nothing sets nothing, and that absence
+    # is itself the record -- see `settle_unclassified`.
+    if failure:
         res["classified_text"] = probe.get("output")
     return res
 

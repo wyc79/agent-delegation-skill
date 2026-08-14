@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from adg import cli, cooldown, quota, router, runtime, store     # noqa: E402
 from adg.machine import Orchestrator                             # noqa: E402
-from test_orchestrator import REGISTRY, TempRepo, _report, sh    # noqa: E402,F401
+from test_orchestrator import (REGISTRY, TempRepo, _report, _slurp,  # noqa: E402,F401
+                               sh)
 
 T0 = 1754800000.0        # a fixed epoch; every test clock starts here
 
@@ -1474,6 +1475,173 @@ class TestChannelsCommand(unittest.TestCase):
             cooldown.record_use("claude-seat", 5 * 3600, self.now - i)
         out = self._run(["channels"])
         self.assertIn("25%", out, out)   # 10 of est_capacity 40
+
+
+class TestRunLogAndBundle(unittest.TestCase):
+    """The record a real quota wall gets diagnosed from, hours later.
+
+    The bar is that somebody -- or something -- reading the bundle alone, with
+    no follow-up questions available, can reconstruct which seats existed,
+    every routing decision AND ITS INPUTS, every classification and what text
+    it saw, every failover hop, and the final brief. Outcomes alone do not
+    clear that bar: "picked cursor-seat" does not say why claude-seat lost, and
+    the numbers that decided it existed for one instant.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+
+    def tearDown(self):
+        self.t.close()
+
+    def _run(self, wall=False, message=QUOTA_MSG):
+        state = {"seen": []}
+
+        def implementer(env, cwd):
+            state["seen"].append(cwd)
+            if wall and len(state["seen"]) == 1:
+                return blocked(message)
+            with open(os.path.join(cwd, "app.py"), "a") as fh:
+                fh.write("\ndef subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "subtask": "st-1-main",
+                "status": "complete", "summary": "added subtract",
+                "evidence": {"tests": "green"}})
+            return None
+
+        task = store.Task.create(self.t.repo, "T-LOG", "# t\n\n- **AC-1** — x\n",
+                                 self.pol)
+        task.write_text("plan.md", PLAN_MD)
+        logs = []
+        status = Orchestrator(task, self.reg,
+                              runtime.MockAdapter({"implementer": implementer},
+                                                  now=lambda: T0),
+                              lambda k, x: True, log=logs.append,
+                              clock=lambda: T0).run()
+        return task, status, logs
+
+    def test_the_run_log_persists_everything_stdout_saw(self):
+        task, status, logs = self._run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        text = task.read_text("run.log")
+        for line in logs:
+            self.assertIn(line, text,
+                          "a line reached stdout and not the record: %r" % line)
+        self.assertRegex(text, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  ",
+                         "the record carries no wall-clock stamps")
+
+    def test_routing_records_its_inputs_not_only_its_pick(self):
+        """The headroom numbers and the shadow prices, as the router saw them.
+        Neither is recoverable afterwards: a seat that was 4% from a wall looks
+        identical in channels.json an hour after it reopened."""
+        for i in range(12):
+            cooldown.record_use("claude-seat", 5 * 3600, T0 - i)
+        task, _, _ = self._run()
+        text = task.read_text("run.log")
+        self.assertIn("routing:", text)
+        self.assertIn("seats as the router saw them:", text)
+        self.assertIn("window:", text, "no per-window figure was recorded")
+        self.assertRegex(text, r"headroom: .*~\d+",
+                         "no headroom number reached the record")
+        self.assertRegex(text, r"by shadow price: .*\d+\.\d\d",
+                         "no shadow price reached the record")
+        self.assertRegex(text, r"picked: \S+ on \S+")
+
+    def test_the_seat_block_is_the_status_renderer_not_a_second_opinion(self):
+        """Reused, not duplicated. Two renderings of one number drift, and the
+        day they disagree the log is the one nobody can check."""
+        import inspect
+        from adg import machine as m
+        self.assertIn("_seat_quota_lines",
+                      inspect.getsource(m.Orchestrator._log_routing))
+
+    def test_classification_records_the_text_it_actually_read(self):
+        task, _, logs = self._run(wall=True)
+        text = task.read_text("run.log")
+        self.assertIn("classification:", text)
+        self.assertIn("quota_exhausted", text)
+        self.assertIn("it read:", text, "the verdict was recorded without its input")
+        self.assertIn("usage limit reached", text,
+                      "the classified text is absent, so the verdict cannot be checked")
+
+    def test_a_hop_is_one_line_carrying_the_whole_narrative(self):
+        task, status, logs = self._run(wall=True)
+        self.assertEqual(status, "done", "\n".join(logs))
+        hops = [l for l in task.read_text("run.log").splitlines() if "hop:" in l]
+        self.assertEqual(len(hops), 1, "expected one hop line, got %s" % hops)
+        line = hops[0]
+        for part in ("walled on", "reopens", "respawned on", "resumes from"):
+            self.assertIn(part, line, "the hop line drops %r: %s" % (part, line))
+
+    def test_a_redacted_string_does_not_survive_into_the_bundle(self):
+        task, _, _ = self._run(
+            wall=True,
+            message=QUOTA_MSG + " ctx=%s/x.py ada@example.com sk-ABCDEFGHIJKLMNOP"
+                    % os.path.expanduser("~"))
+        text = cli._bundle_text(task, cli._capture_lines_for(task))
+        self.assertNotIn("ada@example.com", text, "an address survived into the bundle")
+        self.assertNotIn("sk-ABCDEFGHIJKLMNOP", text, "a key survived into the bundle")
+        self.assertNotIn(os.path.expanduser("~"), text, "a home path survived")
+        self.assertIn("usage limit reached", text,
+                      "redaction took the provider message with it")
+
+    def test_the_bundle_is_one_file_with_all_four_sections(self):
+        import contextlib
+        import io
+        task, _, _ = self._run(wall=True)
+        buf = io.StringIO()
+
+        class Args:
+            repo, registry, id, out = self.t.repo, REGISTRY, "T-LOG", None
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_bundle(Args())
+        printed = buf.getvalue().strip()
+        self.assertEqual(len(printed.splitlines()), 1,
+                         "bundle printed more than the path: %r" % printed)
+        self.assertTrue(os.path.isfile(printed), "no file at %r" % printed)
+        body = _slurp(printed)
+        for name in cli.BUNDLE_SECTIONS:
+            self.assertIn("=== %s" % name, body, "the bundle has no %s section" % name)
+        # And each section carries something, not just a header.
+        self.assertIn("T-LOG", body.split("=== task.json")[1][:2000])
+        self.assertIn("routing:", body.split("=== run.log")[1][:20000])
+        self.assertIn("quota_exhausted",
+                      body.split("=== corpus-capture.jsonl")[1])
+
+    def test_an_unwritable_log_leaves_the_run_alone(self):
+        """Exhaust, like corpus capture. And it must never report itself
+        through `self.log` -- that IS the thing failing, and the recursion
+        would turn a full disk into a hang."""
+        class Deaf(store.Task):
+            def append(self, name, line):
+                raise OSError("read-only")
+
+        task = Deaf(store.Task.create(
+            self.t.repo, "T-DEAF", "# t\n\n- **AC-1** — x\n", self.pol).path)
+        task.write_text("plan.md", PLAN_MD)
+
+        def implementer(env, cwd):
+            with open(os.path.join(cwd, "app.py"), "a") as fh:
+                fh.write("\ndef subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "subtask": "st-1-main",
+                "status": "complete", "summary": "s", "evidence": {"tests": "green"}})
+
+        logs = []
+        status = Orchestrator(task, self.reg,
+                              runtime.MockAdapter({"implementer": implementer},
+                                                  now=lambda: T0),
+                              lambda k, x: True, log=logs.append,
+                              clock=lambda: T0).run()
+        self.assertEqual(status, "done",
+                         "an unwritable run log changed the run:\n" + "\n".join(logs))
 
 
 class TestStatusShowsSeatQuota(unittest.TestCase):

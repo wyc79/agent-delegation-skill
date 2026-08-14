@@ -10,6 +10,7 @@ a provider walls, and merge what comes back. Nothing here decides what the work
 is or whether it was done well.
 """
 
+import logging
 import os
 import re
 import subprocess
@@ -62,6 +63,11 @@ def _stamp(epoch):
 # prompt and output gone.
 _LOG_SEQ = [0]
 _LOG_LOCK = threading.Lock()
+
+# For the run log's own failures only. Nothing this module does routinely goes
+# here -- the run's narrative goes through `Orchestrator.log`, which is the
+# thing being persisted, so reporting its failure through itself would recurse.
+_LOG = logging.getLogger("adg.machine")
 
 # An input line in a pane transcript: the terminal's own prompt marker, with an
 # optional clock stamp in front of it. There is one marker for both parties,
@@ -166,12 +172,18 @@ class Orchestrator:
         self.workflow = wf.current()
         self.adapter = adapter
         self.gate = gate            # callable(kind, brief_text) -> bool
-        self.log = log
         self.dry_run = dry_run
         # The machine's only wall clock. Cooldown expiry, utilisation windows
         # and reopen times all derive from it, so a run replays under a fixed
         # clock exactly as it ran.
         self.clock = clock
+        # Every line also lands in the task directory. Stdout is gone the moment
+        # the terminal scrolls, and the thing a real quota wall is diagnosed
+        # from afterwards is the record, not somebody's scrollback. Wrapped
+        # after `clock`, which it stamps from.
+        self._log_lock = threading.Lock()
+        self._log_persist_failed = False
+        self.log = self._persisting(log)
         self._warned_channels = False
         # Breaker-write failures already reported. `_meter` runs after every
         # single invocation, so an unwritable state dir would otherwise repeat
@@ -191,6 +203,44 @@ class Orchestrator:
         self.budget = lim.Budget(task)
         self.repo = task.repo_path()
         self.vcfg = verify.load_project_config(self.repo)
+
+    # The run's own record, beside task.json in the task directory. Named like
+    # the other state files and appended to rather than rewritten, so a crash
+    # keeps everything up to the crash.
+    RUN_LOG = "run.log"
+
+    def _persisting(self, log):
+        """Wrap the caller's log so every line is also written down.
+
+        Wall-clock stamps, because the reader is a person or a model looking at
+        this hours later and asking when the seat went out -- not a profiler.
+        From `self.clock` rather than `time.time` directly, which is the same
+        instant in a real run and keeps the record replayable under an injected
+        one: the reopen times and capture stamps beside it come from that clock
+        too, and a log on a different timebase from the events it describes
+        cannot be lined up with them.
+
+        Under a lock, since a wave logs from several threads and interleaved
+        half-lines would cost exactly the narrative this file exists to carry.
+
+        A logging failure never touches the run, and never reports itself
+        through `self.log` -- that is this function, and the recursion would
+        turn a full disk into a hang. One debug record, like corpus capture.
+        """
+        def emit(message):
+            try:
+                with self._log_lock:
+                    self.task.append(self.RUN_LOG, "%s  %s" % (
+                        time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(self.clock())),
+                        message))
+            except Exception as e:              # noqa: BLE001 -- exhaust
+                if not self._log_persist_failed:
+                    self._log_persist_failed = True
+                    _LOG.debug("run log is not being written (%s): %s",
+                               self.task.file(self.RUN_LOG), e)
+            log(message)
+        return emit
 
     # ------------------------------------------------------------------ run
     def run(self):
@@ -1391,8 +1441,14 @@ class Orchestrator:
         return None
 
     def _channel_state(self):
-        """-> (now, cooled, utilization, entries). One clock read feeds routing,
-        so every gate in a single selection sees the same instant."""
+        """-> (now, cooled, utilization, entries, usage). One clock read feeds
+        routing, so every gate in a single selection sees the same instant.
+
+        `usage` -- the raw invocation stamps -- rides along unaggregated so the
+        routing log can render exactly what `delegate status` renders, from the
+        same numbers the router just decided on, rather than a second opinion
+        computed a moment later.
+        """
         now = self.clock()
         cools, usage, warning = cooldown.read(now)
         if warning and not self._warned_channels:
@@ -1403,7 +1459,51 @@ class Orchestrator:
         util = {}
         for name, chan in (self.reg.get("channels") or {}).items():
             util[name] = cooldown.utilization(usage.get(name), chan.get("quota"), now)
-        return now, set(cools), util, cools
+        return now, set(cools), util, cools, usage
+
+    def _log_routing(self, role, tier, runnable, picked, util, entries, usage, now):
+        """The inputs to a routing decision, not just its outcome.
+
+        A line saying which seat won answers nothing afterwards: the question a
+        diagnosis asks is why the OTHER seat lost, and that turns on numbers
+        that existed for one instant -- how drawn each window was, which
+        breakers were open, how many calls this task still needed, and the
+        shadow price those produced. None of it is recoverable later. The seat
+        that was 4% from a wall looks identical in `channels.json` an hour after
+        it reopened.
+
+        The seat block is rendered by `cli._seat_quota_lines`, the same code
+        `delegate status` prints, from the same `usage` the router just read --
+        so the log and the command a reader would run to check it cannot
+        disagree. Imported here rather than at module scope because `cli` is
+        the layer above this one; a top-level import would invert that.
+        """
+        try:
+            from .cli import _seat_quota_lines
+            need = self._calls_remaining()
+            lines = ["routing: %s%s" % (role or "worker",
+                                        ", tier %s" % tier if tier else
+                                        ", no band named")]
+            lines += ["  seats as the router saw them:"]
+            lines += ["  " + x for x in _seat_quota_lines(
+                self.reg, entries, usage, now) if x.strip()
+                and not x.strip().startswith(("seats:", "(draw is"))]
+            room = []
+            for c in runnable:
+                left = self._headroom(c.channel, util)
+                room.append("%s ~%s" % (
+                    c.channel, "%d" % left if left is not None else "unmetered"))
+            lines.append("  headroom: %s; this task needs ~%d more call(s)"
+                         % (", ".join(sorted(set(room))) or "nothing runnable", need))
+            lines.append("  by shadow price: %s" % "; ".join(
+                "%s via %s %.2f" % (c.model, c.channel, c.score)
+                for c in runnable[:6]))
+            lines.append("  picked: %s on %s (%s)"
+                         % (picked.model, picked.channel, picked.agent_kind))
+            for line in lines:
+                self.log(line)
+        except Exception as e:                  # noqa: BLE001 -- a log, not a gate
+            _LOG.debug("routing log failed: %s", e)
 
     def _pick(self, role=None, boost=None, exclude=(), min_reasoning=None, tier=None):
         """Best candidate this runtime can actually launch. The registry says
@@ -1413,7 +1513,7 @@ class Orchestrator:
         Channels in a quota cooldown are filtered exactly like `disabled`, and
         when a cooldown is the *only* reason nothing is left, the caller gets an
         error that knows when the seats come back."""
-        _, cooled, util, entries = self._channel_state()
+        now, cooled, util, entries, usage = self._channel_state()
         blocked = cooled | set(exclude or ())
 
         def ask(ignore_reserve):
@@ -1446,6 +1546,7 @@ class Orchestrator:
             if c.demoted:
                 self.log("  reserve: %s on %s anyway — no alternative"
                          % (role, c.channel))
+            self._log_routing(role, tier, runnable, c, util, entries, usage, now)
             return c
         if blocked:
             # Would this role have had somewhere to go with nothing filtered?
@@ -1705,6 +1806,7 @@ class Orchestrator:
                 res = self.adapter.follow_up(session, text, timeout=3600)
             self._log_transcript(role, text, res)
             self._count_human_turns(session, subtask, res)
+            self._log_classification(choice, res)
             reason = res.get("failure")
             if reason not in self.HOPS_TO_ANOTHER_SEAT:
                 break
@@ -1712,7 +1814,7 @@ class Orchestrator:
             # ahead of teardown meant a write failure leaked the session -- under
             # the herdr adapter, an orphaned pane.
             self._close(session)
-            self._salvage(cwd, role, subtask)
+            salvaged = self._salvage(cwd, role, subtask)
             at = self._cool(choice, res) if reason in self.OPENS_THE_BREAKER else None
             # Appended whatever the reason: this list excludes the seat from THIS
             # task's remaining picks, which is a different thing from the global
@@ -1759,6 +1861,7 @@ class Orchestrator:
             self.log("failover: %s %s -> %s (%s%s)"
                      % (role, choice.channel, nxt.channel, reason,
                         ", reopens %s" % _stamp(at) if at else ", seat not cooled"))
+            self._log_hop(role, subtask, choice, nxt, reason, at, salvaged, cwd)
             # A fresh session on the new seat, in the *same* worktree: every
             # checkpoint commit is still there, so the replacement continues
             # from the last one rather than restarting the subtask.
@@ -1814,6 +1917,30 @@ class Orchestrator:
         # session too, but only this handle survives the caller raising before
         # it gets to close -- which is most of the ways `_one_subtask` can end.
         return session, report, choice
+
+    def _log_hop(self, role, subtask, walled, nxt, reason, at, salvaged, cwd):
+        """One line carrying the whole hop, because the interesting question
+        afterwards is never any single half of it.
+
+        "Did it lose work" is answered by the checkpoint hash; "will it restart
+        from nothing" by which commit the replacement continues from; "was the
+        seat really out" by whether a reopen time was recorded at all -- a
+        timeout hops and deliberately cools nothing. Spread across four log
+        lines written at four moments, that narrative has to be reassembled by
+        whoever reads it. Here it is one line.
+        """
+        try:
+            head = git(["rev-parse", "--short", "HEAD"], cwd, check=False) or "unknown"
+            self.log("  hop: %s walled on %s (%s) → %s → reopens %s → respawned "
+                     "on %s/%s → resumes from %s"
+                     % (subtask.get("id") if subtask else role, walled.channel,
+                        reason,
+                        "checkpointed %s" % head if salvaged
+                        else "nothing to checkpoint",
+                        _stamp(at) if at else "not cooled",
+                        nxt.channel, nxt.model, head))
+        except Exception as e:                  # noqa: BLE001 -- a log, not a gate
+            _LOG.debug("hop log failed: %s", e)
 
     def _record_demotion(self, sub, asked, choice, reason):
         """A job is about to run below the band its caller asked for.
@@ -2018,6 +2145,38 @@ class Orchestrator:
                     s["human_turns"] = ht
         self.task.mutate(mark)
         self.log("  %s: %d human turn(s) typed into its pane" % (sub["id"], len(fresh)))
+
+    def _log_classification(self, choice, res):
+        """What the quota verdict was, and what it was reached from.
+
+        The verdict alone is the least useful half. A run that cooled a healthy
+        seat and a run that missed a real wall both come back as one word, and
+        telling them apart afterwards means seeing the string the pattern table
+        actually matched against -- which is not `output`, and on some adapters
+        is nothing at all.
+
+        Redacted and capped through `corpus`, because this file is written to
+        be handed to somebody: same scrub, same limit, one implementation.
+        """
+        try:
+            verdict = res.get("failure")
+            if not verdict:
+                return
+            self.log("classification: %s on %s -> %s%s"
+                     % (choice.agent_kind, choice.channel, verdict,
+                        ", reopens %s" % _stamp(res["reset_at"])
+                        if res.get("reset_at") else ""))
+            if "classified_text" in res:
+                seen = corpus.redact(res.get("classified_text") or "")
+                self.log("  it read: %r" % seen[:corpus.MAX_TEXT])
+            else:
+                # The absence is the record. `settle_unclassified` never sets
+                # the key, so this line is how a reader learns the verdict came
+                # from how the call ended rather than from anything anyone said.
+                self.log("  it read: nothing — this adapter offers the "
+                         "classifier no provider channel")
+        except Exception as e:                  # noqa: BLE001 -- a log, not a gate
+            _LOG.debug("classification log failed: %s", e)
 
     def _log_transcript(self, role, prompt, res):
         """Keep what the agent was asked and what it said. An agent that does

@@ -275,6 +275,7 @@ orchestrator/delegate init                          # which seat serves which ti
 orchestrator/delegate run "add subtract" --plan jobs.md
 orchestrator/delegate status                        # tasks, then room left per seat
 orchestrator/delegate show --brief                  # the merge-gate brief
+orchestrator/delegate bundle T-001                  # one redacted file for diagnosis
 orchestrator/delegate approve --note "..."          # answer it
 orchestrator/delegate resume --id T-001             # continue a parked task
 ```
