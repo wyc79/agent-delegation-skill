@@ -4448,10 +4448,6 @@ class TestPaneModeHumanTurns(unittest.TestCase):
             self.assertIn(wanted, doc, "the design note no longer says %r" % wanted)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestPerJobRequiredChecks(unittest.TestCase):
     """`required_checks`: the only thing that can fail an attempt for a reason
     specific to one job.
@@ -4779,3 +4775,15 @@ class TestGateStageChecks(unittest.TestCase):
         src = inspect.getsource(m)
         self.assertIn("for tier in verify.COMMAND_TIERS", src)
         self.assertIn("gate", verify.COMMAND_TIERS)
+
+
+# Last line of the file, and it has to stay there. `unittest.main()` runs at
+# the point it is reached, so a class defined BELOW it does not exist yet when
+# collection happens -- and `python3 orchestrator/tests/test_orchestrator.py`,
+# which this module's own docstring gives as the way to run it, then reports OK
+# over a suite it never loaded. This block sat four classes from the end and
+# hid sixteen tests that way. Pytest never saw the gap, because importing the
+# module defines everything and `__name__` is not `"__main__"`, so the two ways
+# of running the file disagreed about how much of it existed.
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
