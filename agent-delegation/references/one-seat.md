@@ -92,13 +92,25 @@ the colliding ones into a single job or run them in sequence.
 
 **This is the same location `delegate` uses, deliberately.** It computes that
 `<repo-parent>/.adg-worktrees/<project-key>/` path the same way, from the same
-git common dir, so a run you started by hand does not have to be thrown away the
-day a second seat appears: the worktrees and their branches are already where
-`delegate` looks, and `git worktree add` reattaches an existing branch rather
-than refusing it. Start on one seat, enroll a second, and the work in flight is
-still on disk in the right place. (A test in this repository runs the two lines
-above and asserts they equal `store.project_key`, so the recipe cannot drift
-away from the runtime it is matching.)
+git common dir, so hand-started work sits where the runtime already looks.
+(A test in this repository runs the two lines above and asserts they equal
+`store.project_key`, so the recipe cannot drift away from the runtime it is
+matching.)
+
+**The job names in `$scopes` are the hand-off, so choose them as if `delegate`
+were going to read them — because it does.** When it dispatches a subtask it
+looks for a local branch whose name is *exactly* that subtask's id, and if one
+exists it cuts the job's branch from that branch's tip instead of from the
+integration branch. Your commits end up underneath the agent's and land with
+them, and the merge brief says which jobs were adopted and how far ahead they
+were. Nothing is refused, rewritten or deleted: your branch is left where it is,
+and the worktree holding it keeps working.
+
+So name a job `st-2-beta` here and write `id: st-2-beta` in the plan you later
+hand `delegate --plan`, and the second seat continues your work instead of
+starting the job over. Name it something else and it starts over — silently,
+because a branch nobody asked about is indistinguishable from no branch at all.
+That is the whole of the contract: **the job name is the key.**
 
 **Both paths are namespaced on the repository, and the two collisions are not
 equally polite.** A bare `../wt` and a fixed `/tmp/scopes` are relative to where

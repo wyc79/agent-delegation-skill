@@ -659,6 +659,16 @@ class Orchestrator:
             self._dispatch(sub, tree)
             self._integrate_wave([sub])
             return
+        # A lone subtask normally runs straight in the integration worktree --
+        # there are no siblings to isolate it from, so a second checkout would
+        # be pure cost. A hand-started branch is the one reason to pay it: that
+        # branch can only be adopted by cutting a per-job branch from its tip,
+        # and this path has no per-job branch at all. Everything after the cut
+        # is the machinery a wave already uses.
+        if self._adoptable(sub):
+            self._dispatch(sub, self._prepare(sub, self._subtask_worktree(sub)))
+            self._integrate_wave([sub])
+            return
         self._dispatch(sub, self._ensure_worktree())
 
     def _prepare(self, sub, tree):
@@ -1046,13 +1056,97 @@ class Orchestrator:
         return ((sub or {}).get("base_commit")
                 or self.task.state["repo"].get("base_commit", "HEAD"))
 
+    def _adoptable(self, sub):
+        """-> the tip of a hand-started branch named exactly for this subtask.
+
+        None when there is no such branch, when its name is unusable as a ref,
+        or when it carries nothing the integration tip does not already have --
+        adopting that last case would be a no-op wearing a finding's clothes,
+        and a brief row for it is the noise that stops the real ones being read.
+
+        Asked before the worktree is chosen as well as while cutting it, because
+        the single-subtask path does not use a per-job worktree at all and has
+        to be told to.
+        """
+        try:
+            name = str(sub.get("id") or "")
+            if not name:
+                return None
+            tip = git(["rev-parse", "--verify", "--quiet", "refs/heads/" + name],
+                      self.repo, check=False)
+            if not tip:
+                return None
+            ahead = git(["rev-list", "--count", "%s..%s"
+                         % (self._integration_tip(), tip)],
+                        self.repo, check=False) or "0"
+            return tip if ahead.isdigit() and int(ahead) > 0 else None
+        except Exception as e:                  # noqa: BLE001 -- never fatal
+            _LOG.debug("adoption check failed for %s: %s", sub.get("id"), e)
+            return None
+
+    def _adopt(self, sub, base):
+        """Continue from a branch somebody started by hand, if there is one.
+
+        `references/one-seat.md` is the same pattern without this program: a
+        worktree per job, one branch per job, named for the job. It promised
+        that work would be picked up the day a second seat appeared, and it was
+        not -- delegate's branch is `adg/<task>/<sub>` and the recipe's is bare
+        `<job>`, so the names never met and every hand-started branch was
+        silently ignored while a fresh one was cut from the integration tip.
+
+        The subtask id IS the key, which is the whole of the contract: name a
+        job what you will name its subtask and this finds it. Adoption cuts
+        `adg/<task>/<sub>` from that branch's TIP rather than from integration,
+        so the hand commits are underneath the agent's work and land with it.
+
+        The hand branch itself is left completely alone -- not checked out, not
+        moved, not deleted. If the recipe's worktree still holds it, that
+        checkout keeps working: git's one-checkout-per-branch rule is about the
+        branch, and this creates a different one pointing at the same commit.
+
+        Measure, do not enforce: adopted and reported, never refused. -> base.
+        """
+        try:
+            tip = self._adoptable(sub)
+            if not tip:
+                return base
+            name = sub["id"]
+            ahead = git(["rev-list", "--count", "%s..%s" % (base, tip)],
+                        self.repo, check=False) or "0"
+            n = int(ahead) if ahead.isdigit() else 0
+            if not n:
+                return base
+            self.log("  %s: adopting hand-started branch %s, %d commit(s) ahead"
+                     % (name, name, n))
+
+            def mark(state):
+                for s in state["subtasks"]:
+                    if s["id"] == name:
+                        s["adopted"] = {"branch": name, "tip": tip[:12],
+                                        "commits": n}
+            self.task.mutate(mark)
+            return tip
+        except Exception as e:                  # noqa: BLE001 -- never fatal
+            # A run that cannot adopt must still run. The fresh branch off
+            # integration is the behaviour every task had before this existed.
+            _LOG.debug("adoption check failed for %s: %s", sub.get("id"), e)
+            return base
+
     def _subtask_worktree(self, sub):
         state = self.task.state
         branch = "adg/%s/%s" % (state["id"], sub["id"])
         path = os.path.join(os.path.dirname(os.path.abspath(self.repo)),
                             ".adg-worktrees", state["project_key"],
                             "%s-%s" % (state["id"], sub["id"]))
-        self.adapter.create_worktree(self.repo, branch, self._integration_tip(), path)
+        # Only ever consulted when this branch does not exist yet:
+        # `create_worktree` reuses an existing one and ignores the base it is
+        # handed, so a rework cannot re-adopt and cannot be rebased underneath
+        # itself by a branch that has moved on.
+        base = self._integration_tip()
+        if not git(["rev-parse", "--verify", "--quiet", "refs/heads/" + branch],
+                   self.repo, check=False):
+            base = self._adopt(sub, base)
+        self.adapter.create_worktree(self.repo, branch, base, path)
         # Persisted, because `_run_wave` holds these in a local dict that is gone
         # long before the task reaches `done` -- and a reaper that cannot name
         # what it created is a reaper that leaves everything behind. The diff

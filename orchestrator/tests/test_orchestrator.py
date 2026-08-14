@@ -4007,6 +4007,178 @@ stages:
 
 
 
+class TestAdoptsHandStartedBranches(unittest.TestCase):
+    """The one-seat hand-off, which used to be a claim rather than a feature.
+
+    `references/one-seat.md` said hand-started work was "already where delegate
+    looks" and that branches get reattached. Both halves were true about the
+    PATH and false about the WORK: delegate's branch is `adg/<task>/<sub>` and
+    the recipe's is a bare job name, so the names never met. Every hand-started
+    branch was ignored and the job started over from the integration tip, with
+    nothing saying so.
+
+    The subtask id is the key now, and the doc says so in those words.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+
+    def tearDown(self):
+        subprocess.run(["git", "worktree", "prune"], cwd=self.t.repo,
+                       capture_output=True)
+        self.t.close()
+
+    PLAN = ('# p\n\n```yaml\n- id: st-1-subtract\n'
+            '  goal: Add subtract to app.py\n  file_scope: ["app.py"]\n```\n')
+
+    def _hand_branch(self, name, filename="hand.py", body="HAND = 1\n"):
+        """What the recipe leaves behind: a branch named for the job, with
+        commits on it, cut from the same base."""
+        sh(["git", "branch", name], self.t.repo)
+        wt = os.path.join(self.t.dir, "handwt")
+        sh(["git", "worktree", "add", wt, name], self.t.repo)
+        _spit(os.path.join(wt, filename), body)
+        sh(["git", "add", "-A"], wt)
+        sh(["git", "-c", "user.email=h@x", "-c", "user.name=H",
+            "commit", "-qm", "hand-started work"], wt)
+        return wt
+
+    def _run(self):
+        task = _task(self.t.repo, "T-ADOPT", "# t\n\nAdd subtract\n",
+                     self.reg["policy"]["limits"], plan=self.PLAN)
+
+        def implementer(env, cwd):
+            _spit(os.path.join(cwd, "app.py"),
+                  "def add(a, b):\n    return a + b\n\n"
+                  "def subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"],
+                    "implement-st-1-subtract.json",
+                    {"stage": "implement", "role": "implementer",
+                     "subtask": "st-1-subtract", "status": "complete",
+                     "summary": "added subtract", "evidence": {"tests": "ok"}})
+
+        logs = []
+        status = Orchestrator(task, self.reg,
+                              runtime.MockAdapter({"implementer": implementer}),
+                              lambda k, t: True, log=logs.append).run()
+        return status, task, logs
+
+    def test_a_branch_named_like_the_subtask_is_adopted(self):
+        self._hand_branch("st-1-subtract")
+        status, task, logs = self._run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        got = task.state["subtasks"][0].get("adopted")
+        self.assertIsNotNone(got, "the hand branch was ignored:\n" + "\n".join(logs))
+        self.assertEqual(got["branch"], "st-1-subtract")
+        self.assertEqual(got["commits"], 1)
+        # The real test: the agent's branch descends from the hand work, so the
+        # hand commit is an ancestor rather than something merged in later.
+        anc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "st-1-subtract",
+             "adg/T-ADOPT/st-1-subtract"], cwd=self.t.repo, capture_output=True)
+        self.assertEqual(anc.returncode, 0,
+                         "the job's branch was not cut from the hand branch")
+
+    def test_the_adopted_work_reaches_the_brief_and_the_patch(self):
+        self._hand_branch("st-1-subtract")
+        _, task, logs = self._run()
+        text = brief.render(task, "merge", "Land it?")
+        self.assertIn("continued hand-started work", text)
+        row = [l for l in text.splitlines() if l.startswith("| st-1-subtract")]
+        self.assertTrue([l for l in row if "st-1-subtract" in l and "|" in l])
+        self.assertIn("Nothing was refused", text)
+        self.assertEqual(brief.lint(text), [], "the section trips the jargon lint")
+        # And the hand file is actually in the integration result.
+        patch = task.read_text("integrate.patch", "")
+        self.assertIn("hand.py", patch,
+                      "the adopted commit did not reach the deliverable")
+
+    def test_the_hand_branch_and_its_worktree_are_left_alone(self):
+        """Measure, do not enforce. The recipe's checkout keeps working: a new
+        branch at the same commit is not the same branch, so git's
+        one-checkout-per-branch rule never fires."""
+        wt = self._hand_branch("st-1-subtract")
+        before = subprocess.run(["git", "rev-parse", "st-1-subtract"],
+                                cwd=self.t.repo, capture_output=True, text=True).stdout
+        self._run()
+        after = subprocess.run(["git", "rev-parse", "st-1-subtract"],
+                               cwd=self.t.repo, capture_output=True, text=True).stdout
+        self.assertEqual(before, after, "the hand branch was moved")
+        self.assertTrue(os.path.isdir(wt), "the hand worktree was removed")
+        head = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                              cwd=wt, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(head, "st-1-subtract",
+                         "the hand worktree lost its branch")
+
+    def test_no_matching_branch_changes_nothing(self):
+        self._hand_branch("some-other-name")
+        status, task, logs = self._run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        self.assertIsNone(task.state["subtasks"][0].get("adopted"))
+        self.assertNotIn("continued hand-started work",
+                         brief.render(task, "merge", "Land it?"))
+
+    def test_a_branch_with_nothing_on_it_is_not_reported_as_adopted(self):
+        """A row for a no-op adoption is noise, and noise in this section is
+        what stops the real ones being read."""
+        sh(["git", "branch", "st-1-subtract"], self.t.repo)   # no commits
+        _, task, _ = self._run()
+        self.assertIsNone(task.state["subtasks"][0].get("adopted"))
+
+    def test_a_wave_adopts_only_the_jobs_that_have_a_branch(self):
+        """The shape the recipe actually produces: several jobs, some of which
+        you got to by hand before the second seat appeared. A wave gives every
+        job its own worktree, so this is the path the item describes; the
+        single-job case above has to be routed there deliberately, because a
+        lone subtask otherwise runs in the integration worktree and has no
+        per-job branch to cut from anything."""
+        plan = ('# p\n\n```yaml\n- id: st-1-alpha\n  goal: alpha\n'
+                '  file_scope: ["alpha.py"]\n'
+                '- id: st-2-beta\n  goal: beta\n  file_scope: ["beta.py"]\n```\n')
+        self._hand_branch("st-2-beta", filename="beta.py", body="# started\n")
+        task = _task(self.t.repo, "T-WAVE", "# t\n\ntwo jobs\n",
+                     self.reg["policy"]["limits"], plan=plan)
+
+        def implementer(env, cwd):
+            name = _tree_name(cwd)
+            sid = "st-1-alpha" if "st-1-alpha" in name else "st-2-beta"
+            _spit(os.path.join(cwd, sid.split("-")[-1] + ".py"), "# agent\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-%s.json" % sid,
+                    {"stage": "implement", "role": "implementer", "subtask": sid,
+                     "status": "complete", "summary": "did it",
+                     "evidence": {"tests": "ok"}})
+
+        logs = []
+        status = Orchestrator(task, self.reg,
+                              runtime.MockAdapter({"implementer": implementer}),
+                              lambda k, t: True, log=logs.append).run()
+        self.assertEqual(status, "done", "\n".join(logs))
+        by_id = {s["id"]: s for s in task.state["subtasks"]}
+        self.assertIsNone(by_id["st-1-alpha"].get("adopted"),
+                          "a job with no branch was reported as adopted")
+        self.assertIsNotNone(by_id["st-2-beta"].get("adopted"),
+                             "the hand branch was ignored:\n" + "\n".join(logs))
+        anc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "st-2-beta",
+             "adg/T-WAVE/st-2-beta"], cwd=self.t.repo, capture_output=True)
+        self.assertEqual(anc.returncode, 0,
+                         "the job's branch was not cut from the hand branch")
+
+    def test_the_recipe_names_the_job_id_as_the_adoption_key(self):
+        """Driven from one-seat.md, because the contract only holds if the
+        document tells a reader to name their jobs after their subtasks. The
+        recipe's own `$scopes` block is where those names get chosen."""
+        doc = _slurp(os.path.join(REPO_ROOT, "agent-delegation", "references",
+                                  "one-seat.md"))
+        self.assertIn("the job name is the key", doc.lower(),
+                      "one-seat.md no longer states the adoption contract")
+        # And the branch the recipe creates has to be the bare job name, or the
+        # contract it now promises is not the one the shell performs.
+        self.assertIn('git worktree add "$wt/$job" -b "$job"', doc,
+                      "the recipe stopped creating a branch named for the job")
+
+
 class TestBriefStatesTheDemotion(unittest.TestCase):
     """A job that ran below the band it asked for has to say so at the gate.
 

@@ -158,6 +158,41 @@ def _by_job(state, limit=8):
     return rows
 
 
+def _adoptions(state):
+    """Jobs that continued from work somebody had already started by hand.
+
+    Worth a row because it changes what the diff means. An adopted job's branch
+    carries commits no agent in this run wrote, and its scope column measures
+    only what the agent added on top -- so a reader comparing the two without
+    knowing about the adoption is reading a smaller change than the branch
+    actually lands.
+
+    Silent when nothing was adopted, like every other section here.
+    """
+    rows = []
+    for sub in (state.get("subtasks") or []):
+        got = sub.get("adopted")
+        if not got:
+            continue
+        # No separate branch column: the branch name IS the job id, which is
+        # the whole of the adoption contract, and repeating it would put the
+        # same bare id in a second cell for nothing.
+        rows.append("| %s | %d | `%s` |" % (
+            sub.get("id", "?"), int(got.get("commits") or 0),
+            got.get("tip", "?")))
+    if not rows:
+        return []
+    return ["## Jobs that continued hand-started work", "",
+            "| Job | Commits already on its branch | Cut from |",
+            "|---|---|---|"] + rows + [
+        "",
+        "A branch already existed with the job's name, so the job was cut from "
+        "its tip instead of from the integration branch and those commits land "
+        "with it. Nothing was refused and nothing was rewritten. The scope "
+        "column above counts only what the agent added on top, so the branch "
+        "carries more than the diff there shows.", ""]
+
+
 def _demotions(state):
     """Jobs that ran below the band they asked for.
 
@@ -296,6 +331,7 @@ def render(task, kind, decision_text, files=(), verify=None, extra=None):
     # Before the evidence, because it qualifies what the evidence is worth: a
     # green check on a job that ran a band below the one it was given is a
     # weaker claim than the same check on a job that got what it asked for.
+    md += _adoptions(state)
     md += _demotions(state)
 
     if verify is not None:
