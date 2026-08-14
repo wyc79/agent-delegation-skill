@@ -381,6 +381,47 @@ was not designed for; it does not say the shape is general. And it produced no
 score — five findings files are not 31/31, so K carries no correctness signal at
 all, only that the pipeline placed the work and the accounting held.
 
+## What G/H settles — an optimisation that was refuted
+
+Moved here from the repository README, which was carrying the argument as well
+as the rule.
+
+Cost tracks *turns* almost exactly, so inlining the three files each agent opens
+should have saved three turns per agent. **G/H measured it and it saved zero,
+and cost 1.15x more** — roughly 1,900 extra prompt tokens then rode on every
+turn, and a turn re-sends its accumulated context. Reverted; the note stays in
+`prompts.py` so the next person to have the idea reads the result before
+spending the day.
+
+Separately, one job where `delegate` came out *cheaper* — `st-4-raster` at
+0.86x, in the table above — did not reproduce. Re-run controlled, it came back
+1.77x the other way. One job's ratio is noise; the pair is the measurement.
+
+## What measuring found that reading did not
+
+Also moved from the README. Four defects shipped, and a green suite caught none
+of them:
+
+- `slow` checks were parsed, printed in the brief as *"not run"*, and executed
+  **zero times** — so the merge gate asked a human to land a change whose only
+  real check had never run.
+- `frozen_interfaces` were stored, promised by two documents, and **composed
+  into no prompt** — on a pipeline whose four agents coordinate only through
+  them.
+- Cached input was billed at the fresh-input rate, ~10x over, inflating every
+  estimated figure this project had published.
+- A one-letter typo in a plan file (`files_scope:` for `file_scope:`) silently
+  produced a job with **no write scope**, which `scope_violations` reads as
+  `**` — so it claimed every file in the repository and collapsed its wave to
+  one agent.
+
+They share a shape: each lives in the seam between the program and reality —
+config parsed but never executed, data stored but never composed, a correct
+price applied to the wrong quantity, a field name accepted by nobody. Unit
+tests cannot see it, because both halves pass on their own.
+`tests/test_orchestrator.py`'s `TestTheSeams` now checks those joins, driven
+from where each claim is made rather than from a copy of it.
+
 ## Conclusion
 
 **Do not reach for delegate to be cheaper or faster.** On one provider it costs

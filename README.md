@@ -421,9 +421,13 @@ keeping it moving when one empties.
 Green suites, from a clone of this repo:
 
 ```bash
-python3 orchestrator/tests/test_orchestrator.py  # 199 tests, no tokens spent
-python3 orchestrator/tests/test_failover.py      # 107 more, same
+python3 -m pytest orchestrator/tests/ -q
 ```
+
+Both test files must pass. No count is quoted here on purpose: this section has
+carried a hardcoded one twice and it was wrong both times, because the suite
+grows every time something is measured and a number in a README is a fact about
+the day it was typed. Run it.
 
 They drive the real state machine over a real git repository with a scripted
 adapter, so dispatch, isolated worktrees, waves, verify, failover and
@@ -468,7 +472,7 @@ the same seat. The skill hands single-seat callers the alternative rather than
 selling itself.
 
 How every one of those figures was arrived at, what else was tried, and what had
-to be corrected along the way, is the next section.
+to be corrected along the way, is in [`evidence/RESULTS.md`](evidence/RESULTS.md).
 
 **Built and exercised:** dependency waves in isolated worktrees; scope measured
 per job; cost and elapsed time recorded per delegation from the CLI's own JSON;
@@ -492,125 +496,32 @@ file is not safe for simultaneous writers in the strict sense.
 
 ## Experiments
 
-Every design decision below was forced by a run, not argued into place. The task
-throughout is the same: four stages of a software rasterizer, graded by the
-course's own script over 26 reference images, pass only at 31/31. Full records and caveats in
-[`evidence/RESULTS.md`](evidence/RESULTS.md).
+Every design decision here was forced by a run, not argued into place; the task
+throughout is four stages of a software rasterizer, graded by the course's own
+script over 26 reference images, pass only at 31/31. The per-arm narratives —
+what each run settled, what it refuted, and every caveat — live in
+[`evidence/RESULTS.md`](evidence/RESULTS.md), which is where the raw records
+are too.
 
-Two earlier arms are deliberately absent. They measured the **role protocol**
-against a plain warm session — a question about a product this no longer is —
-and their raw records are not in this repository. Their one surviving
-conclusion, that the roles were not worth their cost, is in *Why this is a
-wrapper and not a workflow* above.
-
-Everything below is a run, and every one but **K** has its data in
-`evidence/`. K's artifacts live with the code-winnow work rather than here, so
-its figures are transcribed rather than re-derivable — which is worth knowing,
-because K is the arm carrying the generalisation claim.
+Every arm below is a run, and every one but **K** has its data in `evidence/`.
+K's artifacts live with the code-winnow work rather than here, so its figures
+are transcribed rather than re-derivable — worth knowing, because K is the arm
+carrying the generalisation claim.
 
 | # | What it tested | Result | What changed here |
 |---|---|---|---|
 | **B** | the wrapper: 4 caller-written jobs, 2 seats | 31/31, ≈$3.0, 9.6 min | first run of the product as it now is |
 | **D** | the same structure **hand-rolled, no `delegate`**, 1 seat | 31/31, **$2.92, 3.5 min** | the skill now ships this recipe |
-| **F** | the wrapper on **1 seat**, same jobs as D | 31/31, $5.03, 9.6 min | the per-agent overhead, and the wave-cap cost below |
+| **F** | the wrapper on **1 seat**, same jobs as D | 31/31, $5.03, 9.6 min | the per-agent overhead, and the `max_parallel_agents` cost |
 | **E1** | a wall on a band only one seat serves | did **not** park — `_replacement` re-asks for the walled model's *reasoning floor*, not its tier, and on failing it drops the floor | a known rough edge: the caller's band does not survive its seat going out, and only the run log says so |
 | **E2** | a wall mid-job, twice, 2 seats | 31/31 across two provider changes | the failover claim is earned |
 | **E3** | a wall mid-job on a **single** seat | salvaged, parked, resumed from the checkpoint | found a bug that failed the recovery |
 | **G/H** | inlining the protocol to save turns | **no change** — 30 turns either way | progressive disclosure kept |
 | **K** | **a foreign package's** five judgment passes dispatched as jobs, 2 seats | five findings files, zero scope violations, $7.18 | the pipeline generalises past the task it was built on |
 
-**A third of the wall-clock gap is a config default, not overhead.** F's clean
-rerun took 576s against D's 210s — 2.74×, worse than the 1.8× its per-agent
-figures suggest. The shipped `max_parallel_agents: 3` runs a four-job plan as
-**three then one**; the hand-rolled control ran all four at once. From the
-per-job times, `max(117, 224, 381) + 178 = 559s` against 576s measured, and all
-four concurrently would have been 381s. So ~195s of that gap is the cap. Whether
-`3` is the right default is open: raising it trades wall clock against
-contention on one provider's rate limits, and only the first has been measured.
-
-**It generalises past the task it was built on, and arm K is the evidence.**
-Every other arm here is the same rasterizer: four writers of four pre-split
-files, disjoint by construction, on a decomposition this project wrote. A
-pipeline that only works on the workload it was designed against has not been
-shown to work at all.
-
-K is a different shape on every axis that could have mattered. It dispatched
-**code-winnow's** five judgment passes — a package this repository does not own,
-whose plan its author wrote — as **five readers over one diff** rather than
-writers of disjoint code. Two waves, five agents, both providers, every check
-green, **$7.18** of a $15 cap, stopping at the merge gate as attended mode
-should.
-
-Three things held that were not designed for it:
-
-- **Scope accounting, on a workload that inverts its premise.** Disjointness
-  here is not "each job owns a file" — every pass *reads* the same diff, and
-  they are disjoint only because each writes its own findings file. Zero
-  violations. The rule held for a reason it was not built around.
-- **The tier bands, translated by nobody.** code-winnow's own guidance — *keep
-  the supervisor passes at your tier, tier down the volume passes* — mapped onto
-  `tier:` verbatim. The two supervisor passes drew `opus-class-strong` on the
-  Claude seat; the volume passes ran `fast-cheap` and `balanced-coder` on the
-  other provider, concurrently. The two volume passes cost **$0.13** together
-  against the supervisor pair's **$6.69**, a ~51× spread the caller got by
-  copying a sentence out of its own docs.
-- **The bands bought what they were supposed to.** Output tracked them: the two
-  `t3` passes wrote 11–12 KB of findings each, the tiered-down passes about 1 KB,
-  **107 `file:line` citations** between them. One `t3` pass did not read
-  statically at all — it built an instrumented copy of the tree with branch
-  counters, ran all 26 grading scenes through it, and reported measured counts.
-
-Building that plan is also what found the job id pattern only accepted
-`st-<number>-`, which fitted this repository's first task and nothing else. Five
-named review passes have no numbers to give.
-
-**Why the skill tells you not to use this on one seat.** D and F are the same
-jobs, provider and model; only `delegate` differs. Per job it ran 1.77× and
-2.10× the cost, and cost tracks *turns* almost exactly. Four to five of the
-eight-to-ten extra turns are the protocol and its report; the rest is
-unexplained. So the skill ships D's recipe at
-[`references/one-seat.md`](agent-delegation/references/one-seat.md) instead of
-selling itself.
-
-**Why failover is the whole pitch.** E2 is the only arm that survives a provider
-going out: partial work committed, seat cooled, job re-selected elsewhere,
-replacement continuing in the same worktree — then the gate ran the grader
-itself. E3 showed the single-seat half works too (no hop, but a checkpoint and a
-resume). Neither has been seen on an unprompted wall; both were injected.
-
-**What was tried and refuted.** Cost tracks turns, so inlining the three files
-each agent opens *should* have saved three turns. It saved zero and cost 1.15×
-more, because ~1,900 extra prompt tokens then rode on every turn. Reverted, and
-the note stays in `prompts.py` so the next person reads the result first.
-Separately, one job where `delegate` appeared *cheaper* (0.86×) did not
-reproduce — re-run controlled it came back 1.77× the other way.
-
-**What measuring found that reading did not.** Every one of these shipped, and a
-green suite of 270 tests caught none:
-
-- `slow` checks were parsed, printed in the brief as *"not run"*, and executed
-  **zero times** — so the merge gate asked a human to land a change whose only
-  real check had never run.
-- `frozen_interfaces` were stored, promised by two documents, and **composed
-  into no prompt** — on a pipeline whose four stages coordinate only through
-  them.
-- Cached input was billed at the fresh-input rate, ~10× over, inflating every
-  estimated figure this project published.
-- A one-letter typo in a plan file silently produced a job with **no write
-  scope**, which means it claims every file in the repository.
-
-They share a shape: each lives in the seam between the program and reality —
-config parsed but never executed, data stored but never composed, a correct
-price applied to the wrong quantity. Unit tests cannot see it, because both
-halves pass alone. `tests/test_orchestrator.py`'s `TestTheSeams` now checks
-those joins, driven from where each claim is made.
-
-**How much to trust this.** n=1 per arm. Both walls were injected, not
-encountered. The task is unusually friendly to parallel decomposition — four
-pre-split files, disjoint by construction. And B's job file is downstream of A's
-$2.93 planner: no arm here paid for producing its own decomposition. Every
-number in this session moved when it was sampled a second time, which is the
-best argument for the caveats and against the confidence.
+**How much to trust it: n=1 per arm.** Both quota walls were injected rather
+than encountered, and the task is unusually friendly to parallel decomposition —
+four pre-split files, disjoint by construction.
 
 ## License
 
