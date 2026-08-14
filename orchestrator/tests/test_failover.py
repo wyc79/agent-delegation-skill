@@ -1477,6 +1477,197 @@ class TestChannelsCommand(unittest.TestCase):
         self.assertIn("25%", out, out)   # 10 of est_capacity 40
 
 
+DSH_HOME = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures", "dsh-home")
+DSH_FIXTURES = os.path.join(DSH_HOME, "sessions")
+
+
+class TestDshSeat(unittest.TestCase):
+    """A dsh seat, without dsh installed.
+
+    `dsh --profile headless` prints the final assistant message and exits: no
+    structured-output flag exists (checked against `--help` on 0.1.0-rc.6), so
+    stdout is prose and everything structured comes from the session log it
+    persisted. Both halves are tested here -- the exit-code floor through the
+    command pattern, and the enrichment against a recorded store -- and neither
+    touches the network or needs the binary.
+
+    orchestrator/docs/dsh-adapter-notes.md carries the verified/assumed split.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+
+    def tearDown(self):
+        self.t.close()
+
+    # --- the reader -------------------------------------------------------
+    def test_usage_is_summed_across_the_session(self):
+        from adg import dsh
+        events = dsh.read_events(
+            os.path.join(DSH_FIXTURES, "--tmp-proj--", "s-01", "session.jsonl"))
+        got = dsh.usage(events)
+        self.assertEqual(got["fresh_in"], 1200)
+        self.assertEqual(got["cache_read"], 8000)
+        self.assertEqual(got["cache_write"], 500)
+        self.assertEqual(got["out"], 340)
+        # `in` is the total, matching every other adapter's shape, so `_bill`
+        # prices a dsh run through exactly the same path.
+        self.assertEqual(got["in"], 1200 + 8000 + 500)
+
+    def test_a_packed_chunk_row_and_a_torn_tail_are_skipped_not_fatal(self):
+        """`packChunks` is on by default, so runs of stream chunks are stored
+        as rows that are not SessionEvents at all -- and an append-only log
+        written by a live process routinely ends mid-line."""
+        from adg import dsh
+        events = dsh.read_events(
+            os.path.join(DSH_FIXTURES, "--tmp-walled--", "s-02", "session.jsonl"))
+        self.assertTrue(events, "a torn tail emptied the whole log")
+        self.assertIsNotNone(dsh.failure(events),
+                             "the structured failure was lost with the bad line")
+
+    def test_the_structured_failure_is_what_classifies_not_the_prose(self):
+        """The fixture's own user/message says "429" and "rate_limit" as the
+        AGENT's words. Reading those as the provider is the failure this whole
+        contract exists to prevent, so the wall has to come from LlmFailure."""
+        from adg import dsh
+        events = dsh.read_events(
+            os.path.join(DSH_FIXTURES, "--tmp-walled--", "s-02", "session.jsonl"))
+        err = dsh.failure(events)
+        self.assertEqual(err["code"], "insufficient_quota")
+        self.assertEqual(err["status"], 429)
+        res = {"settled": "blocked", "stderr": "", "dsh_failure": err}
+        probe = dsh.probe_text(res)
+        self.assertIn("insufficient_quota", probe)
+        self.assertNotIn("retry handler", probe,
+                         "the agent's own prose reached the probe")
+
+    def test_a_stated_retry_after_beats_the_prose_table(self):
+        from adg import dsh
+        events = dsh.read_events(
+            os.path.join(DSH_FIXTURES, "--tmp-walled--", "s-02", "session.jsonl"))
+        res = {"dsh_failure": dsh.failure(events)}
+        self.assertEqual(dsh.stated_reset(res, T0), T0 + 5400,
+                         "providerRetryAfterMs was not used as the reset time")
+
+    def test_per_event_origin_is_available(self):
+        """dsh answers the provenance ask pane mode cannot: `source.kind`
+        separates a human prompt from an agent.inject() context."""
+        from adg import dsh
+        events = dsh.read_events(
+            os.path.join(DSH_FIXTURES, "--tmp-proj--", "s-01", "session.jsonl"))
+        self.assertEqual(dsh.human_turn_kinds(events), {"user": 1, "plugin": 1})
+
+    def test_a_compressed_log_is_refused_by_name_not_decoded(self):
+        """The default artifact, and the constraint the notes file records: no
+        stdlib zstd before 3.14. Naming the reason beats a silent empty
+        enrichment, because the fix is one line in the user's dsh profile and
+        they cannot apply it if nothing says so."""
+        from adg import dsh
+        env = {"DSH_HOME": DSH_HOME}
+        path, note = dsh.find_log("/tmp/zstd", env=env)
+        self.assertIsNone(path, "a zstd artifact was offered to the line reader")
+        self.assertIn("Zstandard", note)
+        self.assertIn("compression: none", note, "the note omits the fix")
+
+    def test_a_missing_store_says_so_rather_than_failing_quietly(self):
+        from adg import dsh
+        res = {}
+        dsh.enrich(res, "/tmp/x", env={"DSH_HOME": "/nonexistent"})
+        self.assertIn("no dsh session store", res["dsh_note"])
+
+    def test_the_log_is_found_under_the_project_key(self):
+        from adg import dsh
+        path, note = dsh.find_log("/tmp/proj", env={"DSH_HOME": DSH_HOME})
+        self.assertIsNotNone(path, note)
+        self.assertIn("--tmp-proj--", path,
+                      "the reader did not use the project key")
+
+    def test_a_missing_store_leaves_the_result_untouched(self):
+        from adg import dsh
+        res = {"settled": "idle", "output": "done", "code": 0}
+        before = dict(res)
+        dsh.enrich(res, self.t.repo, env={"DSH_HOME": "/nonexistent"})
+        for k, v in before.items():
+            self.assertEqual(res[k], v, "enrichment changed the floor's answer")
+
+    def test_the_project_key_matches_the_shipped_encoder(self):
+        """Transcribed from dsh-session-persistence-jsonl, not invented: runs of
+        separators collapse to one dash, `~` and anything unsafe become ~XXXX,
+        leading dashes go, and the whole thing is wrapped."""
+        from adg import dsh
+        self.assertEqual(dsh.project_key("/tmp/proj"), "--tmp-proj--")
+        self.assertEqual(dsh.project_key("/a//b"), "--a-b--")
+        self.assertEqual(dsh.project_key("/x/~y"), "--x-~007Ey--")
+
+    # --- the floor --------------------------------------------------------
+    def _session(self, argv):
+        return runtime.Session("dsh-x", self.t.repo, handle={
+            "kind": "dsh", "role": "implementer", "argv": argv,
+            "env": dict(os.environ, DSH_HOME="/nonexistent")})
+
+    def test_the_task_goes_on_argv_and_settles_on_the_exit_code(self):
+        """headless declares `[task...]` positionally and reads nothing from
+        stdin, so the shared stdin path would hand it an empty task and wait."""
+        a = runtime.LocalAdapter()
+        argv = ["python3", "-c",
+                "import sys; print('TASK=' + sys.argv[1]); sys.exit(0)"]
+        res = a.prompt(self._session(argv), "do the thing", timeout=30)
+        self.assertEqual(res["settled"], "idle")
+        self.assertIn("TASK=do the thing", res["output"])
+        self.assertIsNone(res["failure"])
+
+    def test_a_non_zero_exit_is_a_plain_failure(self):
+        a = runtime.LocalAdapter()
+        argv = ["python3", "-c", "import sys; sys.exit(2)"]
+        res = a.prompt(self._session(argv), "go", timeout=30)
+        self.assertEqual(res["settled"], "blocked")
+        self.assertEqual(res["failure"], "other")
+
+    def test_the_printed_answer_is_never_classified(self):
+        """The whole point of the seat kind. headless prints the agent's final
+        message; an agent whose job is rate limiting must not cool its seat."""
+        a = runtime.LocalAdapter()
+        argv = ["python3", "-c",
+                "print('I added the 429 retry_limit handler; usage limit "
+                "reached is now handled'); import sys; sys.exit(1)"]
+        res = a.prompt(self._session(argv), "go", timeout=30)
+        self.assertEqual(res["failure"], "other",
+                         "stdout was read as the provider refusing")
+        self.assertIsNone(res["reset_at"])
+
+    def test_stderr_is_classified(self):
+        a = runtime.LocalAdapter()
+        argv = ["python3", "-c",
+                "import sys; sys.stderr.write('dsh: 429 rate_limited'); "
+                "sys.exit(1)"]
+        res = a.prompt(self._session(argv), "go", timeout=30)
+        self.assertEqual(res["failure"], "quota_exhausted",
+                         "the provider's own stream was ignored")
+
+    def test_a_dsh_seat_renders_without_fabricated_headroom(self):
+        """API-billed, so no metered window. `delegate status` must say it has
+        no estimate rather than print a percentage nobody measured."""
+        reg = json.loads(json.dumps(router.load_registry(REGISTRY)))
+        reg["channels"]["dsh-seat"] = {
+            "type": "metered", "adapter": "local", "agent_kind": "dsh",
+            "exposes": ["balanced-coder"]}
+        lines = cli._seat_quota_lines(reg, {}, {}, T0)
+        row = [l for l in lines if "dsh-seat" in l][0]
+        self.assertIn("no capacity estimate", row)
+        self.assertNotIn("%", row)
+
+    def test_the_notes_file_separates_verified_from_assumed(self):
+        doc = _slurp(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))),
+            "orchestrator", "docs", "dsh-adapter-notes.md"))
+        self.assertIn("0.1.0-rc.6", doc, "the notes name no pinned version")
+        self.assertIn("verified", doc)
+        self.assertIn("ASSUMED", doc, "the notes claim everything was verified")
+        self.assertIn("Zstandard", doc, "the notes omit the reader's blocker")
+
+
 class TestRunLogAndBundle(unittest.TestCase):
     """The record a real quota wall gets diagnosed from, hours later.
 

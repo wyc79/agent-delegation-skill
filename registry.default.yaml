@@ -194,6 +194,33 @@ channels:
   #   agent_kind: claude
   #   exposes: [opus-class-strong, balanced-coder]
 
+  # DeepSeek Harness, headless. Commented out because it is nobody's default:
+  # enrolling a seat is a deliberate edit, and this one is pinned to a release
+  # candidate of a project that promises compatibility-breaking changes.
+  #
+  # PINNED TO @deepseek-ai/dsh@0.1.0-rc.6. What was verified against that
+  # version and what was only inferred is in
+  # orchestrator/docs/dsh-adapter-notes.md — read it before raising the pin.
+  #
+  # `type: metered`, and NO `quota:` block, deliberately. This is an API-billed
+  # seat: there is no subscription window to draw down, so there is no
+  # utilisation to meter and no headroom to estimate. `delegate status` renders
+  # it as "no capacity estimate" rather than inventing a percentage, which is
+  # the no-fabricated-headroom rule doing its job — a seat that reported "100%
+  # left" is exactly the number somebody would dispatch a wave on.
+  #
+  # Enrichment (token counts, the structured failure) reads the persisted
+  # session log, which dsh writes Zstandard-compressed by default and this
+  # program cannot decompress with the standard library alone. To get it, set
+  # `compression: none` on the session-persistence-jsonl plugin in the headless
+  # profile. Without that the seat still works; it just bills from nothing and
+  # classifies from stderr only.
+  # dsh-seat:
+  #   type: metered
+  #   adapter: local
+  #   agent_kind: dsh
+  #   exposes: [balanced-coder]
+
 # ---------------------------------------------------------------------------
 # Policy. Composes DOWN only: a repo or a single task may lower these,
 # never raise them.

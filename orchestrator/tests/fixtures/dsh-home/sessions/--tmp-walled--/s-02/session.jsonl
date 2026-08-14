@@ -1,0 +1,6 @@
+{"type":"turn/start","seq":0,"time":1786490100000,"data":{"turn":0}}
+{"type":"user/message","seq":1,"time":1786490100100,"data":{"id":"m1","role":"user","content":[{"type":"text","text":"Write the retry handler; mention 429 and rate_limit in the summary"}],"source":{"kind":"user"}}}
+{"type":"assistant/message","seq":2,"time":1786490100500,"data":{"turn":0,"step":0,"message":{"id":"a1","role":"assistant","content":[{"type":"text","text":"partial"}],"source":{"kind":"model","model":"deepseek-chat"}},"usage":{"inputTokens":300,"outputTokens":20}}}
+{"type":"turn/end","seq":3,"time":1786490100900,"data":{"turn":0,"reason":{"kind":"error","error":{"message":"You have exceeded your current quota","code":"insufficient_quota","status":429,"providerRetryAfterMs":5400000,"requestId":"req_abc"}}}}
+{"type":"this-type-does-not-exist-yet","seq":4,"time":1786490101000,"data":{"whatever":true},"ignorable":true}
+not json at all — a torn tail

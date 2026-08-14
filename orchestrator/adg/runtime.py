@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import time
 
-from . import quota
+from . import dsh, quota
 from .store import git
 
 
@@ -190,6 +190,12 @@ AGENT_CONFIG = {
     "cursor": [".cursor/rules", ".cursorrules"],
     "codex": ["AGENTS.md"],
     "gemini": ["GEMINI.md"],
+    # dsh ships `@deepseek-ai/dsh-skill` and a subdir-AGENTS.md injector, and
+    # AGENTS.md is the convention that package names. Listed so `delegate init`
+    # audits a dsh seat like any other rather than reporting it as having no
+    # conventions at all -- which would read as "this seat is fine" when the
+    # real answer is "nobody asked".
+    "dsh": ["AGENTS.md"],
 }
 
 
@@ -275,6 +281,14 @@ class LocalAdapter(Adapter):
         "codex": ["codex", "exec", "--full-auto"],
         "cursor": ["cursor-agent", "-p", "--force", "--output-format", "json"],
         "gemini": ["gemini", "-y", "-p"],
+        # DeepSeek Harness, pinned to 0.1.0-rc.6. `--profile headless` answers
+        # one task in the invoking directory and exits; it has NO structured
+        # output flag (`--help` lists only `-h`), so stdout is the agent's final
+        # message as prose and nothing else. Everything structured comes from
+        # the persisted session log afterwards -- see
+        # orchestrator/docs/dsh-adapter-notes.md, which records what was
+        # verified against the installed package and what was not.
+        "dsh": ["dsh", "--profile", "headless"],
     }
 
     # Some agent CLIs confine file access to the working directory. Both the
@@ -380,6 +394,8 @@ class LocalAdapter(Adapter):
         # --add-dir will otherwise swallow a trailing positional prompt, and
         # stdin has no argument-length limit.
         kind = (session.handle or {}).get("kind")
+        if kind == "dsh":
+            return self._prompt_dsh(session, text, timeout, argv)
         try:
             p = subprocess.run(argv or session.handle["argv"], cwd=session.cwd,
                                env=session.handle["env"], input=text,
@@ -395,6 +411,45 @@ class LocalAdapter(Adapter):
             return {"settled": "timeout", "output": "", "code": None,
                     "failure": "timeout", "reset_at": None}
         return _result(p.stdout, p.stderr, p.returncode, kind=kind)
+
+    def _prompt_dsh(self, session, text, timeout, argv=None, now=None):
+        """One headless dsh turn, then whatever its session log will admit to.
+
+        Two things make this its own path. The task goes on **argv**, not
+        stdin: `dsh --profile headless` declares `[task...]` positionally and
+        reads no prompt from stdin, so the shared path would hand it an empty
+        task and wait. And stdout is the final assistant message as prose --
+        there is no structured-output flag on headless, checked against
+        `--help` -- so the classifier is shown stderr and the session log's
+        structured failure, and never the printed answer. An agent whose job
+        involves rate limits must not be able to cool its own seat.
+        """
+        now = time.time() if now is None else now
+        started = now
+        base = list(argv or session.handle["argv"])
+        try:
+            p = subprocess.run(base + [text], cwd=session.cwd,
+                               env=session.handle["env"],
+                               capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"settled": "timeout", "output": "", "code": None,
+                    "failure": "timeout", "reset_at": None}
+        res = {"settled": "idle" if p.returncode == 0 else "blocked",
+               "output": p.stdout or "", "stderr": p.stderr or "",
+               "code": p.returncode, "cost_usd": None, "usage": None,
+               "elapsed_ms": None, "turns": None, "error_code": None}
+        # Enrichment first, so the structured failure is in scope when the
+        # table is asked. Best-effort by construction: `enrich` cannot raise,
+        # and everything below still works from the exit code alone.
+        dsh.enrich(res, session.cwd, env=session.handle.get("env"),
+                   since=started - 1)
+        classify(res, "dsh", now, text=dsh.probe_text(res))
+        stated = dsh.stated_reset(res, now)
+        if stated and res.get("failure") == "quota_exhausted":
+            # A provider-stated delay beats every regex in the prose table, so
+            # it wins where it exists rather than being a fallback for it.
+            res["reset_at"] = stated
+        return res
 
     def follow_up(self, session, text, timeout):
         flag = self.CONTINUE.get(session.handle.get("kind"))

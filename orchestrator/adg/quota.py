@@ -55,6 +55,20 @@ PATTERNS = {
         r"usage limit",
         r"\bout of (?:requests|credits)\b",
     ],
+    # DeepSeek Harness. Narrow on purpose, and it matters more here than
+    # elsewhere: `dsh --profile headless` prints the final assistant message on
+    # stdout, so the adapter shows this table only stderr plus the session
+    # log's structured `LlmFailure` -- see `runtime.LocalAdapter._prompt_dsh`.
+    # The heavy lifting is meant to be done by `LlmFailure.code` through
+    # ERROR_CODES; these are the fallback for a wall that never reaches a
+    # session log, which is exactly the case a startup-time refusal produces.
+    "dsh": [
+        r"\b429\b",
+        r"\brate[ _-]?limit(?:ed|_exceeded)?\b",
+        r"usage limit",
+        r"\bquota\b.{0,40}\bexceeded\b",
+        r"\binsufficient_quota\b",
+    ],
 }
 
 # A CLI that returns a JSON envelope can report the refusal as a code rather
