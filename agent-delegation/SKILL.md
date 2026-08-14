@@ -206,6 +206,11 @@ agent's pane is invisible to the record — nothing knows which turn came from
 you — so the job is counted and flagged in the merge brief instead, as a result
 that may no longer answer the goal it was dispatched with.
 
+**In pane mode, quota walls are not auto-detected.** A pane exposes only the
+agent's own transcript, never the provider's error channel, so a walled seat
+surfaces as a failed job rather than a cooldown — and `delegate resume` after
+the window reopens is manual. Run `--no-panes` if you want the failover.
+
 **Exit code 1 does not mean it failed.** Only `done` exits 0; parked, waiting on
 quota, declined and crashed all exit 1. Read the status.
 

@@ -57,7 +57,14 @@ PATTERNS = {
     ],
 }
 
-# herdr reports failures as a JSON error code rather than prose.
+# A CLI that returns a JSON envelope can report the refusal as a code rather
+# than as prose -- `runtime._result` lifts it from `error.code`. That is the
+# provider talking through the CLI, so it is in scope here.
+#
+# This used to say "herdr reports failures as a JSON error code", and herdr
+# does not: its `AgentInfo` carries no error field at all, only a liveness
+# status. Nothing ever populated `error_code` on the pane path, and the pane
+# path no longer classifies anything -- see `runtime.HerdrAdapter`.
 ERROR_CODES = {"rate_limited", "quota_exceeded", "usage_limit_reached",
                "agent_rate_limited", "insufficient_quota"}
 

@@ -635,10 +635,174 @@ class TestRuntimeClassification(unittest.TestCase):
         s = a.start_agent("implementer", "claude", ".", {})
         self.assertIsNone(a.prompt(s, "go", timeout=1)["failure"])
 
-    def test_herdr_error_codes_classify_without_prose(self):
+    def test_a_json_envelopes_error_code_classifies_without_prose(self):
+        """`error.code` out of a JSON envelope, lifted by `runtime._result`.
+
+        Named for herdr until the schema was actually read: herdr's `AgentInfo`
+        has no error field at all, so nothing on that path ever set this key.
+        What does set it is a CLI whose envelope reports the refusal as a code
+        -- which is the provider talking through the CLI, and in scope.
+        """
         res = {"settled": "blocked", "output": "", "code": 1,
                "error_code": "rate_limited"}
         self.assertEqual(quota.classify("claude", res, T0)[0], "quota_exhausted")
+
+
+class TestHerdrPaneClassification(unittest.TestCase):
+    """The pane path must not read the agent as the provider.
+
+    A pane is a PTY: the CLI's stderr is already merged into the scrollback, so
+    what `agent read` returns is the AGENT's prose. An agent whose job merely
+    mentions rate limits -- writing a retry handler, reviewing a limiter,
+    grepping for RESOURCE_EXHAUSTED -- puts every string in `quota.PATTERNS`
+    into that scrollback.
+
+    The asymmetry decides it. A false positive is a five-hour breaker on a
+    healthy seat, machine-wide, across every repository, and it is silent. A
+    missed wall is one failed attempt, and it is loud. herdr exposes no channel
+    that carries the provider's own words (see `runtime.HerdrAdapter`), so the
+    pane path classifies nothing.
+
+    Driven through the adapter, not `quota.classify`: the whole question is
+    which text the adapter hands over, and a test against the classifier cannot
+    see that.
+    """
+
+    class _Pane(runtime.HerdrAdapter):
+        """A herdr that answers `agent prompt` and `agent read` from a script."""
+
+        def __init__(self, transcript, status="blocked"):
+            runtime.HerdrAdapter.__init__(self, workspace="w1")
+            self.transcript, self.status = transcript, status
+
+        def _cli(self, args, check=True):
+            if args[:2] == ["agent", "prompt"]:
+                return {"result": {"agent": {"agent_status": self.status}}}
+            if args[:2] == ["agent", "read"]:
+                return {"result": {"text": self.transcript}}
+            return {"result": {}}
+
+    @staticmethod
+    def _session():
+        return runtime.Session("x", "/tmp",
+                               handle={"herdr": True, "role": "implementer",
+                                       "kind": "claude"})
+
+    def _prompt(self, transcript, status="blocked"):
+        return self._Pane(transcript, status).prompt(self._session(), "go", 10)
+
+    def test_an_agents_quota_vocabulary_in_a_pane_is_not_a_wall(self):
+        """Every positive string in the corpus, as the AGENT's transcript. Each
+        one classifies as a wall when a provider says it on stderr; none may
+        when it is the pane talking."""
+        walls = [c["text"] for c in CORPUS["cases"]
+                 if c.get("expect") == "quota_exhausted" and "_class" not in c]
+        self.assertTrue(walls, "the corpus lost its positive cases")
+        for text in walls:
+            with self.subTest(text=text[:48]):
+                res = self._prompt("I am writing the retry handler.\n" + text)
+                self.assertEqual(res["failure"], "other",
+                                 "the pane transcript was read as the provider")
+                self.assertIsNone(res["reset_at"],
+                                  "a reopen time was parsed out of agent prose")
+
+    def test_the_documented_unclassified_behaviour_holds_end_to_end(self):
+        """No structured channel exists, so this is the positive case the item
+        asks for: a run whose seat really has walled gets a failed job, no
+        cooldown entry, and no park -- the outcome SKILL.md now promises."""
+        task = store.Task.create(self.t.repo, "T-PANE", "# t\n\n- **AC-1** — x\n",
+                                 self.pol)
+        task.write_text("plan.md", PLAN_MD)
+
+        class Adapter(runtime.MockAdapter):
+            """A mock wearing the pane path's answer: settled blocked, the
+            provider's message only in the scrollback, nothing else."""
+
+            def prompt(self, session, text, timeout):
+                return runtime.settle_unclassified({
+                    "settled": "blocked", "code": 1, "cost_usd": None,
+                    "pane_transcript": True,
+                    "output": "Error: Claude AI usage limit reached. "
+                              "Your limit will reset in 2 hours."})
+
+        logs = []
+        Orchestrator(task, self.reg, Adapter({}), lambda k, x: True,
+                     log=logs.append, clock=lambda: T0).run()
+        self.assertEqual(cooldown.read(T0)[0], {},
+                         "a pane transcript opened a breaker")
+        self.assertNotIn("quota_all_exhausted",
+                         (task.state.get("park") or {}).get("reason") or "")
+        self.assertFalse(any("failover:" in x for x in logs),
+                         "a pane failure was routed as a quota wall:\n"
+                         + "\n".join(logs))
+
+    def test_a_refusal_by_herdr_is_not_the_provider_either(self):
+        """herdr's own ErrorResponse code says herdr would not take the
+        request. Feeding it to the table would let herdr's vocabulary cool a
+        seat herdr never called."""
+        class H(runtime.HerdrAdapter):
+            def _cli(self, args, check=True):
+                self.last_error = "rate_limited"      # herdr's word, not a provider's
+                return None
+        res = H(workspace="w1").prompt(self._session(), "go", 10)
+        self.assertEqual(res["failure"], "other")
+        self.assertIsNone(res["reset_at"])
+        self.assertEqual(res.get("herdr_error"), "rate_limited",
+                         "the reason was dropped instead of being kept off the table")
+        self.assertIsNone(res.get("error_code"),
+                          "herdr's code reached the key the classifier reads")
+
+    def test_a_hung_pane_is_still_a_timeout(self):
+        """Not a reading of text -- it is how the call ended. A timeout still
+        hops to another seat and still does not cool one."""
+        class H(runtime.HerdrAdapter):
+            def _cli(self, args, check=True):
+                self.last_error = "timeout"
+                return None
+        res = H(workspace="w1").prompt(self._session(), "go", 10)
+        self.assertEqual(res["failure"], "timeout")
+        self.assertIsNone(res["reset_at"])
+
+    def test_a_clean_pane_turn_is_not_a_failure(self):
+        res = self._prompt("all done\n", status="idle")
+        self.assertIsNone(res["failure"])
+        self.assertIsNone(res["reset_at"])
+
+    def test_no_panes_keeps_the_whole_local_probe(self):
+        """The regression that would make this item a downgrade. `--no-panes`
+        is a real subprocess with a real stderr, and it must keep classifying."""
+        h = runtime.HerdrAdapter(workspace="w1", panes=False)
+        sess = runtime.Session("x", "/tmp", handle={
+            "kind": "claude", "argv": ["python3", "-c",
+                                       "import sys; sys.stderr.write("
+                                       "'Error: Claude AI usage limit reached');"
+                                       "sys.exit(1)"],
+            "env": dict(os.environ), "role": "implementer"})
+        res = h.prompt(sess, "go", timeout=30)
+        self.assertEqual(res["failure"], "quota_exhausted",
+                         "the subprocess path stopped classifying")
+
+    def test_a_pane_wall_captures_nothing_to_the_corpus(self):
+        """Capture records what classification SAW. On this path it saw
+        nothing, so there is nothing to file -- and filing agent prose as a
+        provider message would poison the corpus that pins detection."""
+        from adg import corpus
+        self._prompt("Claude AI usage limit reached. Resets at 3pm.")
+        self.assertFalse(os.path.exists(corpus.path()),
+                         "agent prose was filed as a provider wall")
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+        with open(os.path.join(self.t.repo, ".adg.yaml"), "w") as fh:
+            fh.write('fast:\n  - "python3 -c \'print(1)\'"\n')
+        sh(["git", "add", "-A"], self.t.repo)
+        sh(["git", "commit", "-qm", "cfg"], self.t.repo)
+
+    def tearDown(self):
+        self.t.close()
 
 
 def _orch(reg, adapter, task, clock=None, logs=None):

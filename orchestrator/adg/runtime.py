@@ -92,6 +92,33 @@ def _result(stdout, stderr, code, kind=None, now=None, error_code=None):
     return classify(res, kind, now, probe)
 
 
+def settle_unclassified(res):
+    """Settle a failure WITHOUT asking the pattern table anything.
+
+    The adapter decides what text classification is allowed to read, and an
+    adapter is entitled to answer "nothing". This is that answer: the result
+    gets a `failure` derived only from how the call settled, never from prose.
+
+    Which means no `quota_exhausted` can come out of here, so no breaker, no
+    cooldown and no reset parse -- the run sees a plain failed attempt. That is
+    the cheap, loud outcome. The expensive, silent one is a five-hour breaker on
+    a healthy seat, machine-wide, across every repository, opened because an
+    agent working on rate-limiting code said "429" in its own transcript.
+
+    `timeout` survives, because a timeout is not a reading of text: it is how
+    the call ended. It hops to another seat and deliberately does not cool one,
+    which is the same thing it means everywhere else. `quota.failed` decides
+    "did this fail at all" here as it does there, so the two cannot drift.
+    """
+    if not quota.failed(res):
+        res["failure"], res["reset_at"] = None, None
+    elif res.get("settled") == "timeout":
+        res["failure"], res["reset_at"] = "timeout", None
+    else:
+        res["failure"], res["reset_at"] = "other", None
+    return res
+
+
 def classify(res, kind, now=None, text=None):
     """Attach `failure` and `reset_at` to an adapter result. One seam, so every
     adapter answers the quota question the same way."""
@@ -378,7 +405,37 @@ class LocalAdapter(Adapter):
 
 class HerdrAdapter(LocalAdapter):
     """Uses herdr for worktrees, panes and authenticated sessions. Inherits
-    LocalAdapter so any unavailable piece degrades instead of failing."""
+    LocalAdapter so any unavailable piece degrades instead of failing.
+
+    **In pane mode, quota walls are not detected at all, and that is
+    deliberate.** herdr exposes no channel that carries the provider's own
+    words. Checked against the shipped API schema (`herdr api schema`, protocol
+    schema_version 1) and against a live `herdr agent list`:
+
+      * `AgentInfo` -- what `agent prompt` and `agent get` return -- has no
+        error field of any kind. Its whole outcome vocabulary is
+        `agent_status: idle | working | blocked | done | unknown`, which is
+        liveness and says nothing about why. (This class used to read
+        `agent.get("error_code")`; herdr has never emitted one, so that read
+        was a permanent None dressed as a structured channel.)
+      * `ErrorResponse{code, message}` is herdr refusing the REQUEST --
+        `agent_pane_busy`, a stalled prompt, a timeout. That is herdr talking
+        about herdr, not a provider talking about quota.
+      * All four `agent read --source` values (visible, recent,
+        recent-unwrapped, detection) are renderings of the pane's scrollback.
+        A pane is a PTY, so a CLI's stderr is already merged into the screen
+        by construction: there is no stderr-like channel to separate out.
+
+    That leaves only the transcript, which is prose the AGENT wrote, and
+    classifying an agent's own words as the provider refusing is the failure
+    `runtime._result` documents at length for the local path. So the pane path
+    settles unclassified (`settle_unclassified`): a wall shows up as a failed
+    job, and resuming after the window reopens is the caller's move.
+
+    `--no-panes` is unaffected. It runs `LocalAdapter.prompt`, a real
+    subprocess with a real stderr and a real JSON envelope, and keeps the full
+    envelope-minus-prose probe.
+    """
 
     name = "herdr"
 
@@ -497,10 +554,15 @@ class HerdrAdapter(LocalAdapter):
                          "--timeout", str(int(timeout * 1000))], check=False)
         if res is None:
             why = getattr(self, "last_error", "") or "unknown"
-            return classify({"settled": "timeout" if "timeout" in why else "blocked",
-                             "output": "herdr refused the prompt: %s" % why,
-                             "code": None, "cost_usd": None,
-                             "error_code": why}, kind)
+            # herdr's own error code, kept on the record and deliberately NOT
+            # named `error_code`: that key is the one `quota.classify` reads,
+            # and this is herdr saying it would not take the request, not a
+            # provider saying it is out. Handing it to the table would let
+            # herdr's vocabulary open a breaker on a seat herdr never called.
+            return settle_unclassified({
+                "settled": "timeout" if "timeout" in why else "blocked",
+                "output": "herdr refused the prompt: %s" % why,
+                "code": None, "cost_usd": None, "herdr_error": why})
         read = self._cli(["agent", "read", session.name, "--source",
                           "recent-unwrapped", "--lines", "400"], check=False) or {}
         out = ((read.get("result") or {}).get("text")
@@ -517,10 +579,14 @@ class HerdrAdapter(LocalAdapter):
         # anything. A subprocess run has no keyboard on it, and its output is
         # the agent's own prose, where a line beginning `>` is a blockquote and
         # not somebody talking.
-        return classify({"settled": "blocked" if state == "blocked" else "idle",
-                         "output": out, "code": 0 if state != "blocked" else 1,
-                         "cost_usd": None, "pane_transcript": True,
-                         "error_code": agent.get("error_code")}, kind)
+        #
+        # And it is the same fact that keeps `out` away from the pattern table.
+        # Scrollback is what the AGENT wrote; herdr offers nothing else (see the
+        # class docstring), so this settles unclassified rather than guessing.
+        return settle_unclassified({
+            "settled": "blocked" if state == "blocked" else "idle",
+            "output": out, "code": 0 if state != "blocked" else 1,
+            "cost_usd": None, "pane_transcript": True})
 
     def follow_up(self, session, text, timeout):
         if not (session.handle or {}).get("herdr"):
