@@ -181,8 +181,13 @@ def _until_epoch(text, now):
     Bare `HH:MM` is the next occurrence of that time, which is the case this
     command exists for: the message in the pane says "resets at 14:03" and
     gives no date, and both readings of it -- later today, or tomorrow -- are
-    ordinary. `tm_isdst=-1` lets mktime settle which offset applies, so an
-    overnight cooldown across a clock change lands where the wall clock says.
+    ordinary.
+
+    `tm_isdst=-1` settles the offset for TODAY's date. The tomorrow branch then
+    adds 24 hours rather than re-resolving the date, so a time typed the evening
+    before a clock change lands an hour off the one stated -- measured at
+    `America/New_York`, `--until 14:03` at 23:00 on 2026-03-07 returns 15:03.
+    The command prints the time it actually set, and `--clear` reopens early.
     """
     raw = str(text or "").strip()
     for fmt in _UNTIL_FORMATS:

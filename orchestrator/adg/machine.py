@@ -186,10 +186,9 @@ class Orchestrator:
         # and reopen times all derive from it, so a run replays under a fixed
         # clock exactly as it ran.
         self.clock = clock
-        # Every line also lands in the task directory. Stdout is gone the moment
-        # the terminal scrolls, and the thing a real quota wall is diagnosed
-        # from afterwards is the record, not somebody's scrollback. Wrapped
-        # after `clock`, which it stamps from.
+        # Stdout is gone the moment the terminal scrolls, and the thing a real
+        # quota wall is diagnosed from afterwards is the record, not somebody's
+        # scrollback. Wrapped after `clock`, which it stamps from.
         self._log_lock = threading.Lock()
         self._log_persist_failed = False
         self.log = self._persisting(log)
@@ -2202,8 +2201,7 @@ class Orchestrator:
     def _sent(session, text):
         """Remember a prompt, so a line in the pane that is not one of these can
         be recognised as somebody else's."""
-        if session is not None:
-            session.sent.append(text)
+        session.sent.append(text)
 
     def _count_human_turns(self, session, sub, res):
         """Count the lines somebody typed into this job's pane while it worked.
@@ -2227,7 +2225,7 @@ class Orchestrator:
         so. orchestrator/docs/pane-mode-human-input.md has the field that would
         fix it.
         """
-        if sub is None or session is None or not res.get("pane_transcript"):
+        if sub is None or not res.get("pane_transcript"):
             return
         fresh = [(line, at) for line, at in
                  foreign_input(res.get("output"), session.sent)

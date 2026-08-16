@@ -247,13 +247,9 @@ def enrich(res, cwd, env=None, since=None):
         if not events:
             res["dsh_note"] = "the dsh session log held no readable events"
             return res
-        res["dsh_log"] = path
         tok = usage(events)
         if tok:
             res["usage"] = tok
-        kinds = human_turn_kinds(events)
-        if kinds:
-            res["dsh_turn_sources"] = kinds
         err = failure(events)
         if err:
             # The structured channel, and the only text this adapter lets the

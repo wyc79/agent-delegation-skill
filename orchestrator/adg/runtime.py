@@ -412,7 +412,7 @@ class LocalAdapter(Adapter):
                     "failure": "timeout", "reset_at": None}
         return _result(p.stdout, p.stderr, p.returncode, kind=kind)
 
-    def _prompt_dsh(self, session, text, timeout, argv=None, now=None):
+    def _prompt_dsh(self, session, text, timeout, argv=None):
         """One headless dsh turn, then whatever its session log will admit to.
 
         Two things make this its own path. The task goes on **argv**, not
@@ -424,8 +424,7 @@ class LocalAdapter(Adapter):
         structured failure, and never the printed answer. An agent whose job
         involves rate limits must not be able to cool its own seat.
         """
-        now = time.time() if now is None else now
-        started = now
+        now = time.time()
         base = list(argv or session.handle["argv"])
         try:
             p = subprocess.run(base + [text], cwd=session.cwd,
@@ -442,7 +441,7 @@ class LocalAdapter(Adapter):
         # table is asked. Best-effort by construction: `enrich` cannot raise,
         # and everything below still works from the exit code alone.
         dsh.enrich(res, session.cwd, env=session.handle.get("env"),
-                   since=started - 1)
+                   since=now - 1)
         classify(res, "dsh", now, text=dsh.probe_text(res))
         stated = dsh.stated_reset(res, now)
         if stated and res.get("failure") == "quota_exhausted":
