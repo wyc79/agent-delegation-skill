@@ -306,6 +306,35 @@ def cmd_cooldown(args):
           "out. Reopen early with `delegate cooldown %s --clear`." % args.seat)
 
 
+def _herdr_schema_audit(reg):
+    """Is herdr still the shape the adapter was written against?
+
+    Enrolled seats only, and only when herdr is actually there. A deployment
+    that does not route through herdr cannot act on this and should not be
+    told about it, and an absent herdr says nothing about anything -- the
+    check is for the case where a seat is live and the protocol under it moved.
+
+    One line, never a refusal. `runtime.HERDR_SCHEMA_PINNED` carries the
+    reasoning; what a reader needs here is the two numbers and which of this
+    program's assumptions the gap puts in question.
+    """
+    herdr_seats = [name for name, chan in (reg.get("channels") or {}).items()
+                   if isinstance(chan, dict) and chan.get("adapter") == "herdr"
+                   and any((reg.get("models") or {}).get(m, {}).get("enrolled")
+                           for m in (chan.get("exposes") or []))]
+    if not herdr_seats or not runtime.HerdrAdapter.available():
+        return []
+    live = runtime.HerdrAdapter().schema_version()
+    if live == runtime.HERDR_SCHEMA_PINNED:
+        return []
+    return ["", "warning: herdr reports protocol schema_version %s; this "
+                "adapter was written against %s — its error channels and "
+                "agent_status vocabulary may have moved, which is what decides "
+                "whether a pane failure can be classified at all (%s)"
+            % ("nothing" if live is None else live,
+               runtime.HERDR_SCHEMA_PINNED, ", ".join(sorted(herdr_seats)))]
+
+
 def _conventions_audit(repo, reg):
     """Which seats will run without this repository's standing conventions.
 
@@ -383,6 +412,8 @@ def cmd_init(args):
         print("\npresent but deliberately not enrolled: %s" % ", ".join(unused))
 
     for line in _conventions_audit(repo, reg):
+        print(line)
+    for line in _herdr_schema_audit(reg):
         print(line)
 
     # The one question the caller is told to answer here, answered rather than

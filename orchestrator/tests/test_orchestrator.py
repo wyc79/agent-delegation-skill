@@ -8,6 +8,8 @@ Run: python3 orchestrator/tests/test_orchestrator.py
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -4817,6 +4819,119 @@ class TestGateStageChecks(unittest.TestCase):
         src = inspect.getsource(m)
         self.assertIn("for tier in verify.COMMAND_TIERS", src)
         self.assertIn("gate", verify.COMMAND_TIERS)
+
+
+class TestHerdrSchemaPin(unittest.TestCase):
+    """herdr promised nothing, and the adapter is written against a promise.
+
+    a86fee0 decided the pane path classifies nothing, and it decided it from a
+    reading of `herdr api schema` at protocol schema_version 1: `AgentInfo` has
+    no error field, `ErrorResponse` is herdr talking about herdr, and all four
+    `agent read --source` values are renderings of one pane. Every one of those
+    is a fact about version 1. herdr is somebody else's program and can add an
+    error channel, or rename a status, in any release.
+
+    So `init` compares the live number against the pinned one and says when
+    they differ. Warn, never block: which version a deployment is on is not
+    this program's business, and a seat that works must not be refused over a
+    number. Silent when herdr is not enrolled or not there — a check nobody
+    can act on is noise.
+    """
+
+    def setUp(self):
+        self.t = TempRepo()
+
+    def tearDown(self):
+        self.t.close()
+
+    @contextlib.contextmanager
+    def _herdr(self, payload, available=True):
+        """herdr's CLI surface, without herdr. Patched on the real class
+        because `cmd_init` builds its own adapter and cannot be handed one."""
+        A = runtime.HerdrAdapter
+        old_av = A.__dict__["available"]
+        old_cli = A.__dict__["_cli"]
+        self.asked = []
+
+        def cli_(adapter_self, args, check=True):
+            self.asked.append(args)
+            return payload if args[:2] == ["api", "schema"] else None
+
+        A.available = staticmethod(lambda: available)
+        A._cli = cli_
+        try:
+            yield
+        finally:
+            A.available, A._cli = old_av, old_cli
+
+    def _init(self, registry=REGISTRY):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_init(argparse.Namespace(repo=self.t.repo, registry=registry))
+        return buf.getvalue()
+
+    def test_the_pinned_version_is_what_the_investigation_read(self):
+        """A pin whose provenance is not written down is a magic number, and
+        the next person to see it move has no way to judge whether the reading
+        it came from still applies."""
+        import inspect
+        self.assertEqual(runtime.HERDR_SCHEMA_PINNED, 1)
+        src = inspect.getsource(runtime)
+        pin = src.split("HERDR_SCHEMA_PINNED")[0]
+        self.assertIn("a86fee0", pin[-1200:],
+                      "the pin does not name the investigation it came from")
+
+    def test_a_matching_version_says_nothing(self):
+        with self._herdr({"result": {"schema_version": 1}}):
+            out = self._init()
+        self.assertNotIn("schema", out.lower(),
+                         "a version that matches was reported anyway:\n" + out)
+
+    def test_a_bare_payload_shape_is_read_too(self):
+        # herdr guarantees nothing about the envelope either, so both shapes it
+        # has been seen to use are accepted before anything is called a change.
+        with self._herdr({"schema_version": 1}):
+            out = self._init()
+        self.assertNotIn("schema", out.lower(), out)
+
+    def test_a_changed_version_names_both_and_what_may_have_moved(self):
+        with self._herdr({"result": {"schema_version": 2}}):
+            out = self._init()
+        line = [l for l in out.splitlines() if "schema" in l.lower()]
+        self.assertEqual(len(line), 1, "expected one warning line, got %s" % line)
+        self.assertIn("1", line[0], "the pinned version is not named")
+        self.assertIn("2", line[0], "the live version is not named")
+        for what in ("error", "status"):
+            self.assertIn(what, line[0].lower(),
+                          "the warning does not say what may have changed (%s)" % what)
+
+    def test_a_schema_that_states_no_version_is_itself_a_change(self):
+        # The loudest possible signal, and silence here would swallow it: the
+        # field the adapter was written against is gone.
+        with self._herdr({"result": {}}):
+            out = self._init()
+        self.assertIn("schema", out.lower(), out)
+
+    def test_an_unreachable_herdr_is_silent(self):
+        with self._herdr(None, available=False):
+            out = self._init()
+        self.assertNotIn("schema", out.lower(), out)
+        self.assertEqual(self.asked, [], "herdr was called when it is not there")
+
+    def test_no_herdr_seat_means_no_check_is_attempted(self):
+        one = os.path.join(self.t.dir, "local-only.yaml")
+        _spit(one, ONE_SEAT)             # every channel declares adapter: local
+        with self._herdr({"result": {"schema_version": 9}}):
+            out = self._init(registry=one)
+        self.assertEqual(self.asked, [],
+                         "herdr was asked about a deployment that does not use it")
+        self.assertNotIn("schema", out.lower(), out)
+
+    def test_a_warning_never_stops_init(self):
+        with self._herdr({"result": {"schema_version": 7}}):
+            out = self._init()
+        self.assertIn("tier assignments", out,
+                      "the version warning cut `init` short:\n" + out)
 
 
 # Last line of the file, and it has to stay there. `unittest.main()` runs at

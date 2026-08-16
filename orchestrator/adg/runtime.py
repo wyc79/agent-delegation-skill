@@ -462,6 +462,21 @@ class LocalAdapter(Adapter):
         return "idle"
 
 
+# The herdr protocol version the class below was WRITTEN AGAINST, not the one
+# it requires. a86fee0 decided the pane path classifies nothing at all, and it
+# decided that from a reading of `herdr api schema` at schema_version 1:
+# `AgentInfo` carries no error field, `ErrorResponse` is herdr talking about
+# herdr, and all four `agent read --source` values render one pane. Each of
+# those is a fact about version 1, and herdr is somebody else's program --
+# an error channel added, or a status renamed, would change what the honest
+# answer is here without changing a line of this file.
+#
+# So `delegate init` compares and says when they differ. It does not gate:
+# which version a deployment runs is not this program's business, and refusing
+# a working seat over a number would be enforcing where this measures.
+HERDR_SCHEMA_PINNED = 1
+
+
 class HerdrAdapter(LocalAdapter):
     """Uses herdr for worktrees, panes and authenticated sessions. Inherits
     LocalAdapter so any unavailable piece degrades instead of failing.
@@ -513,6 +528,26 @@ class HerdrAdapter(LocalAdapter):
         # comes back from `claude -p --output-format json`. Turning panes off
         # trades that visibility back for an enforceable spend cap.
         self.panes = panes
+
+    def schema_version(self):
+        """herdr's live protocol version, or None when it will not say.
+
+        Two envelope shapes are accepted because herdr guarantees neither, and
+        calling a rewrapped payload a version change would make the pin cry
+        wolf on the one signal it exists to carry. A version this cannot find
+        is reported by `delegate init` as a change, not as silence: the field
+        the adapter was written against being gone is the loudest thing that
+        could happen to it.
+        """
+        got = self._cli(["api", "schema"], check=False)
+        if not isinstance(got, dict):
+            return None
+        for where in (got, got.get("result")):
+            if isinstance(where, dict):
+                v = where.get("schema_version")
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    return int(v)
+        return None
 
     @staticmethod
     def available():
