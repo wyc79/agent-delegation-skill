@@ -206,6 +206,7 @@ delegate status                                # one line per task, then per sea
 delegate show --brief                          # the merge-gate brief
 delegate bundle                                # one redacted file: state, log, brief, walls
 delegate approve --note "..."                  # answer the gate
+delegate reject --note "..."                   # decline it; the run parks
 delegate resume --when-open                    # sleep out a quota window, then continue
 delegate cooldown <seat> --for 5h              # cool a seat by hand — runbook below
 ```
