@@ -2239,6 +2239,222 @@ class TestCorpusCapture(unittest.TestCase):
         self.assertIn("Bearer <key>", got)
 
 
+class TestUnclassifiedEvidence(unittest.TestCase):
+    """The one string that explains a pane-mode failure, kept instead of lost.
+
+    Nothing classifies a pane transcript and nothing here changes that. What
+    changed is where the text goes afterwards: it used to live only in the
+    pane's scrollback, which is gone the moment the terminal scrolls, so the
+    human who has to make the judgement the program refuses to make had nothing
+    to make it from.
+
+    So it is written down, labelled as evidence nobody judged. The label is the
+    load-bearing part -- a later reader, person or model, must not mistake
+    "kept" for "assessed".
+    """
+
+    WALL = ("Error: Claude AI usage limit reached. "
+            "Your limit will reset in 2 hours.")
+
+    def setUp(self):
+        self.t = TempRepo()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        self.t.close()
+
+    def _pane_run(self, transcript=None):
+        """One job dispatched into a pane whose scrollback holds a wall.
+
+        Built on the real `settle_unclassified` rather than a hand-written
+        dict: that function is what "unclassified" means, and a test that
+        described its output instead of calling it would keep passing after the
+        meaning moved.
+        """
+        task = store.Task.create(self.t.repo, "T-EV", "# t\n\n- **AC-1** — x\n",
+                                 self.pol)
+        task.write_text("plan.md", PLAN_MD)
+        text = self.WALL if transcript is None else transcript
+
+        class Pane(runtime.MockAdapter):
+            name = "herdr"
+            panes = True
+
+            def prompt(self, session, prompt_text, timeout):
+                return runtime.settle_unclassified({
+                    "settled": "blocked", "code": 1, "cost_usd": None,
+                    "pane_transcript": True, "output": text})
+
+        logs = []
+        status = Orchestrator(task, self.reg, Pane({}), lambda k, x: True,
+                              log=logs.append, clock=lambda: T0).run()
+        return task, status, logs
+
+    # --- what is kept -------------------------------------------------------
+    def test_the_tail_is_kept_under_a_label_that_says_nothing_judged_it(self):
+        from adg.machine import UNCLASSIFIED_EVIDENCE
+        task, _, _ = self._pane_run()
+        log = task.read_text("run.log")
+        self.assertIn(UNCLASSIFIED_EVIDENCE, log,
+                      "the evidence went into the log unlabelled")
+        self.assertIn("usage limit reached", log,
+                      "the label arrived without the evidence it labels")
+        # The wording is the contract, not decoration: it has to say the text
+        # was not classified AND that a person has to look at it.
+        for phrase in ("evidence only", "not classified", "human judgment"):
+            self.assertIn(phrase, UNCLASSIFIED_EVIDENCE)
+
+    def test_the_evidence_lands_on_the_job_as_well_as_in_the_log(self):
+        from adg.machine import UNCLASSIFIED_EVIDENCE
+        task, _, _ = self._pane_run()
+        sub = task.state["subtasks"][0]
+        kept = sub.get("unclassified_evidence") or []
+        self.assertEqual(len(kept), 1, "expected one block, got %s" % kept)
+        self.assertEqual(kept[0]["label"], UNCLASSIFIED_EVIDENCE)
+        self.assertIn("usage limit reached", kept[0]["tail"])
+        self.assertIn(kept[0]["channel"], self.reg["channels"])
+
+    def test_the_tail_is_redacted_before_anything_writes_it(self):
+        home = os.path.expanduser("~")
+        secret = "sk-" + "A1b2C3d4E5f6G7h8"
+        task, _, _ = self._pane_run(
+            "%s ctx=%s/work/app.py user=ada@example.com auth=%s"
+            % (self.WALL, home, secret))
+        log = task.read_text("run.log")
+        kept = task.state["subtasks"][0]["unclassified_evidence"][0]["tail"]
+        for where, text in (("the run log", log), ("the job's state", kept)):
+            self.assertNotIn(home, text, "a home path reached %s" % where)
+            self.assertNotIn("ada@example.com", text, "an address reached %s" % where)
+            self.assertNotIn(secret, text, "a key reached %s" % where)
+        self.assertIn("usage limit reached", kept,
+                      "redaction took the evidence with it")
+
+    def test_the_tail_is_capped_like_every_other_kept_text(self):
+        from adg import corpus
+        task, _, _ = self._pane_run("x" * 40000 + "\n" + self.WALL)
+        kept = task.state["subtasks"][0]["unclassified_evidence"][0]["tail"]
+        self.assertLessEqual(len(kept), corpus.MAX_TEXT)
+        self.assertIn("usage limit reached", kept,
+                      "the cap kept the head and dropped the tail — the end of "
+                      "a transcript is where the failure is")
+
+    # --- and what it must not do -------------------------------------------
+    def test_keeping_it_cools_nothing_and_captures_nothing(self):
+        from adg import corpus
+        task, _, logs = self._pane_run()
+        self.assertEqual(cooldown.read(T0)[0], {},
+                         "kept evidence opened a breaker")
+        self.assertFalse(os.path.exists(corpus.path()),
+                         "a pane tail was auto-promoted into the corpus")
+        self.assertFalse(any("failover:" in x for x in logs),
+                         "the evidence was routed on:\n" + "\n".join(logs))
+        self.assertNotIn("quota_all_exhausted",
+                         (task.state.get("park") or {}).get("reason") or "")
+
+    def test_the_tail_is_never_handed_to_the_classifier(self):
+        """The boundary, asserted rather than described. Every call into
+        `quota.classify` during the run is recorded, and none of them may carry
+        the transcript -- which is the whole of what a86fee0 decided."""
+        from adg import quota as q
+        seen = []
+        real = q.classify
+
+        def spy(kind, res, now):
+            seen.append((res or {}).get("output") or "")
+            return real(kind, res, now)
+
+        q.classify = spy
+        try:
+            self._pane_run()
+        finally:
+            q.classify = real
+        offenders = [t for t in seen if "usage limit reached" in t]
+        self.assertEqual(offenders, [],
+                         "the pane transcript reached the pattern table")
+
+    def test_a_classified_failure_records_no_evidence_block(self):
+        """The local path is unchanged, and nothing is recorded twice. There
+        the classifier DID see the text and `classification: ... it read:`
+        already carries it; a second labelled copy claiming nobody judged it
+        would be false as well as redundant."""
+        from adg.machine import UNCLASSIFIED_EVIDENCE
+        task = store.Task.create(self.t.repo, "T-CLS", "# t\n\n- **AC-1** — x\n",
+                                 self.pol)
+        task.write_text("plan.md", PLAN_MD)
+        state = {"seen": []}
+
+        def implementer(env, cwd):
+            state["seen"].append(cwd)
+            if len(state["seen"]) == 1:
+                return blocked(QUOTA_MSG)
+            with open(os.path.join(cwd, "app.py"), "a") as fh:
+                fh.write("\ndef subtract(a, b):\n    return a - b\n")
+            _report(env["AGENT_DELEGATION_TASK_DIR"], "implement-st-1-main.json", {
+                "stage": "implement", "role": "implementer", "subtask": "st-1-main",
+                "status": "complete", "summary": "s", "evidence": {"tests": "green"}})
+
+        logs = []
+        Orchestrator(task, self.reg,
+                     runtime.MockAdapter({"implementer": implementer},
+                                         now=lambda: T0),
+                     lambda k, x: True, log=logs.append, clock=lambda: T0).run()
+        log = task.read_text("run.log")
+        self.assertIn("it read:", log, "the classified path stopped recording")
+        self.assertNotIn(UNCLASSIFIED_EVIDENCE, log,
+                         "a classified wall was also filed as unjudged evidence")
+        for sub in task.state["subtasks"]:
+            self.assertNotIn("unclassified_evidence", sub)
+
+    def test_a_herdr_refusal_is_not_filed_as_a_transcript_tail(self):
+        """`HerdrAdapter.prompt`'s other unclassified exit is herdr declining
+        the request. That message is about herdr, not about a provider, and it
+        is already in the log — labelling it as pane evidence would send a
+        reader looking for a wall that nobody hit."""
+        from adg.machine import UNCLASSIFIED_EVIDENCE
+        task = store.Task.create(self.t.repo, "T-REF", "# t\n\n- **AC-1** — x\n",
+                                 self.pol)
+        task.write_text("plan.md", PLAN_MD)
+
+        class Refusing(runtime.MockAdapter):
+            name = "herdr"
+
+            def prompt(self, session, prompt_text, timeout):
+                return runtime.settle_unclassified({
+                    "settled": "blocked", "code": None, "cost_usd": None,
+                    "output": "herdr refused the prompt: agent_pane_busy",
+                    "herdr_error": "agent_pane_busy"})
+
+        Orchestrator(task, self.reg, Refusing({}), lambda k, x: True,
+                     log=lambda *_: None, clock=lambda: T0).run()
+        self.assertNotIn(UNCLASSIFIED_EVIDENCE, task.read_text("run.log"))
+
+    # --- and where it travels ----------------------------------------------
+    def test_a_bundle_of_such_a_run_carries_the_labelled_block(self):
+        from adg.machine import UNCLASSIFIED_EVIDENCE
+        home = os.path.expanduser("~")
+        task, _, _ = self._pane_run(
+            "%s ctx=%s/work/app.py ada@example.com" % (self.WALL, home))
+        text = cli._bundle_text(task, cli._capture_lines_for(task))
+        self.assertIn(UNCLASSIFIED_EVIDENCE, text,
+                      "the evidence did not travel with the bundle")
+        self.assertIn("usage limit reached", text)
+        self.assertNotIn(home, text, "a home path survived into the bundle")
+        self.assertNotIn("ada@example.com", text, "an address survived")
+
+    def test_the_adapter_says_where_the_boundary_is(self):
+        """The rule lives next to the code that would break it. Somebody adding
+        a channel to `HerdrAdapter` reads this docstring; a note in a commit
+        message is not there when they do."""
+        doc = runtime.HerdrAdapter.__doc__ or ""
+        self.assertIn("quota.classify", doc,
+                      "the docstring does not name what the tail is kept away from")
+        for word in ("evidence", "cooldown"):
+            self.assertIn(word, doc.lower(),
+                          "the docstring does not state the %s half" % word)
+
+
 class TestManualCooldown(unittest.TestCase):
     """`delegate cooldown`: a human sitting in the classifier's seat.
 

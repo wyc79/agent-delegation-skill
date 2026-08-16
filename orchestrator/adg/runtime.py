@@ -491,6 +491,14 @@ class HerdrAdapter(LocalAdapter):
     settles unclassified (`settle_unclassified`): a wall shows up as a failed
     job, and resuming after the window reopens is the caller's move.
 
+    **The tail of that transcript is kept, and keeping it judges nothing.**
+    `machine._keep_unclassified_evidence` writes it to the run log and the job's
+    state under a label saying so; it is data at rest, never passed to
+    `quota.classify`, never able to open a cooldown, and it exists only so the
+    human doing the classifying -- `delegate cooldown` is how their answer gets
+    back in -- has the provider's message in front of them rather than in
+    scrollback.
+
     `--no-panes` is unaffected. It runs `LocalAdapter.prompt`, a real
     subprocess with a real stderr and a real JSON envelope, and keeps the full
     envelope-minus-prose probe.

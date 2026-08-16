@@ -69,6 +69,15 @@ _LOG_LOCK = threading.Lock()
 # thing being persisted, so reporting its failure through itself would recurse.
 _LOG = logging.getLogger("adg.machine")
 
+# What a pane-mode failure leaves behind, and the label that says what it is
+# not. `runtime.settle_unclassified` means no machine judgement was applied to
+# this text -- not that it was judged and found innocent -- and a reader
+# arriving hours later, person or model, has to be told which of those it is
+# looking at. Spelled out rather than abbreviated because the audience for it
+# is whoever opens the bundle, and they have no other context.
+UNCLASSIFIED_EVIDENCE = ("unclassified failure — transcript tail "
+                         "(evidence only, not classified; human judgment required)")
+
 # An input line in a pane transcript: the terminal's own prompt marker, with an
 # optional clock stamp in front of it. There is one marker for both parties,
 # because to the terminal a prompt this program sent and a line a human typed
@@ -1901,6 +1910,7 @@ class Orchestrator:
             self._log_transcript(role, text, res)
             self._count_human_turns(session, subtask, res)
             self._log_classification(choice, res)
+            self._keep_unclassified_evidence(choice, res, subtask)
             reason = res.get("failure")
             if reason not in self.HOPS_TO_ANOTHER_SEAT:
                 break
@@ -2271,6 +2281,57 @@ class Orchestrator:
                          "classifier no provider channel")
         except Exception as e:                  # noqa: BLE001 -- a log, not a gate
             _LOG.debug("classification log failed: %s", e)
+
+    def _keep_unclassified_evidence(self, choice, res, subtask):
+        """Keep the pane tail when a job fails and nothing was allowed to read it.
+
+        **This text is data at rest.** It is never handed to `quota.classify`,
+        never opens a cooldown, never feeds pattern matching of any kind. The
+        asymmetry a86fee0 settled is unchanged: no automatic reader treats a
+        pane transcript as the provider speaking, because a false positive is a
+        five-hour breaker on a healthy seat, machine-wide and silent. Writing
+        the text down does not judge it. It only stops it from being the one
+        string that explains the failure and the one string nobody kept --
+        `delegate bundle` ships the run log, so the evidence now travels to
+        whoever is going to make the judgement this program will not.
+
+        Only the pane branch. `HerdrAdapter.prompt`'s other unclassified exit is
+        herdr refusing the request -- `agent_pane_busy`, a stalled prompt --
+        whose `output` is herdr's own error code, already in the log and already
+        legible. Filing that under this label would send a reader hunting for a
+        provider wall that never happened.
+        """
+        if not res.get("failure") or "classified_text" in res:
+            return
+        if not res.get("pane_transcript"):
+            return
+        # Redacted whole, then tailed. Slicing first can cut an opaque run of
+        # key characters short enough that the blunt 40-character rule no longer
+        # matches it -- which would leak exactly the shape that rule exists for.
+        # Same scrub and same cap as everything else this program keeps.
+        tail = corpus.redact(res.get("output") or "")[-corpus.MAX_TEXT:]
+        if not tail.strip():
+            return
+        who = subtask.get("id") if subtask else choice.channel
+        # One log call, so the block lands under one stamp and reads as a block
+        # rather than as N stamped fragments of one thing.
+        self.log("%s: %s\n%s" % (who, UNCLASSIFIED_EVIDENCE,
+                                 "\n".join("  | " + x for x in tail.splitlines())))
+        if subtask is None:
+            return
+        entry = {"label": UNCLASSIFIED_EVIDENCE, "channel": choice.channel,
+                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                     time.gmtime(self.clock())),
+                 "tail": tail}
+
+        # Appended, not replaced: a job can fail this way more than once, and
+        # the earlier transcript is the one that says what changed.
+        def mark(state):
+            for s in state["subtasks"]:
+                if s["id"] == subtask["id"]:
+                    s["unclassified_evidence"] = \
+                        (s.get("unclassified_evidence") or []) + [entry]
+        self.task.mutate(mark)
 
     def _log_transcript(self, role, prompt, res):
         """Keep what the agent was asked and what it said. An agent that does
