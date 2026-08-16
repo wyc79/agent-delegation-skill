@@ -783,14 +783,21 @@ class TestHerdrPaneClassification(unittest.TestCase):
         self.assertEqual(res["failure"], "quota_exhausted",
                          "the subprocess path stopped classifying")
 
-    def test_a_pane_wall_captures_nothing_to_the_corpus(self):
+    def test_a_pane_wall_reaches_no_verdict_the_corpus_hangs_off(self):
         """Capture records what classification SAW. On this path it saw
         nothing, so there is nothing to file -- and filing agent prose as a
-        provider message would poison the corpus that pins detection."""
-        from adg import corpus
-        self._prompt("Claude AI usage limit reached. Resets at 3pm.")
-        self.assertFalse(os.path.exists(corpus.path()),
-                         "agent prose was filed as a provider wall")
+        provider message would poison the corpus that pins detection.
+
+        Asserted on the VERDICT, because that is the only half this level can
+        decide. `corpus.capture` has one caller, `machine._cool`, which is
+        reached only from an Orchestrator run -- so a file-existence check here
+        was unconditionally true and stayed green with the boundary broken.
+        `TestUnclassifiedEvidence.test_keeping_it_cools_nothing_and_captures_
+        nothing` drives the writer for real; this pins the verdict it hangs off.
+        """
+        res = self._prompt("Claude AI usage limit reached. Resets at 3pm.")
+        self.assertNotEqual(res["failure"], "quota_exhausted",
+                            "agent prose reached the verdict that files a wall")
 
     def setUp(self):
         self.t = TempRepo()
@@ -1898,7 +1905,6 @@ class TestStatusShowsSeatQuota(unittest.TestCase):
         cooldown.open_breaker("claude-seat", "quota", reopen, self.now, "usage limit")
         out = self._status()
         self.assertIn("[cooling until %s (classified)]" % cli._stamp(reopen), out, out)
-        # And the seat that is fine is not decorated as if it were not.
         cursor = [l for l in out.splitlines() if l.startswith("  cursor-seat")][0]
         self.assertNotIn("cooling", cursor)
 
@@ -1907,7 +1913,7 @@ class TestStatusShowsSeatQuota(unittest.TestCase):
         estimate -- deliberately, so no estimate means no shadow price. Rendered
         as a percentage that is "100% left", which is the fabricated number a
         caller would decide to dispatch a wave on."""
-        reg = json.loads(json.dumps(self.reg))          # a deep copy of plain data
+        reg = json.loads(json.dumps(self.reg))
         reg["channels"]["claude-seat"]["quota"] = {"window": "5h"}
         lines = cli._seat_quota_lines(reg, {}, {}, self.now)
         claude = [l for l in lines if "claude-seat" in l][0]

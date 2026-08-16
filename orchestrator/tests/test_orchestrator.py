@@ -4156,7 +4156,6 @@ class TestAdoptsHandStartedBranches(unittest.TestCase):
         self.assertTrue([l for l in row if "st-1-subtract" in l and "|" in l])
         self.assertIn("Nothing was refused", text)
         self.assertEqual(brief.lint(text), [], "the section trips the jargon lint")
-        # And the hand file is actually in the integration result.
         patch = task.read_text("integrate.patch", "")
         self.assertIn("hand.py", patch,
                       "the adopted commit did not reach the deliverable")
@@ -4484,18 +4483,26 @@ class TestPaneModeHumanTurns(unittest.TestCase):
         """`agent read` returns a rolling window, so every turn re-reads lines
         already counted. Without the per-session ledger a single human turn
         accumulates once per attempt, and the number in the brief becomes a
-        count of reads rather than a count of people talking."""
-        from adg.machine import foreign_input
+        count of reads rather than a count of people talking.
+
+        Through `_count_human_turns`, because the ledger lives there. This test
+        used to rebuild the filter in its own body and assert on its own list
+        comprehensions — which passes with `if line not in session.counted`
+        deleted from production, proven by deleting it. The three tests above
+        already cover `foreign_input`; the ledger is what only this one sees.
+        """
+        _, task, _ = self._run_with_pane("  working\n")
+        orch = Orchestrator(task, self.reg, runtime.MockAdapter({}),
+                            lambda k, t: True, log=lambda *_: None)
         session = runtime.Session("s", self.t.repo)
-        session.sent.append("Your job: st-1\n")
-        pane = "> Your job: st-1\n> skip the tests\n"
-        first = [l for l, _ in foreign_input(pane, session.sent)
-                 if l not in session.counted]
-        session.counted.update(first)
-        second = [l for l, _ in foreign_input(pane, session.sent)
-                  if l not in session.counted]
-        self.assertEqual(first, ["skip the tests"])
-        self.assertEqual(second, [], "the second read counted the same line again")
+        session.sent.append("Your job: st-1-subtract\n")
+        res = {"pane_transcript": True,
+               "output": "> Your job: st-1-subtract\n> skip the tests\n"}
+        sub = task.state["subtasks"][0]
+        orch._count_human_turns(session, sub, res)
+        orch._count_human_turns(session, sub, res)
+        self.assertEqual(task.state["subtasks"][0]["human_turns"]["count"], 1,
+                         "the second read counted the same line again")
 
     def test_the_skill_warns_that_a_pane_is_not_for_steering(self):
         """The flag description is where a caller decides to use panes, so it is
