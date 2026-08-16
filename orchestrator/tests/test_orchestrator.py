@@ -2894,6 +2894,29 @@ class TestTheSeams(unittest.TestCase):
                              "to run, which invites it to go and read it")
 
     # --- seam 3: the skill's instructions have to survive contact with init -
+    def test_the_description_routes_to_the_runbook_it_ships(self):
+        """The frontmatter is the routing surface, and it is the half a caller
+        never reads. A procedure the router does not reach is a procedure
+        nobody runs -- the pane-mode runbook turns on `delegate cooldown` and
+        `delegate bundle`, so a description that does not carry that vocabulary
+        leaves the runbook unreachable by the words a human actually says.
+
+        And the anti-trigger clause is load-bearing in the other direction:
+        without it this skill is invoked for planning and review, which it
+        explicitly does not do.
+        """
+        skill = _slurp(os.path.join(REPO_ROOT, "agent-delegation", "SKILL.md"))
+        desc = [l for l in skill.splitlines() if l.startswith("description:")]
+        self.assertEqual(len(desc), 1, "the frontmatter has no single description")
+        text = desc[0].lower()
+        self.assertIn("does not plan, review or judge", text,
+                      "the anti-trigger clause is gone; this skill will be "
+                      "invoked for work it refuses to do")
+        for word in ("cooldown", "bundle"):
+            self.assertIn(word, text,
+                          "the runbook tells an operator to run `delegate %s` "
+                          "and nothing routes them here to read it" % word)
+
     def test_every_delegate_command_in_the_docs_still_parses(self):
         """The docs are the command surface as a caller experiences it.
 

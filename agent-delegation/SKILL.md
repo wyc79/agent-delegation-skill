@@ -1,6 +1,6 @@
 ---
 name: agent-delegation
-description: Use when jobs you have already decomposed should run as parallel agents across more than one provider — dispatching them with the `delegate` CLI, surviving a quota wall or rate limit mid-job by failing over to another seat, running each job in its own git worktree, answering the merge gate, or reading back what a run produced and why one stopped. Trigger on delegate, multi-provider, quota exhausted, rate limited, seat, failover, parallel agents, parallel worktrees, jobs.md, merge gate. It runs jobs; it does not plan, review or judge them, and nothing here is about how the work should be done.
+description: Use when jobs you have already decomposed should run as parallel agents across more than one provider — dispatching them with the `delegate` CLI, each in its own git worktree; failing over to another seat when one hits a quota wall or rate limit mid-job; cooling a seat by hand when nothing detected the wall; enrolling another seat; continuing a branch you started yourself; answering the merge gate; bundling a run up for somebody to diagnose; or reading back what a run produced and why one stopped. Trigger on delegate, multi-provider, quota exhausted, rate limited, hit a rate limit on <seat>, mark <seat> as cooling, cooldown, seat, failover, parallel agents, parallel worktrees, jobs.md, merge gate, bundle that run, continue the branch I started by hand, add a dsh or DeepSeek seat. It runs jobs; it does not plan, review or judge them, and nothing here is about how the work should be done.
 ---
 
 # Agent delegation
