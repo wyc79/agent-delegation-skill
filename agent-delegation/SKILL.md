@@ -73,6 +73,20 @@ worktree, and what you give up by not paying for the gate.
 Read it when `init` showed one provider and you have independent jobs. Skip it
 otherwise — on two seats this is the worse choice.
 
+### Enrolling a seat
+
+A seat is one entry under `channels:` in `registry.default.yaml` — a name, a
+`type` (`subscription` with a metered `quota:` window, or `metered` with none:
+an API-billed seat has no window to draw down and must not fake one), an
+`adapter`, an `agent_kind`, and the models it `exposes`, which is what binds the
+seat to tiers. The kind selects the launch command, which lives in the adapter;
+there is no command field to write. **Copy the commented-out `dsh-seat` block**
+as the template — and a dsh seat needs `compression: none` on the
+`session-persistence-jsonl` plugin in its headless profile, or enrichment reads
+nothing and the seat bills from nothing. `orchestrator/docs/dsh-adapter-notes.md`
+has the rest. Then run `delegate init`: it prints the live tier table and audits
+which config file each seat can actually see.
+
 ## Writing the jobs
 
 Delegate reads a decomposition from a markdown file you write, passed with
