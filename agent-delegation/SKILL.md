@@ -193,7 +193,7 @@ delegate show --brief                          # the merge-gate brief
 delegate bundle                                # one redacted file: state, log, brief, walls
 delegate approve --note "..."                  # answer the gate
 delegate resume --when-open                    # sleep out a quota window, then continue
-delegate channels --clear <seat>               # release a cooldown by hand
+delegate cooldown <seat> --for 5h              # cool a seat by hand; --clear releases one
 ```
 
 Run from the repository being changed, by absolute path; `--repo <path>`
@@ -208,8 +208,34 @@ that may no longer answer the goal it was dispatched with.
 
 **In pane mode, quota walls are not auto-detected.** A pane exposes only the
 agent's own transcript, never the provider's error channel, so a walled seat
-surfaces as a failed job rather than a cooldown — and `delegate resume` after
-the window reopens is manual. Run `--no-panes` if you want the failover.
+surfaces as a failed job rather than a cooldown. **You are the classifier** —
+the runbook below is that job. Run `--no-panes` to have it done for you
+instead, at the cost of the visible panes.
+
+### When a pane-mode job fails
+
+Nothing classified it, so the judgement is yours. In order:
+
+1. **Read the tail** — the job's pane, or the block the run log kept for it,
+   headed `unclassified failure — transcript tail`. It is labelled that way
+   because nothing judged it.
+2. **A provider wall?** Tell the human what the message says, then cool the seat
+   with the reset time *the message states*. Never invent one: if it states no
+   time, say so and give a conservative `--for` instead.
+3. **A real failure** — a bug, a bad prompt, a blocked report? Handle it as
+   *Reading what comes back* describes. Do not cool a seat over it; that takes
+   a working provider away for hours.
+4. **Either way**, `delegate bundle <task-id>` is the one file to hand whoever
+   diagnoses the run. Wall texts inside a bundle can be promoted to the test
+   corpus by hand.
+
+```bash
+delegate cooldown <seat> --until 14:03   # "resets at 14:03", read off the pane
+delegate cooldown <seat> --for 5h        # it named no time — cool it long
+delegate cooldown <seat> --clear         # you misread it, or it reset early
+delegate resume --when-open              # then pick the task back up
+delegate bundle <task-id>                # one redacted file for diagnosis
+```
 
 **Exit code 1 does not mean it failed.** Only `done` exits 0; parked, waiting on
 quota, declined and crashed all exit 1. Read the status.

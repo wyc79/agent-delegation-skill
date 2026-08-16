@@ -883,14 +883,16 @@ def _die_like_ctrl_c(signum, frame):
     raise KeyboardInterrupt("terminated (signal %s)" % signum)
 
 
-def main(argv=None):
-    try:
-        signal.signal(signal.SIGTERM, _die_like_ctrl_c)
-    except (ValueError, OSError, AttributeError):
-        # Not the main thread, or a platform without SIGTERM. The drain in
-        # `run()` still covers every in-process path; only the signal shortcut
-        # is unavailable, and refusing to start over it would be absurd.
-        pass
+def build_parser():
+    """The whole command surface, built without running anything.
+
+    Split out of `main` so a test can ask what this program actually accepts.
+    Every command in SKILL.md and both READMEs is a line somebody will type,
+    and a documented flag that no longer parses is a defect nothing else can
+    see -- the prose reads fine and the suite is green right up until a caller
+    follows it. `test_orchestrator` parses every shell block in the docs
+    through this.
+    """
     p = argparse.ArgumentParser("delegate", description="Multi-agent task delegation.")
     p.add_argument("--repo", default=".", help="repository (default: cwd)")
     p.add_argument("--registry", default=None, help="path to registry.default.yaml")
@@ -984,8 +986,18 @@ def main(argv=None):
                     help="reopen the seat now — the wall was misread, or it "
                          "reset early")
     cd.set_defaults(func=cmd_cooldown)
+    return p
 
-    args = p.parse_args(argv)
+
+def main(argv=None):
+    try:
+        signal.signal(signal.SIGTERM, _die_like_ctrl_c)
+    except (ValueError, OSError, AttributeError):
+        # Not the main thread, or a platform without SIGTERM. The drain in
+        # `run()` still covers every in-process path; only the signal shortcut
+        # is unavailable, and refusing to start over it would be absurd.
+        pass
+    args = build_parser().parse_args(argv)
     # Before any subcommand runs. The workflow decides which protocol and role
     # cards every agent is pointed at, so resolving it late would mean the
     # first stage of a run could be composed against a different manifest from

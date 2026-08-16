@@ -2892,6 +2892,48 @@ class TestTheSeams(unittest.TestCase):
                              "to run, which invites it to go and read it")
 
     # --- seam 3: the skill's instructions have to survive contact with init -
+    def test_every_delegate_command_in_the_docs_still_parses(self):
+        """The docs are the command surface as a caller experiences it.
+
+        A renamed flag or a dropped subcommand leaves the prose reading
+        perfectly and the suite green, right up until somebody types the line.
+        The pane-mode runbook made this worse rather than better: it is a
+        procedure an operating model follows literally, under a failure, on
+        behalf of a human -- so a command in it that does not parse is a dead
+        end at the moment it is most needed.
+
+        Extracted from the documents and parsed by the real parser. Parsed
+        only: running them would need a repository, a registry and a provider,
+        and what rots here is the surface, not the behaviour.
+        """
+        import shlex
+        docs = [os.path.join(REPO_ROOT, "agent-delegation", "SKILL.md"),
+                os.path.join(REPO_ROOT, "orchestrator", "README.md"),
+                os.path.join(REPO_ROOT, "README.md")]
+        parser = cli.build_parser()
+        found = 0
+        for path in docs:
+            if not os.path.exists(path):
+                continue
+            for block in re.findall(r"```bash\s*\n(.*?)```", _slurp(path), re.S):
+                for line in block.splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    # `orchestrator/delegate` in the READMEs, bare `delegate`
+                    # in the skill: the same program, invoked the two ways the
+                    # two audiences invoke it.
+                    if not re.match(r"(\S*/)?delegate\s", line):
+                        continue
+                    argv = shlex.split(line)[1:]
+                    found += 1
+                    with self.subTest(doc=os.path.basename(path), cmd=line):
+                        try:
+                            parser.parse_args(argv)
+                        except SystemExit:
+                            self.fail("%s documents `%s`, which this program "
+                                      "does not accept" % (path, line))
+        self.assertGreater(found, 8, "no delegate commands were found in the "
+                                     "docs -- the extraction stopped matching")
+
     def test_every_reference_the_skill_points_at_exists(self):
         """A skill that names a file it does not ship sends an agent hunting.
 
