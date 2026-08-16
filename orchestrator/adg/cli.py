@@ -130,7 +130,9 @@ def cmd_channels(args):
         q = chan.get("quota") or {}
         util = cooldown.utilization(usage.get(name), q, now)
         entry = cools.get(name)
-        state = ("cooling until %s (%s)" % (_stamp(entry["reopen_at"]), entry["reason"])
+        state = ("cooling until %s (%s, %s)"
+                 % (_stamp(entry["reopen_at"]), entry["reason"],
+                    cooldown.origin(entry))
                  if entry else "ready")
         cap = quota.parse_capacity(q.get("est_capacity"))
         draw = ("%d%% of ~%g per %s" % (round(util * 100), cap, q.get("window"))
@@ -144,6 +146,164 @@ def cmd_channels(args):
     print("Utilization is an estimate — providers expose no meter, so this "
           "counts one invocation as one unit.\nClear a cooldown with "
           "`delegate channels --clear <name>` if a seat is actually available.")
+
+
+# The `--until` formats, in one place: `_until_epoch` tries them in order and
+# `--help` documents them from the same list, so a format cannot be accepted
+# without being named or named without being accepted.
+_UNTIL_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%H:%M")
+
+_COOLDOWN_EPILOG = """\
+Times are local, and stdlib-parsed. --until accepts:
+
+  HH:MM              the NEXT occurrence of that time -- today if it is still
+                     ahead, otherwise tomorrow. This is the form a human types
+                     while reading "resets at 14:03" off a pane at half past
+                     three.
+  YYYY-MM-DD HH:MM   an exact local time. Quote it; it contains a space.
+                     YYYY-MM-DDTHH:MM works too and needs no quotes.
+
+--for accepts a duration -- 5h, 90m, 7d, 30s, 2w. A --until already in the past
+is an error rather than a zero-length cooldown.
+
+Nothing here classifies anything, and that is the point: in pane mode the
+provider's own words never reach this program, so a wall settles as a plain
+failed job. This is how what YOU read in the pane reaches the router. The entry
+it writes is the same entry a classified wall writes -- routing, `resume
+--when-open` and the merge brief cannot tell them apart -- marked `manual` so
+the log, `status` and a bundle can say who decided.
+"""
+
+
+def _until_epoch(text, now):
+    """A local wall-clock time a person typed -> epoch seconds, or None.
+
+    Bare `HH:MM` is the next occurrence of that time, which is the case this
+    command exists for: the message in the pane says "resets at 14:03" and
+    gives no date, and both readings of it -- later today, or tomorrow -- are
+    ordinary. `tm_isdst=-1` lets mktime settle which offset applies, so an
+    overnight cooldown across a clock change lands where the wall clock says.
+    """
+    raw = str(text or "").strip()
+    for fmt in _UNTIL_FORMATS:
+        try:
+            got = time.strptime(raw, fmt)
+        except ValueError:
+            continue
+        if fmt != "%H:%M":
+            return time.mktime((got.tm_year, got.tm_mon, got.tm_mday,
+                                got.tm_hour, got.tm_min, 0, 0, 0, -1))
+        lt = time.localtime(now)
+        at = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                          got.tm_hour, got.tm_min, 0, 0, 0, -1))
+        return at + 86400 if at <= now else at
+    return None
+
+
+def _cooldown_listing(args, cools, usage, now):
+    """What is cooling, rendered the way `status` renders it.
+
+    Through `_seat_quota_lines` rather than a second formatter: a caller who
+    runs this after `status` is checking one against the other, and two
+    renderings of one file are how they come to disagree.
+    """
+    if not cools:
+        print("nothing is cooling — every enrolled seat is open.")
+        print("state file: %s" % cooldown.path())
+        return
+    try:
+        reg = routing.load_registry(args.registry)
+    except (routing.RoutingError, yamlite.YamlError, OSError) as e:
+        print("the registry could not be read (%s) — listing what is on file" % e)
+        reg = {}
+    for line in _seat_quota_lines(reg, cools, usage, now, only=set(cools)):
+        print(line)
+    # A cooldown on a name the registry does not carry -- a typo, or a seat
+    # since renamed. Listed rather than hidden: a human who cannot see the
+    # entry they wrote cannot clear it either, and this command is the only
+    # place that entry surfaces at all.
+    stray = sorted(set(cools) - set(reg.get("channels") or {}))
+    if stray:
+        print("\nnot a seat in this registry, but cooling:")
+        for name in stray:
+            print("  %-14s cooling until %s (%s)"
+                  % (name, _stamp(cools[name]["reopen_at"]),
+                     cooldown.origin(cools[name])))
+    print("\nReopen one early with `delegate cooldown <seat> --clear`.")
+
+
+def cmd_cooldown(args):
+    """Cool a seat because a person read a wall message, not because anything
+    classified one.
+
+    The asymmetry this program is built on is that nothing automatic reads
+    prose as the provider. In pane mode there is no provider channel at all, so
+    a wall settles unclassified, no breaker opens, and the router keeps routing
+    into a seat that is dry. This is the other half of that design rather than
+    a hole in it: the human who can read the pane is the classifier, and this is
+    where their reading enters the store.
+    """
+    now = time.time()
+    cools, usage, warning = cooldown.read(now)
+    if warning:
+        print("warning: %s" % warning)
+    chosen = [flag for flag, given in (("--until", args.until),
+                                       ("--for", args.for_),
+                                       ("--clear", args.clear)) if given]
+    if not args.seat:
+        if chosen:
+            sys.exit("usage: delegate cooldown <seat> %s — with no seat it "
+                     "lists what is cooling" % chosen[0])
+        return _cooldown_listing(args, cools, usage, now)
+    if len(chosen) != 1:
+        sys.exit("usage: delegate cooldown %s — exactly one of --until, --for, "
+                 "--clear is required (got %s)"
+                 % (args.seat, ", ".join(chosen) or "none"))
+
+    if args.clear:
+        if cooldown.clear(args.seat):
+            print("cleared the cooldown on %s — it is open again" % args.seat)
+        else:
+            print("%s is not cooling — nothing to clear" % args.seat)
+        return
+
+    if args.until:
+        at = _until_epoch(args.until, now)
+        if at is None:
+            sys.exit("could not read --until %r — expected HH:MM or "
+                     "\"YYYY-MM-DD HH:MM\", local time" % args.until)
+        if at <= now:
+            sys.exit("--until %s is in the past (%s) — a window that has "
+                     "already reopened is not a cooldown" % (args.until, _stamp(at)))
+    else:
+        secs = quota.parse_duration(args.for_)
+        if not secs:
+            sys.exit("could not read --for %r — expected a duration like 5h, "
+                     "90m or 7d" % args.for_)
+        at = now + secs
+
+    # Reported, never rejected -- the name is the user's and this program does
+    # not own the registry. But a typo writes a breaker nobody is looking for,
+    # so it has to be said at the moment it happens.
+    try:
+        known = sorted(routing.load_registry(args.registry).get("channels") or {})
+    except (routing.RoutingError, yamlite.YamlError, OSError):
+        known = []
+    if known and args.seat not in known:
+        print("note: %s is not a seat in this registry (%s) — cooling it anyway"
+              % (args.seat, ", ".join(known)))
+
+    # `detail` stays empty, deliberately. `delegate channels` renders it as
+    # "said:", and nothing said anything here -- attributing the human's
+    # judgement to the provider is the one thing this whole design is arranged
+    # to avoid. `origin: manual` is the record.
+    err = cooldown.open_breaker(args.seat, "quota", at, now,
+                                origin="manual", replace=True)
+    if err:
+        print("warning: %s" % err)
+    print("%s is cooling until %s (manual)" % (args.seat, _stamp(at)))
+    print("Routing skips it until then; `delegate resume --when-open` waits it "
+          "out. Reopen early with `delegate cooldown %s --clear`." % args.seat)
 
 
 def _conventions_audit(repo, reg):
@@ -490,9 +650,14 @@ def cmd_resume(args):
     sys.exit(0 if status == "done" else 1)
 
 
-def _seat_quota_lines(registry, cools, usage, now):
+def _seat_quota_lines(registry, cools, usage, now, only=None):
     """One line per enrolled seat: how much of each metered window is left, and
     when it reopens if it is shut.
+
+    `only` narrows the list to a set of channel names -- what `delegate
+    cooldown` with no arguments prints. Rendered here rather than in a second
+    formatter so the two commands cannot come to disagree about how a cooling
+    seat looks.
 
     Read-only, and nothing here meters anything. The router already counts
     invocations against a window and prices a seat off the result -- that
@@ -511,6 +676,8 @@ def _seat_quota_lines(registry, cools, usage, now):
     for name, chan in sorted((registry.get("channels") or {}).items()):
         if not isinstance(chan, dict) or chan.get("disabled"):
             continue
+        if only is not None and name not in only:
+            continue
         # The same "enrolled" test `_conventions_audit` uses: a seat exposing
         # nothing the router may pick is not a seat this deployment has.
         if not any((registry.get("models") or {}).get(m, {}).get("enrolled")
@@ -527,7 +694,12 @@ def _seat_quota_lines(registry, cools, usage, now):
         else:
             left = "%s window: no capacity estimate" % (q.get("window") or "5h")
         entry = cools.get(name)
-        shut = ("  [cooling until %s]" % _stamp(entry["reopen_at"])) if entry else ""
+        # The origin, always, not only when it is `manual`. A reader who has to
+        # know the convention to decode a silence is a reader who will read it
+        # wrong once -- and the whole point of the marker is that a seat cooled
+        # by hand and a seat cooled by the classifier are different facts.
+        shut = ("  [cooling until %s (%s)]"
+                % (_stamp(entry["reopen_at"]), cooldown.origin(entry))) if entry else ""
         seats.append("%-14s %s%s" % (name, left, shut))
     if not seats:
         return []
@@ -796,6 +968,22 @@ def main(argv=None):
     ch.add_argument("--clear", metavar="NAME",
                     help="drop the cooldown on one channel")
     ch.set_defaults(func=cmd_channels)
+
+    cd = sub.add_parser("cooldown", help="cool a seat by hand — for a wall "
+                                         "message you read that nothing classified",
+                        epilog=_COOLDOWN_EPILOG,
+                        formatter_class=argparse.RawDescriptionHelpFormatter)
+    cd.add_argument("seat", nargs="?",
+                    help="channel name; omit to list what is cooling")
+    cd.add_argument("--until", metavar="TIME",
+                    help="local time it reopens: HH:MM (next occurrence) or "
+                         "\"YYYY-MM-DD HH:MM\"")
+    cd.add_argument("--for", dest="for_", metavar="DURATION",
+                    help="how long from now: 5h, 90m, 7d")
+    cd.add_argument("--clear", action="store_true",
+                    help="reopen the seat now — the wall was misread, or it "
+                         "reset early")
+    cd.set_defaults(func=cmd_cooldown)
 
     args = p.parse_args(argv)
     # Before any subcommand runs. The workflow decides which protocol and role

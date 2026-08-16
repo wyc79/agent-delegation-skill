@@ -206,6 +206,28 @@ def _from_clock(text, now):
     return at + 86400 if at <= now else at
 
 
+def parse_duration(text):
+    """`5h`, `90m`, `7d` -> seconds, or None when it is not a duration at all.
+
+    The strict sibling of `parse_window`, sharing its units table so the two
+    cannot drift. `parse_window` reads a registry field and falls back to a
+    default, which is right there: a typo in a config file must not stop a run.
+    This one reads what a person just typed at the CLI, where a silent default
+    would cool a seat for a length nobody asked for.
+    """
+    m = _DURATION.match(str(text or "").strip().lower())
+    if not m:
+        return None
+    # Whole-word units only. A first-letter fallback silently read `1month`
+    # as one *minute*, which is a 60-second window on a monthly seat --
+    # wrong by four orders of magnitude and completely invisible.
+    secs = _UNITS.get(m.group(2).rstrip("s"))
+    if not secs:
+        return None
+    got = float(m.group(1)) * secs
+    return got if got > 0 else None
+
+
 def parse_window(text, default=5 * 3600.0):
     """`5h`, `24h`, `weekly`, `monthly` -> seconds. An unparseable window
     returns the default rather than 0, which would mean 'always exhausted' --
@@ -215,17 +237,7 @@ def parse_window(text, default=5 * 3600.0):
     key = str(text or "").strip().lower()
     if key in _WINDOWS:
         return float(_WINDOWS[key])
-    m = _DURATION.match(key)
-    if m:
-        # Whole-word units only. A first-letter fallback silently read `1month`
-        # as one *minute*, which is a 60-second window on a monthly seat --
-        # wrong by four orders of magnitude and completely invisible.
-        secs = _UNITS.get(m.group(2).rstrip("s"))
-        if secs:
-            got = float(m.group(1)) * secs
-            if got > 0:
-                return got
-    return float(default)
+    return parse_duration(key) or float(default)
 
 
 def parse_capacity(text):

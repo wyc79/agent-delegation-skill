@@ -81,19 +81,45 @@ def active(now):
     return set(read(now)[0])
 
 
-def open_breaker(channel, reason, reopen_at, now, detail=""):
+def open_breaker(channel, reason, reopen_at, now, detail="", origin="classified",
+                 replace=False):
     """Open (or extend) a breaker. Extending never shortens an existing one:
-    two providers' messages disagreeing should not reopen a seat early."""
+    two providers' messages disagreeing should not reopen a seat early.
+
+    `origin` records WHO decided -- the classifier, or a human who read a wall
+    message in a pane and ran `delegate cooldown`. It is a record and never a
+    switch: nothing routes, parks or waits differently on it, because it is the
+    same entry either way. See `origin()`.
+
+    `replace` is the one thing a manual entry does differently, and only
+    because the reason for never shortening does not hold for it. That rule is
+    about two provider *messages* disagreeing, where the program cannot tell
+    which is right. A person typing a reset time is the classifier speaking,
+    not a second guess at it, and silently keeping a longer machine-assumed
+    window would make `delegate cooldown --until` report a time it did not set.
+    """
     entry = {"reason": reason, "opened_at": float(now),
-             "reopen_at": float(reopen_at), "detail": (detail or "")[:200]}
+             "reopen_at": float(reopen_at), "detail": (detail or "")[:200],
+             "origin": origin}
 
     def apply(data):
         cur = data["cooldowns"].get(channel)
-        if _entry_ok(cur) and float(cur["reopen_at"]) > entry["reopen_at"]:
+        if (not replace and _entry_ok(cur)
+                and float(cur["reopen_at"]) > entry["reopen_at"]):
             entry["reopen_at"] = float(cur["reopen_at"])
         data["cooldowns"][channel] = entry
 
     return _mutate(apply, now)
+
+
+def origin(entry):
+    """'classified' or 'manual' -- who put this breaker here.
+
+    Absent means classified, and that is the only honest reading: every entry
+    written before the marker existed came from `quota.classify`, and there was
+    no other writer."""
+    got = (entry or {}).get("origin")
+    return got if got in ("classified", "manual") else "classified"
 
 
 def clear(channel):

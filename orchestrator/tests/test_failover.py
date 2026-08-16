@@ -1885,14 +1885,19 @@ class TestStatusShowsSeatQuota(unittest.TestCase):
                          ["claude-seat", "cursor-seat"], "seat order is not stable")
         self.assertNotIn("\x1b", out, "status emitted a terminal escape")
 
-    def test_a_cooling_seat_says_when_it_reopens(self):
+    def test_a_cooling_seat_says_when_it_reopens_and_who_said_so(self):
         """The reopen time the classifier parsed out of the provider's own
         message. Without it the line says a seat is empty and not when to come
-        back, which is the question the caller is actually asking."""
+        back, which is the question the caller is actually asking.
+
+        And who decided, since `delegate cooldown` gave a human the same store
+        to write into: "the provider said this" and "somebody typed this" are
+        different facts about a seat, and the row is where they are told apart.
+        """
         reopen = self.now + 4200
         cooldown.open_breaker("claude-seat", "quota", reopen, self.now, "usage limit")
         out = self._status()
-        self.assertIn("[cooling until %s]" % cli._stamp(reopen), out, out)
+        self.assertIn("[cooling until %s (classified)]" % cli._stamp(reopen), out, out)
         # And the seat that is fine is not decorated as if it were not.
         cursor = [l for l in out.splitlines() if l.startswith("  cursor-seat")][0]
         self.assertNotIn("cooling", cursor)
@@ -2232,6 +2237,223 @@ class TestCorpusCapture(unittest.TestCase):
         self.assertNotIn("ghp_abcdefghij", got)
         self.assertNotIn("z" * 44, got)
         self.assertIn("Bearer <key>", got)
+
+
+class TestManualCooldown(unittest.TestCase):
+    """`delegate cooldown`: a human sitting in the classifier's seat.
+
+    In pane mode nothing classifies anything -- herdr exposes no channel
+    carrying the provider's own words, so a wall settles unclassified and no
+    breaker opens (`runtime.HerdrAdapter`). The message is still there; a person
+    is reading it in the pane. This command is how what they read reaches the
+    router, and the entry it writes is THE SAME ENTRY classification would have
+    written, so nothing downstream can tell the two apart. Only `origin` says
+    who decided, and it is a record rather than a switch.
+    """
+
+    def setUp(self):
+        import time as _time
+        self.t = TempRepo()
+        self.now = _time.time()
+        self.reg = router.load_registry(REGISTRY)
+        self.pol = dict(self.reg["policy"]["limits"],
+                        escalation_ceiling=self.reg["policy"]["escalation_ceiling"])
+
+    def tearDown(self):
+        self.t.close()
+
+    def _run(self, argv):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.main(["--registry", REGISTRY, "--repo", self.t.repo] + argv)
+        return buf.getvalue()
+
+    # --- the entry itself --------------------------------------------------
+    def test_it_writes_the_entry_classification_would_have_written(self):
+        self._run(["cooldown", "claude-seat", "--for", "5h"])
+        cools, _, _ = cooldown.read(self.now)
+        entry = cools["claude-seat"]
+        # `reason` stays "quota" on purpose: the human read a quota wall, and
+        # every downstream reader keys on that word -- `_quota_guard`, the park,
+        # `status`'s "waiting on quota". Only the origin differs.
+        self.assertEqual(entry["reason"], "quota")
+        self.assertEqual(cooldown.origin(entry), "manual")
+        self.assertAlmostEqual(entry["reopen_at"], self.now + 5 * 3600, delta=10)
+
+    def test_an_entry_written_before_origin_existed_reads_as_classified(self):
+        # Every breaker on disk today was opened by the classifier, so the
+        # absent key has exactly one honest reading.
+        cooldown.open_breaker("claude-seat", "quota", T0 + 60, T0)
+        with open(cooldown.path()) as fh:
+            raw = json.load(fh)
+        del raw["cooldowns"]["claude-seat"]["origin"]
+        with open(cooldown.path(), "w") as fh:
+            json.dump(raw, fh)
+        cools, _, _ = cooldown.read(T0)
+        self.assertEqual(cooldown.origin(cools["claude-seat"]), "classified")
+
+    def test_a_classified_entry_still_says_it_was_classified(self):
+        cooldown.open_breaker("claude-seat", "quota", T0 + 60, T0)
+        cools, _, _ = cooldown.read(T0)
+        self.assertEqual(cooldown.origin(cools["claude-seat"]), "classified")
+
+    # --- downstream reads it as the same entry -----------------------------
+    def test_a_manual_entry_routes_jobs_away_from_the_seat(self):
+        # The seat the router WOULD have picked, or the skip proves nothing.
+        first, other = _seats(self.reg)[:2]
+        task = store.Task.create(self.t.repo, "T-001", "# t\n\nDo it\n", self.pol)
+        self._run(["cooldown", first, "--for", "5h"])
+        orch = _orch(self.reg, runtime.MockAdapter(), task,
+                     clock=lambda: self.now)
+        self.assertEqual(orch._pick().channel, other)
+
+    def test_resume_when_open_waits_out_a_manual_window(self):
+        task = store.Task.create(self.t.repo, "T-002", "# t\n", self.pol)
+        self._run(["cooldown", "claude-seat", "--for", "1h"])
+        reopen = cooldown.read(self.now)[0]["claude-seat"]["reopen_at"]
+        task.update(status="needs_human",
+                    park={"reason": "quota_all_exhausted", "reopen_at": reopen,
+                          "channels": ["claude-seat"], "role": "implementer"})
+        fake = {"t": self.now}
+        slept = []
+
+        def sleep(n):
+            slept.append(n)
+            fake["t"] += n
+
+        prev, cli._SLEEP = cli._SLEEP, sleep
+        try:
+            cli._quota_guard(task, when_open=True, clock=lambda: fake["t"],
+                             log=lambda *_: None)
+        finally:
+            cli._SLEEP = prev
+        self.assertTrue(slept, "--when-open did not honour a manual cooldown")
+        self.assertAlmostEqual(sum(slept), 3600, delta=10)
+        self.assertIsNone(task.state.get("park"))
+
+    def test_clear_reopens_the_seat_early(self):
+        self._run(["cooldown", "claude-seat", "--for", "5h"])
+        out = self._run(["cooldown", "claude-seat", "--clear"])
+        self.assertIn("claude-seat", out)
+        self.assertEqual(cooldown.active(self.now), set())
+
+    def test_clearing_something_that_is_not_cooling_says_so(self):
+        out = self._run(["cooldown", "cursor-seat", "--clear"])
+        self.assertIn("not cooling", out)
+
+    # --- what a human can type ---------------------------------------------
+    def test_a_bare_clock_time_means_the_next_occurrence_of_it(self):
+        import time as _time
+        soon = _time.localtime(self.now + 3600)
+        at = cli._until_epoch("%02d:%02d" % (soon.tm_hour, soon.tm_min), self.now)
+        self.assertAlmostEqual(at, self.now + 3600, delta=60)
+        # And the same wall-clock time already past today is tomorrow's, not an
+        # error and not a zero-length cooldown.
+        past = _time.localtime(self.now - 3600)
+        at = cli._until_epoch("%02d:%02d" % (past.tm_hour, past.tm_min), self.now)
+        self.assertGreater(at, self.now)
+        self.assertAlmostEqual(at, self.now + 86400 - 3600, delta=60)
+
+    def test_a_dated_time_is_read_as_local(self):
+        import time as _time
+        at = cli._until_epoch("2026-08-16 09:00", self.now)
+        self.assertEqual(_time.strftime("%Y-%m-%d %H:%M", _time.localtime(at)),
+                         "2026-08-16 09:00")
+
+    def test_a_time_in_the_past_is_an_error_not_a_zero_length_cooldown(self):
+        with self.assertRaises(SystemExit) as cm:
+            self._run(["cooldown", "claude-seat", "--until", "2020-01-01 09:00"])
+        self.assertNotEqual(cm.exception.code, 0)
+        self.assertIn("past", str(cm.exception).lower())
+        self.assertEqual(cooldown.active(self.now), set(),
+                         "a refused time still cooled the seat")
+
+    def test_exactly_one_of_until_for_clear(self):
+        for argv in (["cooldown", "claude-seat"],
+                     ["cooldown", "claude-seat", "--for", "5h", "--clear"],
+                     ["cooldown", "claude-seat", "--for", "5h",
+                      "--until", "23:00"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(SystemExit) as cm:
+                    self._run(argv)
+                self.assertNotEqual(cm.exception.code, 0)
+                self.assertIn("exactly one", str(cm.exception).lower())
+        self.assertEqual(cooldown.active(self.now), set())
+
+    def test_a_duration_that_is_not_one_is_refused_rather_than_defaulted(self):
+        # `quota.parse_window` falls back to 5h for a registry typo, which is
+        # right there and wrong here: nobody asked for five hours.
+        with self.assertRaises(SystemExit) as cm:
+            self._run(["cooldown", "claude-seat", "--for", "soon"])
+        self.assertNotEqual(cm.exception.code, 0)
+        self.assertEqual(cooldown.active(self.now), set())
+
+    def test_the_help_documents_the_formats_it_accepts(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit):
+                cli.main(["cooldown", "--help"])
+        help_text = buf.getvalue()
+        for wanted in ("HH:MM", "YYYY-MM-DD", "5h", "90m", "7d"):
+            self.assertIn(wanted, help_text,
+                          "--help does not document %r" % wanted)
+        self.assertIn("tomorrow", help_text.lower(),
+                      "--help does not state the next-occurrence rule, which is "
+                      "the case a human types while reading a wall message")
+
+    # --- what a reader sees ------------------------------------------------
+    def test_the_no_args_listing_names_what_is_cooling(self):
+        self._run(["cooldown", "claude-seat", "--for", "5h"])
+        out = self._run(["cooldown"])
+        self.assertIn("claude-seat", out)
+        self.assertIn("manual", out)
+        self.assertNotIn("cursor-seat", out,
+                         "the listing is of cooldowns, not of every seat")
+
+    def test_the_listing_says_so_when_nothing_is_cooling(self):
+        out = self._run(["cooldown"])
+        self.assertIn("nothing is cooling", out.lower())
+
+    def test_a_seat_the_registry_does_not_name_is_still_findable(self):
+        # Otherwise a typo writes an entry the listing cannot show and the
+        # human cannot find to clear.
+        out = self._run(["cooldown", "claud-seat", "--for", "5h"])
+        self.assertIn("claud-seat", out.lower())
+        self.assertIn("claud-seat", self._run(["cooldown"]))
+
+    def test_status_says_which_cooldowns_a_human_set(self):
+        import contextlib
+        import io
+        self._run(["cooldown", "claude-seat", "--for", "5h"])
+        cooldown.open_breaker("cursor-seat", "quota", self.now + 60, self.now)
+        buf = io.StringIO()
+
+        class Args:
+            repo, registry = self.t.repo, REGISTRY
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_status(Args())
+        out = buf.getvalue()
+        claude = [l for l in out.splitlines() if l.startswith("  claude-seat")][0]
+        cursor = [l for l in out.splitlines() if l.startswith("  cursor-seat")][0]
+        self.assertIn("(manual)", claude, out)
+        self.assertIn("(classified)", cursor, out)
+
+    def test_the_run_log_carries_the_origin_too(self):
+        # `_log_routing` renders the seat block through `cli._seat_quota_lines`,
+        # so the origin reaches the run log by the same code `status` prints --
+        # which is the point: a reader diagnosing a run hours later must be able
+        # to see that a seat was cooled by hand.
+        task = store.Task.create(self.t.repo, "T-003", "# t\n\nDo it\n", self.pol)
+        self._run(["cooldown", _seats(self.reg)[0], "--for", "5h"])
+        logs = []
+        orch = _orch(self.reg, runtime.MockAdapter(), task, clock=lambda: self.now,
+                     logs=logs)
+        orch._pick()
+        self.assertIn("(manual)", "\n".join(logs), "\n".join(logs))
 
 
 if __name__ == "__main__":

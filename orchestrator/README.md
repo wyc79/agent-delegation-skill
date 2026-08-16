@@ -147,9 +147,21 @@ simultaneous writers in the strict sense — there is no cross-process lock.
 breaker file is what `resume` consults, so clearing a seat lets a parked task
 run again immediately rather than waiting out the recorded window.
 
+**`delegate cooldown` is the other direction, and it is what makes pane mode
+attended rather than weak.** Under herdr the provider's words never reach this
+program, so a wall settles unclassified and no breaker opens — but a person is
+looking at the message. This writes what they read into the same store the
+classifier writes to, marked `manual`, and every reader downstream treats it as
+the entry it is: routing skips the seat, `resume --when-open` waits it out,
+`status` and the run log show it with its origin.
+
 ```bash
 orchestrator/delegate channels                       # cooldowns and quota draw
 orchestrator/delegate channels --clear claude-seat   # override one
+orchestrator/delegate cooldown claude-seat --until 14:03   # what the pane said
+orchestrator/delegate cooldown claude-seat --for 5h  # when it did not say
+orchestrator/delegate cooldown                       # what is cooling, and why
+orchestrator/delegate cooldown claude-seat --clear   # reopen early
 orchestrator/delegate resume --when-open --id T-001  # wait for the window, then resume
 ```
 
@@ -278,6 +290,7 @@ orchestrator/delegate show --brief                  # the merge-gate brief
 orchestrator/delegate bundle T-001                  # one redacted file for diagnosis
 orchestrator/delegate approve --note "..."          # answer it
 orchestrator/delegate resume --id T-001             # continue a parked task
+orchestrator/delegate cooldown claude-seat --for 5h # cool a seat by hand
 ```
 
 Flags worth knowing: `--plan FILE` supplies the jobs; `--dry-run` drives the
